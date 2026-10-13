@@ -1,0 +1,308 @@
+THIRD-PARTY NOTICES FOR SPARTA
+==============================
+
+SPARTA links against third-party software. This file
+reproduces the copyright and permission notices those licences require to
+accompany binary distributions. It must ship with every SPARTA release,
+whether source or binary.
+
+Section 1 covers third-party source compiled into SPARTA, of which there is
+none today. Section 2 reproduces one notice as attribution. Section 3
+records algorithmic sources that are cited in SPARTA's comments but from which
+no code was taken. Section 4 covers linked dependencies. Section 5 lists
+SPARTA's own code, which is licensed under the GNU AGPL, version 3 or later.
+
+  STATUS OF THIS FILE
+  -------------------
+  The SPRAL notice in section 2.1 was copied verbatim out of the upstream
+  LICENCE file. The crate licences in section 4 are the identifiers each crate
+  declares in its own Cargo.toml, read with `cargo metadata`. Before a
+  binary release, generate the full licence texts for section 4 as described
+  there.
+
+
+================================================================================
+1. VENDORED SOURCE  (third-party code compiled into SPARTA)
+================================================================================
+
+SPARTA contains no third-party source code. Its ordering, SCALPEL
+(crates/scalpel), is original SPARTA work.
+
+
+================================================================================
+2. ALGORITHM ATTRIBUTION  (no code taken)
+================================================================================
+
+SPARTA follows one published algorithm closely enough to reproduce its
+notice as attribution hygiene, although no code was taken.
+
+The faer and SuiteSparse AMD notices that used to appear in this section were
+removed on 15 September 2026 along with the quotient-graph ordering code that
+carried them. No code derived from either remains in SPARTA.
+
+--------------------------------------------------------------------------------
+2.1  SPRAL / SSIDS
+--------------------------------------------------------------------------------
+
+The supernode amalgamation merge rule and the merge-biased column renumbering
+in src/symbolic/supernode.rs follow SPRAL SSIDS `core_analyse.f90:644-685`.
+
+Upstream:       SPRAL - Sparse Parallel Robust Algorithms Library
+                https://github.com/ralna/spral
+Licence:        BSD-3-Clause, copied from the LICENCE file on the master
+                branch on 25 September 2026
+
+    Copyright (c) 2014-2025, The Science and Technology Facilities Council (STFC)
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are met:
+        * Redistributions of source code must retain the above copyright
+          notice, this list of conditions and the following disclaimer.
+        * Redistributions in binary form must reproduce the above copyright
+          notice, this list of conditions and the following disclaimer in the
+          documentation and/or other materials provided with the distribution.
+        * Neither the name of the STFC nor the names of its contributors may be
+          used to endorse or promote products derived from this software without
+          specific prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+    ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+    WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+    DISCLAIMED. IN NO EVENT SHALL STFC BE LIABLE FOR ANY DIRECT, INDIRECT,
+    INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+    LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+    PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+    LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
+    OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+    ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+================================================================================
+3. ALGORITHMS IMPLEMENTED FROM PUBLISHED LITERATURE  (no code taken)
+================================================================================
+
+No source from the following was copied. They are recorded because SPARTA's
+comments cite them and a provenance scan will surface the names.
+
+  LAPACK               The blocked symmetric-indefinite factorization in
+                       src/kernels/ldlt_factor.metal follows the algorithm of `zsytrf` /
+                       `zlasyf`. LAPACK is BSD-3-Clause, (c) 1992-2023 The
+                       University of Tennessee, The University of California
+                       Berkeley, the University of Colorado Denver and NAG Ltd.
+                       Algorithm only; the Metal implementation shares no code
+                       or structure with the Fortran.
+
+  METIS                crates/scalpel, the SCALPEL ordering, implements
+                       multilevel nested dissection from Karypis & Kumar
+                       (1998) and uses no METIS code.
+
+  MUMPS                Referenced in comments only, as a comparison against
+                       published behaviour and defaults. No MUMPS code is
+                       present in SPARTA. MUMPS is CeCILL-C; that licence does
+                       not attach.
+
+  Bunch & Kaufman      Pivoting strategy, Math. Comp. 31 (1977) 163-179.
+  Amestoy/Davis/Duff   AMD, SIAM J. Matrix Anal. 17 (1996) 886-905.
+  Gilbert/Ng/Peyton    Column counts, SIAM J. Matrix Anal. 15 (1994) 1075-1091.
+                       src/symbolic/column_counts.rs is an independent
+                       implementation written from this paper. No code was
+                       taken from any existing implementation; see
+                       COL_COUNTS.md section 7 (removed in a5985e4; read it
+                       with `git show a5985e4^:COL_COUNTS.md`).
+
+  George & Liu         Elimination trees: Computer Solution of Large Sparse
+                       Positive Definite Systems (1981) ch. 5; Liu, SIAM J.
+                       Matrix Anal. 11 (1990) 134-172.
+                       src/symbolic/elimination_tree.rs and postorder.rs were
+                       written from these. See section 5.1.
+
+  Liu/Ng/Peyton        Fundamental supernodes, ACM TOMS 19 (1993) 302-325.
+                       src/symbolic/supernode.rs was written from this plus the
+                       published SSIDS merge rule. See section 5.1.
+  Karypis & Kumar      Multilevel partitioning, SIAM J. Sci. Comput. (1998).
+  Fiduccia & Mattheyses  Linear-time refinement, 19th DAC (1982) 175-181.
+
+
+================================================================================
+4. LINKED DEPENDENCIES
+================================================================================
+
+4.1  Rust crates linked into the SPARTA library
+--------------------------------------------------------------------------------
+
+    num-complex           MIT OR Apache-2.0
+    num-traits            MIT OR Apache-2.0
+    rayon                 MIT OR Apache-2.0
+    rayon-core            MIT OR Apache-2.0
+    crossbeam-deque       MIT OR Apache-2.0
+    crossbeam-epoch       MIT OR Apache-2.0
+    crossbeam-utils       MIT OR Apache-2.0
+    either                MIT OR Apache-2.0
+    serde_json            MIT OR Apache-2.0    (reads and writes saved
+                                               profiles, configs.json)
+    serde_core            MIT OR Apache-2.0
+    itoa                  MIT OR Apache-2.0
+    memchr                Unlicense OR MIT
+    zmij                  MIT
+
+    The C and C++ library in crates/sparta-capi links the same set and
+    nothing else. The set is the same on macOS, Linux and Windows.
+
+    A build with the `vulkan` feature also links:
+
+    ash                   MIT OR Apache-2.0    (Vulkan API bindings)
+    libloading            ISC                  (opens the Vulkan loader)
+    cfg-if                MIT OR Apache-2.0
+    windows-link          MIT OR Apache-2.0    (Windows only)
+
+    The Vulkan loader itself is not linked; it is opened at run time from
+    the system's graphics driver installation.
+
+4.2  Additional crates linked into the Python extension module
+--------------------------------------------------------------------------------
+
+    pyo3                  MIT OR Apache-2.0
+    pyo3-ffi              MIT OR Apache-2.0
+    numpy (rust-numpy)    BSD-2-Clause
+    ndarray               MIT OR Apache-2.0
+    num-integer           MIT OR Apache-2.0
+    matrixmultiply        MIT OR Apache-2.0
+    rawpointer            MIT OR Apache-2.0
+    libc                  MIT OR Apache-2.0
+    cfg-if                MIT OR Apache-2.0
+    unindent              MIT OR Apache-2.0
+    memoffset             MIT
+    once_cell             MIT OR Apache-2.0
+    rustc-hash            MIT OR Apache-2.0
+
+    Build-time only, not linked into either product: build scripts and their
+    dependencies (cc, jobserver, shlex, find-msvc-tools, autocfg,
+    pyo3-build-config, target-lexicon, getrandom on Windows) and procedural
+    macros and their dependencies (pyo3-macros, pyo3-macros-backend, indoc,
+    heck, proc-macro2, quote, syn, rustversion, unicode-ident).
+
+    The lists above follow from `cargo metadata` with build and procedural
+    macro dependencies left out. The licence notices themselves (each crate's
+    copyright line and the MIT, Apache-2.0 or BSD text) are not reproduced
+    here. Generate them before a binary release:
+
+        cargo install cargo-about
+        cargo about generate about.hbs > THIRD-PARTY-NOTICES.generated
+
+    Keep sections 1-3 of this file, which cargo-about cannot discover because
+    that code is vendored rather than linked, and replace this section with
+    the generated one.
+
+4.3  Python runtime imports
+--------------------------------------------------------------------------------
+
+    NumPy                 BSD-3-Clause         (c) NumPy Developers
+    SciPy                 BSD-3-Clause         (c) SciPy Developers
+
+    Imported by python/sparta/__init__.py at runtime. If SPARTA is distributed
+    as a bundled application that ships NumPy or SciPy binaries, reproduce
+    their full licence texts here. Merely depending on them via pip creates no
+    notice obligation.
+
+4.4  Apple platform
+--------------------------------------------------------------------------------
+
+    SPARTA builds against the Metal, Foundation and Accelerate frameworks and
+    uses `xcrun clang` at build time, all governed by the Apple SDK licence
+    terms. Accelerate supplies BLAS and LAPACK to the CPU backend. Nothing
+    Apple-owned is redistributed: the frameworks are linked dynamically from
+    the end user's system, and `src/kernels/*.metal` are embedded as source
+    text and compiled at runtime by the end user's own Metal driver.
+
+4.5  BLAS and LAPACK on other platforms
+--------------------------------------------------------------------------------
+
+    Outside Apple, a build links the BLAS and LAPACK library named by the
+    SPARTA_BLAS_LIB environment variable at build time, for example OpenBLAS
+    (BSD-3-Clause) or Intel MKL (Intel Simplified Software License). Without
+    it nothing is linked. Whoever redistributes such a build together with the
+    library must ship that library's own licence and notices as well.
+
+
+================================================================================
+5. SPARTA'S OWN CODE
+================================================================================
+
+Everything not listed above is original SPARTA work, Copyright (C) 2026 Robert
+Fennis and Milan Rother, licensed under the GNU Affero General Public License,
+version 3 or (at your option) any later version. The licence text is in
+LICENSE. No third-party licence covers this code. In
+particular:
+
+    src/kernels/          all Metal compute kernels
+    src/metal.m           the Objective-C command bridge
+    src/gpu/, src/solver.rs
+                          the backend boundary and Solver
+    src/analysis.rs       GPU storage layout and dispatch schedule
+    src/symbolic/         the entire symbolic phase: driver, elimination
+                          tree, postorder, column counts and supernode
+                          partition. All written from published literature;
+                          see section 3.
+    crates/scalpel/       the SCALPEL nested-dissection ordering
+    crates/sparta-capi/   the C and C++ binding
+    devtools/matgen/      curl-curl test matrix generator (development only)
+    python/src/lib.rs     PyO3 bindings
+    python/sparta/        the Python API
+    examples/, tools/     benchmark and conversion harnesses
+
+
+5.1  Provenance of the symbolic phase
+--------------------------------------------------------------------------------
+
+Until September 2026 the symbolic analysis and the fill-reducing orderings were
+copied from RSLAB, a fork of feral. All of it was replaced between 14 and
+15 September 2026, because the upstream copyright position could not be
+established. NOTHING IN THIS REPOSITORY DERIVES FROM RSLAB OR FERAL.
+
+What replaced it, and what each was written from:
+
+    src/symbolic/column_counts.rs
+        Gilbert, Ng & Peyton, SIAM J. Matrix Anal. Appl. 15(4):1075-1091
+        (1994). Detailed record in COL_COUNTS.md section 7, removed in
+        a5985e4 (`git show a5985e4^:COL_COUNTS.md`).
+
+    src/symbolic/elimination_tree.rs, postorder.rs
+        George & Liu, Computer Solution of Large Sparse Positive Definite
+        Systems (1981) ch. 5; Liu, SIAM J. Matrix Anal. Appl. 11(1):134-172
+        (1990).
+
+    src/symbolic/supernode.rs
+        Fundamental supernodes per Liu, Ng & Peyton, ACM TOMS 19 (1993)
+        302-325. Merge rule per SPRAL SSIDS, section 2.1.
+
+    The fill-reducing ordering
+        Replaced by METIS in September 2026, and METIS by SCALPEL
+        (crates/scalpel, original SPARTA work) in October 2026.
+
+    devtools/matgen/
+        Written from the physics: the time-harmonic curl-curl Maxwell operator
+        on a structured grid, discretised through curl curl = L - grad div.
+
+No code was taken from any existing implementation of these algorithms. In
+particular: no CSparse or CXSparse, no code listings from Davis's textbook, no
+SuiteSparse, no SSIDS, no METIS source, and no RSLAB.
+
+Verification. The replacements are behaviour-preserving, which is a stronger
+check than passing tests: the plan digest -- a hash of everything the numeric
+phase consumes, including the ordering and the full supernode partition -- is
+unchanged on every test system, and nnz(L) is identical on all six curl-curl
+sizes up to 113,335,262 nonzeros.
+
+Limitations, which counsel should see rather than discover. This work was done
+by a large language model under human direction. For column_counts.rs the prior
+implementation had already been deleted and was never read, so that record is
+a genuine clean room. For the other files the prior implementation WAS read
+before being rewritten: the algorithms are published and unprotectable, the
+expression differs throughout, and no other implementation was consulted, but
+it is a reimplementation with knowledge of the original rather than a clean
+room. Separately, an LLM's training corpus cannot be certified free of any
+widely published code. The obligation these files ever carried was attribution,
+not copyleft. Having an engineer read them against the cited papers and sign
+off, dated, would convert this from "LLM-authored, documented" to
+"human-reviewed and adopted"; roughly two hours for about 1,500 lines.

@@ -1,0 +1,89 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Unsymmetric LU: the triangular solve. The port of
+// src/kernels/lu_solve.metal, which documents the two index mappings and why
+// the pivot-order handover goes through scratch.
+//
+// Kernels: solve_forward_lu, solve_backward_lu, one workgroup per front and
+// right-hand side at the width the host picks per level. On this path binding
+// 8 (`diagonal` in common.comp) is the solve scratch, one column per
+// right-hand side, as on Metal.
+#define SOLUTION_BLOCK
+#include "common.comp"
+
+const uint SOLVE_STAGE = 256;
+
+#if defined(KERNEL_solve_forward_lu)
+shared vec2 xs[SOLVE_STAGE];
+// Forward substitution with the unit lower triangle of one front, for
+// right-hand side gl_WorkGroupID.y. The right-hand side is read in pivot order
+// and the solved block is written back in variable order.
+void main() {
+    uint lane = gl_LocalInvocationID.x, width = gl_WorkGroupSize.x;
+    uint s = ids[range.x + gl_WorkGroupID.x];
+    Node node = nodes[s];
+    uint m = node.nr, nc = node.nc;
+    uint x = gl_WorkGroupID.y * range.z;
+    uint y = gl_WorkGroupID.y * range.z + node.first;
+    uint l = node.loffset;
+    for (uint k = lane; k < nc; k += width)
+        diagonal[y + k] = x_load(x + global_row(node, k));
+    BARRIER_DEVICE();
+    for (uint k = 0; k < nc; k++) {
+        vec2 v = diagonal[y + k];
+        for (uint i = k + 1 + lane; i < nc; i += width)
+            diagonal[y + i] -= mul(factors[l + k * m + i], v);
+        BARRIER_DEVICE();
+    }
+    for (uint k = lane; k < nc; k += width)
+        x_store(x + front_row(node, k), diagonal[y + k]);
+    BARRIER_DEVICE();
+    uint tail = m - nc;
+    for (uint r0 = 0; r0 < tail; r0 += width) {
+        uint i = nc + r0 + lane;
+        vec2 acc = vec2(0);
+        for (uint base = 0; base < nc; base += SOLVE_STAGE) {
+            uint count = min(SOLVE_STAGE, nc - base);
+            BARRIER_SHARED();
+            for (uint t = lane; t < count; t += width)
+                xs[t] = diagonal[y + base + t];
+            BARRIER_SHARED();
+            if (i < m)
+                for (uint c = 0; c < count; c++)
+                    acc += mul(factors[l + (base + c) * m + i], xs[c]);
+        }
+        if (i < m)
+            x_atomic_subtract(x + front_row(node, i), acc);
+    }
+}
+#endif
+
+#if defined(KERNEL_solve_backward_lu)
+// Backward substitution with U over one front, for right-hand side
+// gl_WorkGroupID.y: U11 read transposed out of the factor columns, U12 from
+// the row-major upper store.
+void main() {
+    uint lane = gl_LocalInvocationID.x, width = gl_WorkGroupSize.x;
+    uint s = ids[range.x + gl_WorkGroupID.x];
+    Node node = nodes[s];
+    uint m = node.nr, nc = node.nc, tail = m - nc;
+    uint x = gl_WorkGroupID.y * range.z;
+    uint l = node.loffset;
+    uint u = node.uoffset;
+    for (uint kk = nc; kk > 0; kk--) {
+        uint k = kk - 1;
+        vec2 acc = vec2(0);
+        for (uint j = k + 1 + lane; j < nc; j += width)
+            acc -= mul(factors[l + j * m + k], x_load(x + front_row(node, j)));
+        for (uint j = nc + lane; j < m; j += width)
+            acc -= mul(upper[u + k * tail + j - nc], x_load(x + front_row(node, j)));
+        BARRIER_SHARED();
+        acc = reduce_sum(acc);
+        if (lane == 0) {
+            uint at = x + front_row(node, k);
+            x_store(at, cdiv(x_load(at) + acc, factors[l + k * m + k]));
+        }
+        BARRIER_DEVICE();
+    }
+}
+#endif

@@ -1,0 +1,21 @@
+[package]
+name = "sparta-python"
+version = "0.1.0"
+edition = "2021"
+authors = ["Robert Fennis", "Milan Rother"]
+license = "AGPL-3.0-or-later"
+publish = false
+[workspace]
+[lib]
+name = "_sparta"
+crate-type = ["cdylib"]
+[features]
+## The Vulkan backend for AMD and NVIDIA; see "Vulkan" in the README.
+vulkan = ["sparta-solver/vulkan"]
+
+[dependencies]
+sparta-solver = { path = ".." }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+numpy = "0.22"
+rayon = "1"
+num-complex = "0.4"

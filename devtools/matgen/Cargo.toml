@@ -1,0 +1,11 @@
+[package]
+name = "sparta-matgen"
+version = "0.1.0"
+edition = "2021"
+authors = ["Robert Fennis", "Milan Rother"]
+license = "AGPL-3.0-or-later"
+publish = false
+description = "Test-matrix generators for SPARTA's examples and tests. Not part of the shipped library."
+
+[dependencies]
+num-complex = "0.4"

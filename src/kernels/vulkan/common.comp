@@ -1,0 +1,345 @@
+// Shared foundation for every SPARTA Vulkan kernel: the descriptors that cross
+// the Rust/Vulkan boundary, complex arithmetic, workgroup reductions, the pivot
+// failure and perturbation policy, and the tiling constants. The GLSL port of
+// src/kernels/common.metal; that file is the specification, and every choice
+// documented there (the arithmetic forms, the perturbation policy, the scale
+// sweep) holds here unchanged.
+//
+// Included by every other file in this directory. Each of them is compiled
+// once per kernel it holds, with `-DKERNEL_<name>` selecting that kernel's
+// `main`, so one file can keep a kernel family together as the Metal files do.
+//
+// Differences from Metal, all mechanical:
+//
+// - Geometry arrives as specialization constants rather than preprocessor
+//   macros, so one SPIR-V module serves every Config. The host sets them from
+//   the plan's config, the same values Metal receives as macros.
+// - The workgroup width is a specialization constant too (`local_size_x_id`),
+//   so a kernel Metal dispatches at several widths has one pipeline per width.
+//   `gl_WorkGroupSize.x` is what Metal reads from [[threads_per_threadgroup]].
+// - GLSL has no pointers. Buffers are global, and a front, panel or factor
+//   block is addressed by its base offset.
+// - Subgroups replace SIMD groups. Their width is 32 on NVIDIA and 32 or 64 on
+//   AMD, so every reduction counts subgroups with `gl_NumSubgroups` rather than
+//   assuming Apple's 32.
+#pragma use_vulkan_memory_model
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// --- Geometry (Config), in the order the host passes it ---------------------
+// Pivots accumulated per panel. Config::panel.
+layout(constant_id = 0) const uint PANEL = 16;
+// Per-thread register block edge of the 16x16 Schur workgroup. Config::schur_block.
+layout(constant_id = 1) const uint SCHUR_BLOCK = 4;
+// Rows per thread of the 16x16 strip workgroup. Config::strip_block.
+layout(constant_id = 2) const uint STRIP_BLOCK = 4;
+// Workgroup width of factor_narrow. Config::pivot_threads.
+layout(constant_id = 3) const uint PIVOT_THREADS = 128;
+// Panel columns staged per pass of the update kernels. Config::schur_chunk.
+layout(constant_id = 4) const uint SCHUR_CHUNK = 16;
+// Rows one factor_panel_tail workgroup stages at a time: its own width.
+layout(constant_id = 5) const uint TAIL_ROWS = 64;
+// Experimental LU diagonal preference. Config::lu_diag_threshold.
+layout(constant_id = 6) const float LU_DIAG_THRESHOLD = 0.0;
+// Upper bound on subgroups in one workgroup, sizing every reduction's scratch:
+// the largest workgroup over the device's smallest subgroup.
+layout(constant_id = 7) const uint MAX_SIMDS = 32;
+// The workgroup shape of this pipeline.
+layout(local_size_x_id = 8, local_size_y_id = 9) in;
+// Widest fully summed block a front takes whole in one workgroup.
+// Config::narrow_cols.
+layout(constant_id = 10) const uint NARROW_COLS = 32;
+
+const uint SCHUR_TILE = 16 * SCHUR_BLOCK;
+const uint STRIP_ROWS = 16 * STRIP_BLOCK;
+const uint PANEL_COLS = PANEL + 1;
+
+// --- Descriptors -------------------------------------------------------------
+// Must match analysis::Node. `soffset` locates this front's contribution block
+// once store_factors has compacted it out of the front.
+struct Node {
+    uint offset, nr, nc, rows, children, count, entries, nentries, first, loffset, woffset,
+        uoffset, soffset, sld;
+};
+struct Child {
+    uint node, map;
+};
+struct Entry {
+    uint source, position;
+};
+// Must match analysis::FrontState. See common.metal for the fields.
+struct FrontState {
+    uint next, start, width, panel;
+    uint perturbed;
+};
+struct UpdateTile {
+    uint node, row, col;
+};
+
+// The lanes of one workgroup hand results to each other through these buffers
+// (a pivot choice written by lane 0, a column formed by all lanes and read by
+// all), so every writable one is `workgroupcoherent` under the Vulkan memory
+// model: a workgroup barrier with buffer semantics then makes one lane's write
+// visible to the rest of the group, as Metal's mem_device fence does. The
+// scope is the workgroup, not the device, because nothing more is needed
+// within a dispatch -- work across dispatches is ordered by the host's
+// pipeline barriers -- and a device-scope `coherent` buffer is not cached in
+// L1 on NVIDIA, which the latency-bound pivot kernels pay for on every load.
+layout(std430, set = 0, binding = 0) readonly buffer NodesBuffer { Node nodes[]; };
+layout(std430, set = 0, binding = 1) readonly buffer RowsBuffer { uint rows[]; };
+layout(std430, set = 0, binding = 2) readonly buffer ChildrenBuffer { Child children[]; };
+layout(std430, set = 0, binding = 3) readonly buffer MapsBuffer { uint maps[]; };
+layout(std430, set = 0, binding = 4) readonly buffer EntriesBuffer { Entry entries[]; };
+layout(std430, set = 0, binding = 5) readonly buffer IdsBuffer { uint ids[]; };
+layout(std430, set = 0, binding = 6) readonly buffer ValuesBuffer { vec2 values[]; };
+layout(std430, set = 0, binding = 7) workgroupcoherent buffer FrontsBuffer { vec2 fronts[]; };
+// LDL^T: the block diagonal. LU: solve scratch.
+layout(std430, set = 0, binding = 8) workgroupcoherent buffer DiagonalBuffer { vec2 diagonal[]; };
+layout(std430, set = 0, binding = 9) workgroupcoherent buffer SubdiagBuffer { vec2 subdiag[]; };
+layout(std430, set = 0, binding = 10) workgroupcoherent buffer PermsBuffer { uint perms[]; };
+layout(std430, set = 0, binding = 11) workgroupcoherent buffer TwoBuffer { uint two[]; };
+layout(std430, set = 0, binding = 12) workgroupcoherent buffer StatusBuffer { uint status[]; };
+// Binding 13 is the solution block. The solve kernels declare it themselves,
+// because the forward sweep needs it as raw words for its atomics.
+layout(std430, set = 0, binding = 15) workgroupcoherent buffer StateBuffer { FrontState state[]; };
+layout(std430, set = 0, binding = 16) readonly buffer StripBuffer { UpdateTile strip_jobs[]; };
+layout(std430, set = 0, binding = 17) workgroupcoherent buffer FactorsBuffer { vec2 factors[]; };
+layout(std430, set = 0, binding = 18) readonly buffer SchurBuffer { UpdateTile schur_jobs[]; };
+layout(std430, set = 0, binding = 19) workgroupcoherent buffer PanelsBuffer { vec2 panels[]; };
+layout(std430, set = 0, binding = 20) workgroupcoherent buffer UpperBuffer { vec2 upper[]; };
+
+// Metal's buffer 14: the per-dispatch range. {start, count} for most kernels,
+// {start, count, splits, extra} for the sliced ones, {start, count, n, nrhs}
+// for the solve sweeps.
+layout(push_constant) uniform Range { uvec4 range; };
+
+// --- Barriers ----------------------------------------------------------------
+// Metal's threadgroup_barrier with its three fence choices. Each is an
+// execution barrier across the workgroup plus the memory fence named.
+#define BARRIER_SHARED()                                                                  \
+    controlBarrier(gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsShared,        \
+                   gl_SemanticsAcquireRelease)
+#define BARRIER_DEVICE()                                                                  \
+    controlBarrier(gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsBuffer,        \
+                   gl_SemanticsAcquireRelease)
+#define BARRIER_ALL()                                                                     \
+    controlBarrier(gl_ScopeWorkgroup, gl_ScopeWorkgroup,                                  \
+                   gl_StorageSemanticsBuffer | gl_StorageSemanticsShared,                 \
+                   gl_SemanticsAcquireRelease)
+// The status word of front `s`, read atomically: the update kernels read it
+// while other workgroups of the same dispatch may flag a non-finite value.
+uint status_of(uint s) {
+    return atomicLoad(status[s], gl_ScopeDevice, 0, gl_SemanticsRelaxed);
+}
+
+// --- Complex arithmetic --------------------------------------------------------
+// The product is the second form common.metal records: one rounded product per
+// component and the other folded in by an FMA, so the subtraction between the
+// two stays intact. Measured on an RTX 3080 (Vulkan, complex64): residual
+// 2.966e-7 against 2.971e-7 for the four-multiply form on a 24^3 curl-curl
+// grid and 3.241e-7 against 3.234e-7 at 30^3, and the factorization 15% faster
+// on em_m2_sym2 (0.0174 s against 0.0200 s device) and 4% on the 24^3 grid.
+// On Metal it measured neutral in speed. `precise` keeps the driver from
+// contracting anything further: the form that folds both products into the
+// accumulator costs 30% more residual (see common.metal).
+vec2 mul(vec2 a, vec2 b) {
+    precise float xx = a.x * b.x, xy = a.x * b.y;
+    precise vec2 r = vec2(fma(-a.y, b.y, xx), fma(a.y, b.x, xy));
+    return r;
+}
+// Finite test on the bit pattern: an all-ones exponent is an infinity or a NaN.
+// Written this way so no driver's floating-point assumptions can fold it away.
+bool finite1(float v) {
+    return (floatBitsToUint(v) & 0x7f800000u) != 0x7f800000u;
+}
+bool finite2(vec2 v) {
+    return finite1(v.x) && finite1(v.y);
+}
+float mag(vec2 a) {
+    return length(a);
+}
+// A float division rounded as Metal's is. Metal without fast math rounds `/`
+// correctly; Vulkan allows 2.5 ulp, and NVIDIA divides by multiplying with a
+// reciprocal, so there x / x need not be 1. The kernels depend on that being
+// exact: two identical rows must stay identical through a pivot, or a pivot
+// that is exactly zero on Metal comes out at 1e-10 and is never recognised as
+// dead. One correction step on the residual, taken by an FMA, restores it --
+// the quotient is exact wherever it is representable. A zero, infinite or NaN
+// first quotient is returned as it is, so division by zero behaves as before.
+float qdiv(float a, float b) {
+    precise float q = a / b;
+    if (q == 0.0 || !finite1(q))
+        return q;
+    precise float r = fma(-q, b, a);
+    precise float c = q + r / b;
+    return c;
+}
+vec2 vdiv(vec2 a, float b) {
+    return vec2(qdiv(a.x, b), qdiv(a.y, b));
+}
+vec2 cdiv(vec2 a, vec2 b) {
+    precise vec2 r;
+    if (abs(b.x) >= abs(b.y)) {
+        precise float q = qdiv(b.y, b.x);
+        precise float d = b.x + b.y * q;
+        r = vec2(qdiv(a.x + a.y * q, d), qdiv(a.y - a.x * q, d));
+    } else {
+        precise float q = qdiv(b.x, b.y);
+        precise float d = b.y + b.x * q;
+        r = vec2(qdiv(a.x * q + a.y, d), qdiv(a.y * q - a.x, d));
+    }
+    return r;
+}
+
+// --- Pivot policy (see common.metal) -----------------------------------------
+const uint PIVOT_ZERO_COLUMN = 0x01000000u;
+const uint PIVOT_NONFINITE = 0x02000000u;
+const uint PIVOT_TINY_2X2 = 0x03000000u;
+const float PIVOT_EPS = 1e-7;
+const float PIVOT_FLOOR = 3.45e-4;
+// The Bunch-Kaufman constant (1 + sqrt(17)) / 8.
+const float BK_ALPHA = 0.6403882;
+
+// Replacement for a pivot that has died, keeping its phase when it has one.
+vec2 floor_pivot(vec2 d, float floor_value) {
+    float v = mag(d);
+    return v > 0 ? d * qdiv(floor_value, v) : vec2(floor_value, 0);
+}
+// A pivot the factorization cannot divide by at all.
+bool pivot_dead(vec2 d) {
+    return !(mag(d) > 0);
+}
+
+// --- Workgroup reductions ------------------------------------------------------
+// One subgroup reduction, then a serial combine over the per-subgroup results.
+// Each returns the same value on every lane. Every lane must call them: they
+// barrier internally. The caller owns the barrier that makes a scratch array
+// safe to reuse, and each reduction kind has its own array so two different
+// kinds never race.
+shared float reduce_max_scratch[MAX_SIMDS];
+shared uint reduce_or_scratch[MAX_SIMDS];
+shared vec2 reduce_sum_scratch[MAX_SIMDS];
+shared float argmax_value_scratch[MAX_SIMDS];
+shared uint argmax_index_scratch[MAX_SIMDS];
+
+float reduce_max(float v) {
+    v = subgroupMax(v);
+    if (gl_SubgroupInvocationID == 0)
+        reduce_max_scratch[gl_SubgroupID] = v;
+    BARRIER_SHARED();
+    float r = reduce_max_scratch[0];
+    for (uint i = 1; i < gl_NumSubgroups; i++)
+        r = max(r, reduce_max_scratch[i]);
+    return r;
+}
+// Flags are 0/1, so a max is the OR.
+uint reduce_or(uint v) {
+    v = subgroupMax(v);
+    if (gl_SubgroupInvocationID == 0)
+        reduce_or_scratch[gl_SubgroupID] = v;
+    BARRIER_SHARED();
+    uint r = reduce_or_scratch[0];
+    for (uint i = 1; i < gl_NumSubgroups; i++)
+        r = max(r, reduce_or_scratch[i]);
+    return r;
+}
+vec2 reduce_sum(vec2 v) {
+    v = subgroupAdd(v);
+    if (gl_SubgroupInvocationID == 0)
+        reduce_sum_scratch[gl_SubgroupID] = v;
+    BARRIER_SHARED();
+    vec2 r = reduce_sum_scratch[0];
+    for (uint i = 1; i < gl_NumSubgroups; i++)
+        r += reduce_sum_scratch[i];
+    return r;
+}
+// Largest magnitude, ties broken toward the lowest index (see common.metal).
+void reduce_argmax(float v, uint idx, out float value, out uint at) {
+    float best = subgroupMax(v);
+    uint where = subgroupMin(v == best ? idx : 0xffffffffu);
+    if (gl_SubgroupInvocationID == 0) {
+        argmax_value_scratch[gl_SubgroupID] = best;
+        argmax_index_scratch[gl_SubgroupID] = where;
+    }
+    BARRIER_SHARED();
+    float bv = argmax_value_scratch[0];
+    uint bi = argmax_index_scratch[0];
+    for (uint i = 1; i < gl_NumSubgroups; i++)
+        if (argmax_value_scratch[i] > bv ||
+            (argmax_value_scratch[i] == bv && argmax_index_scratch[i] < bi)) {
+            bv = argmax_value_scratch[i];
+            bi = argmax_index_scratch[i];
+        }
+    value = bv;
+    at = bi;
+}
+// Largest magnitude in the front at `a` over its fully summed columns (see
+// front_scale in common.metal for why the sweep stops at column `n`).
+float front_scale(uint a, uint m, uint n, uint lane, uint threads) {
+    float big = 0;
+    for (uint idx = lane; idx < m * n; idx += threads) {
+        uint i = idx / n, j = idx - i * n;
+        big = max(big, mag(fronts[a + i * m + j]));
+    }
+    BARRIER_SHARED();
+    return reduce_max(big);
+}
+
+// Where a front's local index lives in the global solution vector (see
+// common.metal for the LDL^T and LU readings of the two mappings).
+uint global_row(Node node, uint local_index) {
+    return rows[node.rows + (local_index < node.nc ? perms[node.first + local_index] : local_index)];
+}
+uint front_row(Node node, uint local_index) {
+    return rows[node.rows + local_index];
+}
+
+// --- The solution block (binding 13) -------------------------------------------
+// Declared only by the solve kernels, as raw 32-bit words: forward substitution
+// subtracts into rows that siblings share, and those updates are atomic. Two
+// builds of each solve kernel exist. With ATOMIC_FLOAT the device adds floats
+// atomically (VK_EXT_shader_atomic_float, NVIDIA); without it the subtraction
+// is a compare-and-swap loop on the word, which every device supports (AMD's
+// integrated GPUs lack the float atomic). `x - v` and `x + (-v)` round alike,
+// so both builds produce the same values Metal's atomic_fetch_sub does.
+#if defined(SOLUTION_BLOCK)
+#if defined(ATOMIC_FLOAT)
+#extension GL_EXT_shader_atomic_float : require
+layout(std430, set = 0, binding = 13) workgroupcoherent buffer SolutionBuffer { float xwords[]; };
+vec2 x_load(uint i) {
+    return vec2(xwords[2 * i], xwords[2 * i + 1]);
+}
+void x_store(uint i, vec2 v) {
+    xwords[2 * i] = v.x;
+    xwords[2 * i + 1] = v.y;
+}
+void x_atomic_subtract(uint i, vec2 v) {
+    atomicAdd(xwords[2 * i], -v.x);
+    atomicAdd(xwords[2 * i + 1], -v.y);
+}
+#else
+layout(std430, set = 0, binding = 13) workgroupcoherent buffer SolutionBuffer { uint xwords[]; };
+vec2 x_load(uint i) {
+    return vec2(uintBitsToFloat(xwords[2 * i]), uintBitsToFloat(xwords[2 * i + 1]));
+}
+void x_store(uint i, vec2 v) {
+    xwords[2 * i] = floatBitsToUint(v.x);
+    xwords[2 * i + 1] = floatBitsToUint(v.y);
+}
+// Subtracts `v` from the float in word `at` by compare-and-swap.
+void word_atomic_subtract(uint at, float v) {
+    uint seen = xwords[at];
+    while (true) {
+        uint expected = seen;
+        seen = atomicCompSwap(xwords[at], expected, floatBitsToUint(uintBitsToFloat(expected) - v));
+        if (seen == expected)
+            break;
+    }
+}
+void x_atomic_subtract(uint i, vec2 v) {
+    word_atomic_subtract(2 * i, v.x);
+    word_atomic_subtract(2 * i + 1, v.y);
+}
+#endif
+#endif

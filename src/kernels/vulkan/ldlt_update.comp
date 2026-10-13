@@ -1,0 +1,149 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Complex-symmetric LDL^T: the deferred trailing updates. The port of
+// src/kernels/ldlt_update.metal, which documents the tiling, the drain
+// cadence and the tile-skipping rules; the arithmetic order is the same.
+//
+// Kernels: update_strip, update_schur. Both run on a 16x16 workgroup.
+#include "common.comp"
+
+// Folds the block diagonal into entry `k` of the front row starting at `row`.
+vec2 fold_diagonal(uint row, uint first, uint k) {
+    if (two[first + k] != 0)
+        return mul(fronts[row + k], diagonal[first + k]) +
+               mul(fronts[row + k + 1], subdiag[first + k]);
+    if (k > 0 && two[first + k - 1] != 0)
+        return mul(fronts[row + k - 1], subdiag[first + k - 1]) +
+               mul(fronts[row + k], diagonal[first + k]);
+    return mul(fronts[row + k], diagonal[first + k]);
+}
+
+#if defined(KERNEL_update_strip)
+shared vec2 w[STRIP_ROWS][SCHUR_CHUNK];
+shared vec2 lj[16][SCHUR_CHUNK];
+// Deferred rank-`width` update of the fully summed columns past the panel: one
+// STRIP_ROWS x 16 tile per workgroup, a STRIP_BLOCK x 1 register block per lane.
+void main() {
+    uvec2 lane = gl_LocalInvocationID.xy;
+    UpdateTile job = strip_jobs[range.x + gl_WorkGroupID.x];
+    uint s = job.node;
+    Node node = nodes[s];
+    FrontState st = state[s];
+    uint end = st.start + st.width;
+    if (st.width == 0 || end >= node.nc || (job.col + 1u) * 16u <= end || status_of(s) != 0)
+        return;
+    uint m = node.nr, first = node.first;
+    uint a = node.offset;
+    uint rowbase = job.row * STRIP_ROWS, colbase = job.col * 16;
+    uint linear = lane.y * 16 + lane.x;
+    vec2 acc[STRIP_BLOCK];
+    for (uint d = 0; d < STRIP_BLOCK; d++)
+        acc[d] = vec2(0);
+    for (uint c0 = st.start; c0 < end;) {
+        uint width = min(SCHUR_CHUNK, end - c0);
+        if (c0 + width < end && two[first + c0 + width - 1] != 0)
+            width--;
+        for (uint idx = linear; idx < STRIP_ROWS * width; idx += 256) {
+            uint r = idx / width, c = idx - r * width, ri = rowbase + r;
+            w[r][c] = ri < m ? fold_diagonal(a + ri * m, first, c0 + c) : vec2(0);
+        }
+        for (uint idx = linear; idx < 16 * width; idx += 256) {
+            uint r = idx / width, c = idx - r * width, rj = colbase + r;
+            lj[r][c] = rj < m ? fronts[a + rj * m + c0 + c] : vec2(0);
+        }
+        BARRIER_SHARED();
+        for (uint c = 0; c < width; c++) {
+            vec2 lv = lj[lane.x][c];
+            for (uint d = 0; d < STRIP_BLOCK; d++)
+                acc[d] -= mul(w[STRIP_BLOCK * lane.y + d][c], lv);
+        }
+        BARRIER_SHARED();
+        c0 += width;
+    }
+    uint j = colbase + lane.x;
+    if (j >= node.nc || j < end)
+        return;
+    for (uint d = 0; d < STRIP_BLOCK; d++) {
+        uint i = rowbase + STRIP_BLOCK * lane.y + d;
+        if (i >= m || j > i)
+            continue;
+        vec2 v = fronts[a + i * m + j] + acc[d];
+        if (!finite2(v))
+            atomicExchange(status[s], 0xfffffffeu);
+        fronts[a + i * m + j] = v;
+        // The mirror is written only where the next row search reads it.
+        if (i < node.nc)
+            fronts[a + j * m + i] = v;
+    }
+}
+#endif
+
+#if defined(KERNEL_update_schur)
+shared vec2 w[SCHUR_TILE][SCHUR_CHUNK];
+shared vec2 lj[SCHUR_TILE][SCHUR_CHUNK];
+const uint SUB = SCHUR_TILE / 4;
+// The tile's 4 x 4 grid of SUB x SUB blocks, lower triangle first (row << 4 | col).
+const uint ORDER[16] = uint[](0x00, 0x10, 0x11, 0x20, 0x21, 0x22, 0x30, 0x31, 0x32, 0x33, 0x01,
+                              0x02, 0x03, 0x12, 0x13, 0x23);
+// Blocked Schur update over the pending pivots [state.panel, state.next): one
+// SCHUR_TILE square per workgroup, a SCHUR_BLOCK square register block per lane.
+void main() {
+    uvec2 lane = gl_LocalInvocationID.xy;
+    UpdateTile job = schur_jobs[range.x + gl_WorkGroupID.x];
+    uint s = job.node;
+    Node node = nodes[s];
+    FrontState st = state[s];
+    if (st.next <= st.panel || status_of(s) != 0)
+        return;
+    uint m = node.nr, base = node.nc, first = node.first;
+    uint a = node.offset;
+    uint rowbase = base + job.row * SCHUR_TILE, colbase = base + job.col * SCHUR_TILE;
+    uint linear = lane.y * 16 + lane.x;
+    uint block = ORDER[linear / 16], within = linear % 16;
+    uint myrow = SUB * (block >> 4) + SCHUR_BLOCK * (within / 4);
+    uint mycol = SUB * (block & 15) + SCHUR_BLOCK * (within % 4);
+    bool idle = (job.row == job.col && linear / 16 >= 10) ||
+                rowbase + SUB * (block >> 4) >= m || colbase + SUB * (block & 15) >= m;
+    vec2 acc[SCHUR_BLOCK][SCHUR_BLOCK];
+    for (uint di = 0; di < SCHUR_BLOCK; di++)
+        for (uint dj = 0; dj < SCHUR_BLOCK; dj++)
+            acc[di][dj] = vec2(0);
+    for (uint c0 = st.panel; c0 < st.next;) {
+        uint width = min(SCHUR_CHUNK, st.next - c0);
+        // Never split a 2x2 pivot across chunks.
+        if (c0 + width < st.next && two[first + c0 + width - 1] != 0)
+            width--;
+        for (uint idx = linear; idx < SCHUR_TILE * width; idx += 256) {
+            uint r = idx / width, c = idx - r * width, k = c0 + c;
+            uint ri = rowbase + r, rj = colbase + r;
+            w[r][c] = ri < m ? fold_diagonal(a + ri * m, first, k) : vec2(0);
+            lj[r][c] = rj < m ? fronts[a + rj * m + k] : vec2(0);
+        }
+        BARRIER_SHARED();
+        uint steps = idle ? 0u : width;
+        for (uint c = 0; c < steps; c++) {
+            vec2 wv[SCHUR_BLOCK], lv[SCHUR_BLOCK];
+            for (uint d = 0; d < SCHUR_BLOCK; d++) {
+                wv[d] = w[myrow + d][c];
+                lv[d] = lj[mycol + d][c];
+            }
+            for (uint di = 0; di < SCHUR_BLOCK; di++)
+                for (uint dj = 0; dj < SCHUR_BLOCK; dj++)
+                    acc[di][dj] -= mul(wv[di], lv[dj]);
+        }
+        BARRIER_SHARED();
+        c0 += width;
+    }
+    for (uint di = 0; di < SCHUR_BLOCK; di++)
+        for (uint dj = 0; dj < SCHUR_BLOCK; dj++) {
+            uint i = rowbase + myrow + di, j = colbase + mycol + dj;
+            if (idle || i >= m || j > i)
+                continue;
+            vec2 v = fronts[a + i * m + j] + acc[di][dj];
+            if (!finite2(v))
+                atomicExchange(status[s], 0xfffffffeu);
+            fronts[a + i * m + j] = v;
+            fronts[a + j * m + i] = v;
+        }
+}
+#endif

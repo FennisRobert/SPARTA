@@ -1,0 +1,30 @@
+# Build output. dist/ holds what `make package` produces.
+/target/
+/python/target/
+dist/
+debug
+*.pdb
+
+# Local toolchain caches, virtualenvs and validation logs
+/.local/
+
+# Python
+__pycache__/
+*.so
+*.egg-info/
+
+# rustfmt backups and cargo-mutants output
+**/*.rs.bk
+**/mutants.out*/
+
+# Converted benchmark systems and their sources are large and problem-specific.
+# .npy covers the loose solve-id / RHS / solution vectors that ship alongside the
+# unsymmetric periodic-array matrices, which are not packed into a container.
+*.npz
+*.npy
+
+# JetBrains: see github/gitignore Global/JetBrains.gitignore for the full list.
+#.idea/
+
+# Benchmark systems are too large for git.
+test_matrices/

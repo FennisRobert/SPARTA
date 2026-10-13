@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Syntax colours for the user guide's code listings, in the website's
+     palette: wine red keywords, grey comments, dark gold literals. -->
+<plist version="1.0">
+<dict>
+  <key>name</key><string>SPARTA</string>
+  <key>settings</key>
+  <array>
+    <dict>
+      <key>settings</key>
+      <dict>
+        <key>foreground</key><string>#1f1c1d</string>
+        <key>background</key><string>#f4f4f5</string>
+      </dict>
+    </dict>
+    <dict>
+      <key>scope</key><string>comment, punctuation.definition.comment</string>
+      <key>settings</key>
+      <dict>
+        <key>foreground</key><string>#857d7e</string>
+        <key>fontStyle</key><string>italic</string>
+      </dict>
+    </dict>
+    <dict>
+      <key>scope</key><string>keyword, storage, keyword.operator.word, variable.language</string>
+      <key>settings</key>
+      <dict><key>foreground</key><string>#8a0c24</string></dict>
+    </dict>
+    <dict>
+      <key>scope</key><string>string, constant.numeric, constant.language, constant.character</string>
+      <key>settings</key>
+      <dict><key>foreground</key><string>#7d5a00</string></dict>
+    </dict>
+    <dict>
+      <key>scope</key><string>entity.name, support.function, support.type, entity.name.type, meta.attribute</string>
+      <key>settings</key>
+      <dict><key>foreground</key><string>#4a3f41</string></dict>
+    </dict>
+  </array>
+</dict>
+</plist>

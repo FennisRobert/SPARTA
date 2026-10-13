@@ -1,0 +1,49 @@
+# Lets `pip install .` work from the repository root.
+#
+# The Python extension crate lives in python/, and it depends on the root crate
+# by path, so the build has to run from here to see both. maturin is pointed at
+# that manifest and told where the Python package sits; python/pyproject.toml
+# stays as the equivalent entry point for `pip install ./python` and for
+# `maturin develop` in validate.sh. Keep the two in step.
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "sparta-solver"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.21", "scipy>=1.7"]
+description = "Experimental Apple Silicon GPU-resident sparse complex-symmetric solver"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "Robert Fennis" }, { name = "Milan Rother" }]
+readme = "README.md"
+
+[tool.maturin]
+manifest-path = "python/Cargo.toml"
+python-source = "python"
+module-name = "sparta._sparta"
+features = ["pyo3/extension-module"]
+# The extension compiles the Metal kernels and the Objective-C bridge from the
+# root crate, so a source distribution has to carry them too. These are sdist
+# only: in a wheel the two Cargo.toml files would collide on one path.
+include = [
+    { path = "Cargo.toml", format = "sdist" },
+    { path = "build.rs", format = "sdist" },
+    { path = "src/**/*.rs", format = "sdist" },
+    { path = "src/**/*.m", format = "sdist" },
+    { path = "src/**/*.metal", format = "sdist" },
+    { path = "src/**/*.comp", format = "sdist" },
+    { path = "python/Cargo.toml", format = "sdist" },
+    { path = "python/src/**/*.rs", format = "sdist" },
+]
+
+# A source distribution only needs what builds the extension. The benchmark
+# matrices alone are ~300 MB of the repository.
+exclude = [
+    { path = "test_matrices/**", format = "sdist" },
+    { path = "documentation/**", format = "sdist" },
+    { path = "examples/**", format = "sdist" },
+    { path = "tools/**", format = "sdist" },
+    { path = "tests/**", format = "sdist" },
+]

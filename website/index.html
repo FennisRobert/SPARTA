@@ -1,0 +1,696 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SPARTA: GPU sparse direct solver</title>
+<meta name="description" content="SPARTA is a GPU sparse direct solver: supernodal multifrontal LDLᵀ and LU on the GPU, from Rust, Python and C/C++. Open source under the GNU AGPL, with a commercial licence for closed-source software.">
+<link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* Red, black and white, square corners. Layout after large engineering-software
+   sites: a dark hero, centred light-weight section titles, grey bands. */
+:root {
+  --red: #8a0c24;
+  --red-dark: #6a0819;
+  --black: #121011;
+  --text: #1f1c1d;
+  --muted: #5f5a5b;
+  --line: #dedad9;
+  --band: #f4f4f5;
+  --bg: #ffffff;
+  --amber: #c98e00;
+  --gpu: #b5223f;
+  --cpu: #2b6cb0;
+  color-scheme: light;
+}
+* { box-sizing: border-box; border-radius: 0; }
+html { scroll-behavior: smooth; }
+html, body { overflow-x: hidden; }
+body { margin: 0; background: var(--bg); color: var(--text);
+       font: 16px/1.6 "Roboto", -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+a { color: var(--red); }
+code, pre, .mono { font-family: "Roboto Mono", ui-monospace, Menlo, monospace; }
+.wrap { max-width: 1160px; margin: 0 auto; padding: 0 24px; }
+.hero .wrap > *, .cols > *, .split > * { min-width: 0; }
+
+/* Top strip and navigation */
+.strip { background: var(--black); color: #bdb6b7; font-size: 13px; }
+.strip .wrap { display: flex; justify-content: space-between; gap: 16px; height: 34px; align-items: center; }
+.strip b { color: #fff; font-weight: 500; }
+.strip i { display: inline-block; width: 7px; height: 7px; margin: 0 6px 1px 14px; background: #d4213f; }
+.strip i.alpha { background: var(--amber); }
+@media (max-width: 700px) { .strip .right { display: none; } }
+nav { position: sticky; top: 0; z-index: 10; background: #fff; box-shadow: 0 1px 0 var(--line), 0 4px 14px rgba(0, 0, 0, .05); }
+nav .wrap { display: flex; align-items: center; gap: 30px; height: 66px; }
+.brand { display: flex; align-items: center; gap: 9px; color: var(--black); text-decoration: none; font-weight: 700;
+         font-size: 19px; letter-spacing: .1em; flex-shrink: 0; }
+.brand img { height: 30px; }
+nav ul { display: flex; gap: 26px; list-style: none; margin: 0; padding: 0; font-size: 15px; }
+nav ul a { color: var(--text); text-decoration: none; }
+nav ul a:hover { color: var(--red); }
+.btn { display: inline-flex; align-items: center; gap: 8px; padding: 11px 20px; font: 500 15px/1.2 "Roboto", sans-serif;
+       text-decoration: none; border: 1px solid transparent; cursor: pointer; }
+.btn.red { background: var(--red); color: #fff; }
+.btn.red:hover { background: var(--red-dark); }
+.btn.white { background: #fff; color: var(--black); }
+.btn.white:hover { background: #ece9e9; }
+.btn.outline { border-color: rgba(255, 255, 255, .55); color: #fff; }
+.btn.outline:hover { background: rgba(255, 255, 255, .08); }
+.btn .chev { font-size: 18px; line-height: 0; }
+nav .btn { margin-left: auto; }
+@media (max-width: 900px) { nav ul { display: none; } }
+
+/* Hero */
+.hero { background: radial-gradient(700px 420px at 78% 40%, rgba(138, 12, 36, .45), transparent 70%),
+                    linear-gradient(120deg, #0c0a0b 0%, #1a0b0f 55%, #2a0a12 100%);
+        color: #fff; position: relative; overflow: hidden; }
+.hero .wrap, .hero-facts { position: relative; z-index: 1; }
+.hero .wrap { display: grid; grid-template-columns: 1.1fr .9fr; gap: 48px; align-items: center; padding-top: 76px; padding-bottom: 64px; }
+.hero h1 { font-size: clamp(26px, 2.9vw, 34px); line-height: 1.18; font-weight: 500; margin: 0 0 16px; }
+.hero .acronym { color: #b7aeaf; font-size: 14px; letter-spacing: .06em; margin: 0 0 22px; }
+.hero p.lead { font-size: 18px; font-weight: 300; color: #e6e0e1; max-width: 32em; margin: 0 0 30px; }
+.hero .buttons { display: flex; flex-wrap: wrap; gap: 12px; }
+/* The animated multifrontal step, behind the right half of the hero: tilted in a fixed
+   perspective and faded towards its edges. The script below draws it. */
+.solve { position: absolute; z-index: 0; top: 0; bottom: 0; right: -10%; width: 76%; pointer-events: none;
+         display: flex; align-items: center; justify-content: center; perspective: 900px; }
+.solve pre { margin: 0; padding: 0; background: transparent; overflow: visible; white-space: pre;
+             font-size: 15px; line-height: 1.7; color: rgba(222, 212, 214, .5);
+             transform: rotateY(-32deg) rotateX(14deg) rotateZ(-3deg) scale(1.05); transform-origin: 60% 50%;
+             -webkit-mask-image: radial-gradient(ellipse 66% 70% at 55% 50%, #000 42%, transparent 100%);
+             mask-image: radial-gradient(ellipse 66% 70% at 55% 50%, #000 42%, transparent 100%); }
+.solve .hot { color: #ff3e5f; text-shadow: 0 0 14px rgba(255, 40, 80, .7); }
+.solve .churn { color: rgba(214, 70, 96, .75); }
+.solve .up { color: rgba(255, 255, 255, .88); text-shadow: 0 0 10px rgba(255, 255, 255, .25); }
+.solve .done { color: rgba(160, 148, 150, .32); }
+.solve .dim { color: rgba(160, 148, 150, .22); }
+@media (max-width: 900px) { .solve { width: 100%; right: -30%; opacity: .45; } }
+.hero-facts { border-top: 1px solid rgba(255, 255, 255, .14); }
+.hero .hero-facts .wrap { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; padding-top: 0; padding-bottom: 0; align-items: start; }
+.hero-facts div { padding: 18px 18px 20px; border-left: 1px solid rgba(255, 255, 255, .14); font-size: 14px; color: #c9c1c2; }
+.hero-facts div:first-child { border-left: 0; padding-left: 0; }
+.hero-facts b { display: block; color: #fff; font-weight: 500; font-size: 15px; }
+@media (max-width: 900px) {
+  .hero .wrap { grid-template-columns: 1fr; padding-top: 48px; }
+  .hero .hero-facts .wrap { grid-template-columns: 1fr 1fr; }
+  .hero-facts div:nth-child(3) { border-left: 0; padding-left: 0; }
+}
+
+/* Sections */
+section { padding: 76px 0; }
+section.band { background: var(--band); }
+.title { text-align: center; max-width: 760px; margin: 0 auto 46px; }
+.title h2 { font-size: clamp(28px, 3.2vw, 36px); font-weight: 400; margin: 0 0 10px; line-height: 1.2; }
+.title p { color: var(--muted); font-size: 17px; font-weight: 300; margin: 0; }
+h3 { font-size: 20px; font-weight: 400; margin: 0; }
+p { margin: 0 0 14px; }
+.cols { display: grid; grid-template-columns: repeat(4, 1fr); gap: 34px; }
+.cols.two { grid-template-columns: 1fr 1fr; gap: 40px 64px; }
+.cols.three { grid-template-columns: repeat(3, 1fr); }
+@media (max-width: 960px) { .cols { grid-template-columns: 1fr 1fr; } .cols.three { grid-template-columns: 1fr; } }
+@media (max-width: 640px) { .cols, .cols.two { grid-template-columns: 1fr; } }
+.feature h3 { margin-bottom: 12px; padding-bottom: 10px; border-bottom: 2px solid var(--black); }
+.feature ul { margin: 0; padding: 0; list-style: none; color: var(--muted); font-size: 15px; }
+.feature li { padding: 6px 0; border-top: 1px solid var(--line); }
+.feature li:first-child { border-top: 0; }
+.more { display: inline-flex; gap: 6px; align-items: center; font-weight: 500; text-decoration: none; margin-top: 10px; }
+.more:hover { text-decoration: underline; }
+
+/* Example */
+.split { display: grid; grid-template-columns: .85fr 1.15fr; gap: 56px; align-items: start; }
+.split h2 { font-size: clamp(28px, 3.2vw, 36px); font-weight: 400; margin: 0 0 14px; line-height: 1.2; }
+.split .lead { color: var(--muted); font-size: 17px; font-weight: 300; }
+.plain { margin: 18px 0 0; padding: 0; list-style: none; }
+.plain li { padding: 10px 0; border-top: 1px solid var(--line); font-size: 15px; }
+.plain li b { font-weight: 500; }
+@media (max-width: 900px) { .split { grid-template-columns: 1fr; gap: 28px; } }
+.tabs { display: flex; }
+.tab { border: 0; background: #e3e0e0; color: var(--text); cursor: pointer; padding: 10px 20px; font: 500 14px/1.2 "Roboto", sans-serif; }
+.tab[aria-selected="true"] { background: var(--black); color: #fff; }
+.panel { display: none; }
+.panel.on { display: block; }
+pre { margin: 0; background: var(--black); color: #ece6e6; padding: 22px 24px; overflow-x: auto; font-size: 13.5px; line-height: 1.65; }
+pre .c { color: #948b8c; } pre .k { color: #ff8599; } pre .s { color: #d9d3d3; }
+
+/* Tables */
+.table-wrap { overflow-x: auto; margin-bottom: 34px; }
+table { width: 100%; border-collapse: collapse; font-size: 15px; }
+caption { text-align: left; font-size: 18px; font-weight: 500; padding-bottom: 10px; }
+th, td { text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+thead th { font-size: 13px; font-weight: 500; letter-spacing: .06em; text-transform: uppercase; color: var(--muted);
+           border-bottom: 2px solid var(--black); }
+td.num, th.num { text-align: right; white-space: nowrap; }
+td.num { font-family: "Roboto Mono", monospace; font-size: 14px; }
+.rig { text-align: center; color: var(--muted); font-size: 14.5px; margin: -30px 0 34px; }
+.fine { color: var(--muted); font-size: 14px; }
+
+/* Performance: GPU against CPU per problem */
+.legend { display: flex; justify-content: center; flex-wrap: wrap; gap: 8px 26px; font-size: 14.5px; color: var(--text); margin: -22px 0 30px; }
+.legend span { display: inline-flex; align-items: center; gap: 8px; }
+.legend .t { display: inline; }
+.legend b { font-weight: 500; }
+.legend i { width: 18px; height: 10px; border-radius: 0 3px 3px 0; display: inline-block; }
+.legend i.gpu, .bar.gpu { background: var(--gpu); }
+.legend i.cpu, .bar.cpu { background: var(--cpu); }
+.perfgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 26px; }
+@media (max-width: 900px) { .perfgrid { grid-template-columns: 1fr; } }
+.perf { margin: 0; background: #fff; border: 1px solid var(--line); border-top: 3px solid var(--black); padding: 22px 24px 18px; }
+.perf h3 { font-size: 19px; }
+.perf .meta { color: var(--muted); font-size: 14px; margin: 4px 0 16px; }
+.metric { margin-bottom: 14px; }
+.mlabel { display: flex; justify-content: space-between; gap: 12px; font-size: 14px; margin-bottom: 6px; }
+.mlabel .sp { color: var(--muted); font-size: 13px; }
+.bar { position: relative; height: 12px; width: calc(var(--w) * .78); border-radius: 0 4px 4px 0; margin-bottom: 2px; outline: none; }
+.bar:hover, .bar:focus-visible { filter: brightness(1.12); }
+.bar .v { position: absolute; left: calc(100% + 8px); top: 50%; transform: translateY(-50%); white-space: nowrap;
+          font: 500 12.5px/1 "Roboto Mono", monospace; color: var(--text); }
+.acc { font-size: 13.5px; color: var(--muted); border-top: 1px solid var(--line); padding-top: 10px; margin: 6px 0 0; }
+.acc.ill { border-top: 0; padding-top: 4px; }
+.alltimes { margin-top: 30px; }
+.alltimes summary { cursor: pointer; font-weight: 500; font-size: 15px; }
+.alltimes table { margin-top: 14px; font-size: 14px; }
+.alltimes th, .alltimes td { padding: 9px 10px; }
+
+/* Platforms */
+.platform { background: #fff; border-top: 3px solid var(--black); padding: 26px 26px 22px; }
+.platform.live { border-top-color: var(--red); }
+.status { display: inline-block; font-size: 12px; font-weight: 500; letter-spacing: .1em; text-transform: uppercase;
+          padding: 3px 8px; margin: 10px 0 14px; background: var(--band); color: var(--muted); }
+.platform.live .status { background: var(--red); color: #fff; }
+.platform.alpha { border-top-color: var(--amber); }
+.platform.alpha .status { background: var(--amber); color: #fff; }
+.platform dl { margin: 0; font-size: 15px; }
+.platform dt { color: var(--muted); font-size: 13px; margin-top: 10px; }
+.platform dd { margin: 2px 0 0; }
+
+/* Getting SPARTA */
+.option { border-top: 3px solid var(--red); padding-top: 22px; }
+.option + .option { border-top-color: var(--black); }
+.option .tag { font-size: 28px; font-weight: 300; margin: 6px 0 14px; }
+.option p { color: var(--muted); }
+.option ul { margin: 0 0 8px; padding-left: 18px; font-size: 15px; }
+.option li { padding: 3px 0; }
+.option li::marker { color: var(--red); }
+.cmd { display: flex; margin: 4px 0 16px; }
+.cmd code { flex: 1; background: var(--band); border: 1px solid var(--line); padding: 7px 10px; font-size: 13px; overflow-x: auto; white-space: nowrap; }
+
+/* Additional information */
+.info details { border-bottom: 1px solid var(--line); padding: 14px 0; }
+.info details:first-child { border-top: 1px solid var(--line); }
+.info summary { cursor: pointer; font-size: 17px; list-style: none; display: flex; justify-content: space-between; gap: 16px; }
+.info summary::-webkit-details-marker { display: none; }
+.info summary::after { content: "+"; color: var(--red); font-size: 22px; line-height: 1; font-weight: 300; }
+.info details[open] summary::after { content: "–"; }
+.info details p { color: var(--muted); margin: 10px 0 2px; font-size: 15px; }
+
+/* Footer */
+footer { background: var(--black); color: #b9b1b2; font-size: 14px; }
+footer .top { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; gap: 30px; padding: 50px 0 36px; }
+footer h4 { color: #fff; font-size: 14px; font-weight: 500; margin: 0 0 12px; }
+footer ul { list-style: none; margin: 0; padding: 0; }
+footer li { padding: 3px 0; }
+footer a { color: #b9b1b2; text-decoration: none; }
+footer a:hover { color: #fff; }
+footer .brand { color: #fff; font-size: 17px; }
+footer .bottom { border-top: 1px solid #2c2729; padding: 16px 0 22px; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; font-size: 13px; }
+@media (max-width: 800px) { footer .top { grid-template-columns: 1fr 1fr; } }
+</style>
+</head>
+<body>
+
+<div class="strip">
+  <div class="wrap">
+    <span><b>SPARTA</b> · GPU sparse direct solver</span>
+    <span class="right"><i></i>Metal: available<i class="alpha"></i>Vulkan: alpha</span>
+  </div>
+</div>
+
+<nav>
+  <div class="wrap">
+    <a class="brand" href="#top"><img src="assets/logo.svg" alt="">SPARTA</a>
+    <ul>
+      <li><a href="#capabilities">Capabilities</a></li>
+      <li><a href="#example">Integration</a></li>
+      <li><a href="#performance">Performance</a></li>
+      <li><a href="#platforms">Platforms</a></li>
+      <li><a href="#get">Get SPARTA</a></li>
+    </ul>
+    <a class="btn red" href="https://github.com/FennisRobert/SPARTA">View on GitHub</a>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="solve" aria-hidden="true"><pre id="solve"></pre></div>
+  <div class="wrap">
+    <div>
+      <h1>Sparse direct factorization on the GPU</h1>
+      <p class="acronym">SPARSE ACCELERATED RAPID TRIANGULAR ANALYSER</p>
+      <p class="lead">Supernodal multifrontal LDLᵀ and LU for large sparse real and complex systems, with every
+        numeric kernel on the GPU. A device-independent Rust core with Python and C/C++ interfaces.</p>
+      <div class="buttons">
+        <a class="btn white" href="#get">Get SPARTA <span class="chev">›</span></a>
+        <a class="btn outline" href="#example">Example integration</a>
+      </div>
+    </div>
+  </div>
+  <div class="hero-facts">
+    <div class="wrap">
+      <div><b>LDLᵀ and LU</b>supernodal multifrontal, GPU-resident</div>
+      <div><b>complex64 + complex128</b>mixed-precision refinement</div>
+      <div><b>Nested dissection</b>custom ordering algorithm</div>
+      <div><b>Rust, Python, C/C++</b>native interfaces</div>
+    </div>
+  </div>
+</header>
+
+<section id="capabilities">
+  <div class="wrap">
+    <div class="title">
+      <h2>Direct solver capabilities</h2>
+      <p>Symbolic analysis runs on the CPU; every numeric kernel, including the triangular solves, runs on the GPU.</p>
+    </div>
+    <div class="cols">
+      <div class="feature">
+        <h3>GPU factorization</h3>
+        <ul>
+          <li>Supernodal multifrontal method, level-scheduled over the assembly tree</li>
+          <li>Blocked panel factorization with deferred Schur-complement updates</li>
+          <li>Bunch–Kaufman 1×1 and 2×2 pivoting for LDLᵀ; partial pivoting for LU</li>
+          <li>GPU-resident factor store; workspace recycled between tree levels</li>
+          <li>Batched solves, eight right-hand sides per pass</li>
+        </ul>
+      </div>
+      <div class="feature">
+        <h3>Ordering and analysis</h3>
+        <ul>
+          <li>Custom nested-dissection ordering, deterministic and parallel</li>
+          <li>Supernode amalgamation and elimination-tree postordering</li>
+          <li>Pattern reuse: refactor new values on the same analysis and GPU memory, for frequency sweeps and
+            time stepping</li>
+        </ul>
+      </div>
+      <div class="feature">
+        <h3>Accuracy and diagnostics</h3>
+        <ul>
+          <li>complex64 factorization with complex128 iterative refinement</li>
+          <li>complex128 CPU backend for ill-conditioned systems, selected explicitly</li>
+          <li>Pivot perturbation, counted per factorization</li>
+          <li>Factor-quality verdict per factorization; refinement report per solve</li>
+        </ul>
+      </div>
+      <div class="feature">
+        <h3>Integration and configuration</h3>
+        <ul>
+          <li>Python: SciPy sparse matrices in, NumPy arrays out</li>
+          <li>Rust native API; C ABI with a single header and a C++ wrapper</li>
+          <li>One <code>Config</code> for ordering, supernodes, front geometry and dispatch widths</li>
+          <li>Presets for one-off solves, frequency sweeps and difficult systems</li>
+          <li>Backend selection and pivot failures always reported to the caller</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="band" id="example">
+  <div class="wrap split">
+    <div>
+      <h2>Example integration</h2>
+      <p class="lead">The same four steps in each interface: analyze the sparsity pattern, factor, solve and
+        release the GPU memory.</p>
+      <ul class="plain">
+        <li><b>Python</b> — takes a SciPy sparse matrix; refinement is on by default.</li>
+        <li><b>Rust</b> — the native API, with every setting in one <code>Config</code>.</li>
+        <li><b>C and C++</b> — one header and one shared library.</li>
+        <li><b>Installation</b> — <code>pip install</code> from the GitHub repository builds and installs the Python
+          package.</li>
+      </ul>
+    </div>
+    <div>
+      <div class="tabs" role="tablist">
+        <button class="tab" role="tab" aria-selected="true" data-tab="py">Python</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="rs">Rust</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="c">C</button>
+      </div>
+      <div class="panel on" id="py"><pre><span class="k">import</span> numpy <span class="k">as</span> np
+<span class="k">from</span> scipy.sparse <span class="k">import</span> csc_matrix
+<span class="k">import</span> sparta
+
+A = csc_matrix([[<span class="s">4.0</span>, <span class="s">1.0</span>], [<span class="s">1.0</span>, <span class="s">3.0</span>]])
+b = np.array([<span class="s">1.0</span>, <span class="s">2.0</span>])
+
+F = sparta.analyze(A)   <span class="c"># 1. analyze the pattern (CPU)</span>
+F.factorize()           <span class="c"># 2. build the factors   (GPU)</span>
+x = F.solve(b)          <span class="c"># 3. find x              (GPU)</span>
+F.destroy()             <span class="c"># 4. hand back the GPU memory</span></pre></div>
+      <div class="panel" id="rs"><pre><span class="k">use</span> sparta::{Analysis, Complex32, Config, Solver};
+
+<span class="c">// The lower triangle of [[4, 1], [1, 3]], in CSC form.</span>
+<span class="k">let</span> analysis = Analysis::ldlt(<span class="s">2</span>, &amp;[<span class="s">0</span>, <span class="s">2</span>, <span class="s">3</span>], &amp;[<span class="s">0</span>, <span class="s">1</span>, <span class="s">1</span>], &amp;Config::default())?;
+<span class="k">let mut</span> solver = Solver::new(analysis)?;
+solver.factor(&amp;[<span class="s">4.0</span>, <span class="s">1.0</span>, <span class="s">3.0</span>].map(|v| Complex32::new(v, <span class="s">0.0</span>)))?;
+<span class="k">let</span> x = solver.solve(&amp;[<span class="s">1.0</span>, <span class="s">2.0</span>].map(|v| Complex32::new(v, <span class="s">0.0</span>)))?;
+solver.destroy();</pre></div>
+      <div class="panel" id="c"><pre><span class="k">#include</span> <span class="s">"sparta.h"</span>
+
+sparta_analysis *plan;
+sparta_solver *solver;
+sparta_analyze(n, col_ptr, row_index, SPARTA_SYMMETRIC, &amp;config, &amp;plan);
+sparta_solver_create(&amp;plan, &amp;solver);
+sparta_factor(solver, values);
+sparta_solve(solver, b, x);
+sparta_solver_free(solver);</pre></div>
+    </div>
+  </div>
+</section>
+
+<section id="performance">
+  <div class="wrap">
+    <div class="title">
+      <h2>Performance</h2>
+      <p>Four full-wave electromagnetic finite-element problems, each solved by SPARTA's GPU solver and by its CPU
+        solver on the same machine, without iterative refinement. Wall time through the Python API, median of three runs.</p>
+    </div>
+    <p class="rig">Apple M4 Pro · 14-core CPU (10 performance + 4 efficiency) · 20-core GPU · 24 GB unified memory ·
+      macOS 26.6.2</p>
+    <div class="legend">
+      <span><i class="gpu"></i><span class="t"><b>SPARTA GPU solver</b>: Metal on 20 GPU cores, complex64, no refinement</span></span>
+      <span><i class="cpu"></i><span class="t"><b>SPARTA CPU solver</b>: complex128 on 8 threads, Accelerate</span></span>
+    </div>
+    <div class="perfgrid">
+      <figure class="perf">
+        <figcaption><h3>Full-wave EM FEM problem #1</h3>
+          <p class="meta">109,370 unknowns · 4.08 M nonzeros · complex symmetric, LDLᵀ</p></figcaption>
+        <div class="metric"><div class="mlabel"><span>Factorization</span><span class="sp">2.3× faster on GPU</span></div><div class="bar gpu" style="--w:42.0%" title="Full-wave EM FEM problem #1 · Factorization · GPU: 120 ms" tabindex="0"><span class="v">120 ms</span></div><div class="bar cpu" style="--w:98.0%" title="Full-wave EM FEM problem #1 · Factorization · CPU: 279 ms" tabindex="0"><span class="v">279 ms</span></div></div><div class="metric"><div class="mlabel"><span>Refactorization</span><span class="sp">2.6× faster on GPU</span></div><div class="bar gpu" style="--w:37.9%" title="Full-wave EM FEM problem #1 · Refactorization · GPU: 108 ms" tabindex="0"><span class="v">108 ms</span></div><div class="bar cpu" style="--w:100.0%" title="Full-wave EM FEM problem #1 · Refactorization · CPU: 285 ms" tabindex="0"><span class="v">285 ms</span></div></div><div class="metric"><div class="mlabel"><span>Solve</span><span class="sp">4.2× faster on GPU</span></div><div class="bar gpu" style="--w:4.7%" title="Full-wave EM FEM problem #1 · Solve · GPU: 13 ms" tabindex="0"><span class="v">13 ms</span></div><div class="bar cpu" style="--w:19.6%" title="Full-wave EM FEM problem #1 · Solve · CPU: 56 ms" tabindex="0"><span class="v">56 ms</span></div></div>
+        <p class="acc">Relative residual, no refinement: GPU 6·10<sup>-5</sup> · CPU 2·10<sup>-13</sup></p>
+      </figure>
+      <figure class="perf">
+        <figcaption><h3>Full-wave EM FEM problem #2</h3>
+          <p class="meta">68,690 unknowns · 2.29 M nonzeros · complex symmetric, LDLᵀ</p></figcaption>
+        <div class="metric"><div class="mlabel"><span>Factorization</span><span class="sp">1.8× faster on GPU</span></div><div class="bar gpu" style="--w:56.9%" title="Full-wave EM FEM problem #2 · Factorization · GPU: 41 ms" tabindex="0"><span class="v">41 ms</span></div><div class="bar cpu" style="--w:100.0%" title="Full-wave EM FEM problem #2 · Factorization · CPU: 73 ms" tabindex="0"><span class="v">73 ms</span></div></div><div class="metric"><div class="mlabel"><span>Refactorization</span><span class="sp">1.9× faster on GPU</span></div><div class="bar gpu" style="--w:50.9%" title="Full-wave EM FEM problem #2 · Refactorization · GPU: 37 ms" tabindex="0"><span class="v">37 ms</span></div><div class="bar cpu" style="--w:95.7%" title="Full-wave EM FEM problem #2 · Refactorization · CPU: 70 ms" tabindex="0"><span class="v">70 ms</span></div></div><div class="metric"><div class="mlabel"><span>Solve</span><span class="sp">4.7× faster on GPU</span></div><div class="bar gpu" style="--w:6.6%" title="Full-wave EM FEM problem #2 · Solve · GPU: 5 ms" tabindex="0"><span class="v">5 ms</span></div><div class="bar cpu" style="--w:31.3%" title="Full-wave EM FEM problem #2 · Solve · CPU: 23 ms" tabindex="0"><span class="v">23 ms</span></div></div>
+        <p class="acc">Relative residual, no refinement: GPU 2·10<sup>-3</sup> · CPU 5·10<sup>-12</sup></p>
+      </figure>
+      <figure class="perf">
+        <figcaption><h3>Full-wave EM FEM problem #3</h3>
+          <p class="meta">86,006 unknowns · 3.62 M nonzeros · unsymmetric, LU</p></figcaption>
+        <div class="metric"><div class="mlabel"><span>Factorization</span><span class="sp">12.2× faster on GPU</span></div><div class="bar gpu" style="--w:8.2%" title="Full-wave EM FEM problem #3 · Factorization · GPU: 366 ms" tabindex="0"><span class="v">366 ms</span></div><div class="bar cpu" style="--w:100.0%" title="Full-wave EM FEM problem #3 · Factorization · CPU: 4.47 s" tabindex="0"><span class="v">4.47 s</span></div></div><div class="metric"><div class="mlabel"><span>Refactorization</span><span class="sp">13.2× faster on GPU</span></div><div class="bar gpu" style="--w:7.6%" title="Full-wave EM FEM problem #3 · Refactorization · GPU: 338 ms" tabindex="0"><span class="v">338 ms</span></div><div class="bar cpu" style="--w:100.0%" title="Full-wave EM FEM problem #3 · Refactorization · CPU: 4.47 s" tabindex="0"><span class="v">4.47 s</span></div></div><div class="metric"><div class="mlabel"><span>Solve</span><span class="sp">3.4× faster on GPU</span></div><div class="bar gpu" style="--w:0.6%" title="Full-wave EM FEM problem #3 · Solve · GPU: 27 ms" tabindex="0"><span class="v">27 ms</span></div><div class="bar cpu" style="--w:2.0%" title="Full-wave EM FEM problem #3 · Solve · CPU: 91 ms" tabindex="0"><span class="v">91 ms</span></div></div>
+        <p class="acc">Relative residual, no refinement: GPU 3·10<sup>-5</sup> · CPU 2·10<sup>-13</sup></p>
+      </figure>
+      <figure class="perf">
+        <figcaption><h3>Full-wave EM FEM problem #4</h3>
+          <p class="meta">457,054 unknowns · 17.63 M nonzeros · complex symmetric, LDLᵀ</p></figcaption>
+        <div class="metric"><div class="mlabel"><span>Factorization</span><span class="sp">2.7× faster on GPU</span></div><div class="bar gpu" style="--w:37.6%" title="Full-wave EM FEM problem #4 · Factorization · GPU: 358 ms" tabindex="0"><span class="v">358 ms</span></div><div class="bar cpu" style="--w:100.0%" title="Full-wave EM FEM problem #4 · Factorization · CPU: 953 ms" tabindex="0"><span class="v">953 ms</span></div></div><div class="metric"><div class="mlabel"><span>Refactorization</span><span class="sp">2.5× faster on GPU</span></div><div class="bar gpu" style="--w:32.5%" title="Full-wave EM FEM problem #4 · Refactorization · GPU: 310 ms" tabindex="0"><span class="v">310 ms</span></div><div class="bar cpu" style="--w:80.0%" title="Full-wave EM FEM problem #4 · Refactorization · CPU: 762 ms" tabindex="0"><span class="v">762 ms</span></div></div><div class="metric"><div class="mlabel"><span>Solve</span><span class="sp">9.6× faster on GPU</span></div><div class="bar gpu" style="--w:2.5%" title="Full-wave EM FEM problem #4 · Solve · GPU: 23 ms" tabindex="0"><span class="v">23 ms</span></div><div class="bar cpu" style="--w:23.6%" title="Full-wave EM FEM problem #4 · Solve · CPU: 225 ms" tabindex="0"><span class="v">225 ms</span></div></div>
+        <p class="acc">Relative residual, no refinement: GPU 1·10<sup>-1</sup> · CPU 2·10<sup>-11</sup></p><p class="acc ill"><em>This test system is ill-conditioned, so single precision alone is far from accurate on it; it is shown for speed.</em></p>
+      </figure>
+    </div>
+    <details class="alltimes">
+      <summary>All measurements</summary>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Problem</th><th class="num">Unknowns</th><th>Method</th>
+            <th class="num">Analysis GPU</th><th class="num">Analysis CPU</th>
+            <th class="num">Factor GPU</th><th class="num">Factor CPU</th>
+            <th class="num">Refactor GPU</th><th class="num">Refactor CPU</th>
+            <th class="num">Solve GPU</th><th class="num">Solve CPU</th>
+            <th class="num">Residual GPU</th><th class="num">Residual CPU</th></tr></thead>
+          <tbody>
+            <tr><td>#1</td><td class="num">109,370</td><td>LDLT</td><td class="num">246 ms</td><td class="num">237 ms</td><td class="num">120 ms</td><td class="num">279 ms</td><td class="num">108 ms</td><td class="num">285 ms</td><td class="num">13 ms</td><td class="num">56 ms</td><td class="num">6·10<sup>-5</sup></td><td class="num">2·10<sup>-13</sup></td></tr>
+<tr><td>#2</td><td class="num">68,690</td><td>LDLT</td><td class="num">141 ms</td><td class="num">132 ms</td><td class="num">41 ms</td><td class="num">73 ms</td><td class="num">37 ms</td><td class="num">70 ms</td><td class="num">5 ms</td><td class="num">23 ms</td><td class="num">2·10<sup>-3</sup></td><td class="num">5·10<sup>-12</sup></td></tr>
+<tr><td>#3</td><td class="num">86,006</td><td>LU</td><td class="num">171 ms</td><td class="num">175 ms</td><td class="num">366 ms</td><td class="num">4.47 s</td><td class="num">338 ms</td><td class="num">4.47 s</td><td class="num">27 ms</td><td class="num">91 ms</td><td class="num">3·10<sup>-5</sup></td><td class="num">2·10<sup>-13</sup></td></tr>
+<tr><td>#4</td><td class="num">457,054</td><td>LDLT</td><td class="num">1.04 s</td><td class="num">1.07 s</td><td class="num">358 ms</td><td class="num">953 ms</td><td class="num">310 ms</td><td class="num">762 ms</td><td class="num">23 ms</td><td class="num">225 ms</td><td class="num">1·10<sup>-1</sup></td><td class="num">2·10<sup>-11</sup></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </details>
+    <p class="fine">Refactorization reuses the analysis with new values on the same pattern, as in a frequency sweep;
+      problem #4 refactors with its own values scaled. The CPU backend is limited to 8 threads
+      (<code>RAYON_NUM_THREADS=8</code>, <code>VECLIB_MAXIMUM_THREADS=8</code>), fewer than the 10 performance cores,
+      so background processes and the slower efficiency cores do not distort its times. Iterative refinement is off throughout, so these are the raw
+      single-precision GPU and double-precision CPU times. In normal use SPARTA refines the GPU solution to
+      double-precision accuracy, which adds a few solves per right-hand side. The analysis runs on the CPU for both.
+      Results for NVIDIA and AMD GPUs follow once the Vulkan backend is tuned.</p>
+  </div>
+</section>
+
+<section class="band" id="platforms">
+  <div class="wrap">
+    <div class="title">
+      <h2>Platform support</h2>
+      <p>One device-independent core; each build targets one GPU backend.</p>
+    </div>
+    <div class="cols three">
+      <div class="platform live">
+        <h3>macOS</h3>
+        <span class="status">Available</span>
+        <dl>
+          <dt>GPU</dt><dd>Apple Silicon, M1 or later</dd>
+          <dt>Backend</dt><dd>Metal</dd>
+          <dt>Operating system</dt><dd>macOS 13 or later</dd>
+        </dl>
+      </div>
+      <div class="platform alpha">
+        <h3>Windows</h3>
+        <span class="status">Alpha</span>
+        <dl>
+          <dt>GPU</dt><dd>NVIDIA or AMD, Vulkan 1.3 driver</dd>
+          <dt>Backend</dt><dd>Vulkan</dd>
+          <dt>Status</dt><dd>Factorizes and solves; tested on an NVIDIA RTX 3080 and an AMD Radeon integrated GPU.
+            Not yet tuned for speed.</dd>
+        </dl>
+      </div>
+      <div class="platform alpha">
+        <h3>Linux</h3>
+        <span class="status">Alpha</span>
+        <dl>
+          <dt>GPU</dt><dd>NVIDIA or AMD, Vulkan 1.3 driver</dd>
+          <dt>Backend</dt><dd>Vulkan</dd>
+          <dt>Status</dt><dd>The same Vulkan backend as on Windows, not yet tested on Linux. Not yet tuned for
+            speed.</dd>
+        </dl>
+      </div>
+    </div>
+    <p class="fine" style="text-align:center; margin-top: 26px">Interfaces: Python 3.9 or later with NumPy and SciPy,
+      a Rust toolchain, or a C11 or C++17 compiler.</p>
+  </div>
+</section>
+
+<!-- The repository is private until release; the links below go live when it is
+     made public. -->
+<section id="get">
+  <div class="wrap">
+    <div class="title">
+      <h2>Get SPARTA</h2>
+      <p>SPARTA is open source under the GNU Affero General Public License (AGPL). Closed-source software needs a
+        commercial licence.</p>
+    </div>
+    <div class="cols two">
+      <div class="option">
+        <h3>Open source</h3>
+        <div class="tag">Free, on GitHub</div>
+        <p>The source code, the Python package, the C/C++ binding and the user guide are all in the repository.</p>
+        <div class="cmd"><code>pip install "git+https://github.com/FennisRobert/SPARTA.git"</code></div>
+        <ul>
+          <li>For open-source software under the AGPL</li>
+          <li>Build from source for Metal or Vulkan</li>
+          <li>Issues and contributions through GitHub</li>
+        </ul>
+        <a class="more" href="https://github.com/FennisRobert/SPARTA">Go to the repository ›</a>
+      </div>
+      <div class="option">
+        <h3>Closed-source software</h3>
+        <div class="tag">Contact us</div>
+        <p>Including SPARTA in closed-source software, distributed or run as a service, needs a commercial
+          licence from us. For official inquiries, email
+          <a href="mailto:robertfennis@emerge-numerics.com?subject=SPARTA%20in%20closed-source%20software">robertfennis@emerge-numerics.com</a>.</p>
+        <a class="more" href="mailto:robertfennis@emerge-numerics.com?subject=SPARTA%20in%20closed-source%20software">Send an email ›</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="band" id="notes">
+  <div class="wrap">
+    <div class="title"><h2>Additional information</h2></div>
+    <div class="cols two info">
+      <div>
+        <details><summary>Licence</summary>
+          <p>SPARTA is released under the GNU Affero General Public License, version 3 or later. Software that includes
+            SPARTA and is distributed, or offered to users over a network, must make its own source available under
+            the AGPL too. The full terms are in the repository.</p></details>
+        <details><summary>Using SPARTA in closed-source software</summary>
+          <p>Closed-source software needs a commercial licence. Email
+            <a href="mailto:robertfennis@emerge-numerics.com">robertfennis@emerge-numerics.com</a> for official
+            inquiries.</p></details>
+        <details><summary>Offline operation</summary>
+          <p>SPARTA needs no internet connection and sends no data anywhere. No matrices, results or usage data
+            leave the machine.</p></details>
+      </div>
+      <div>
+        <details><summary>Accuracy of a single-precision GPU solve</summary>
+          <p>On its own, a relative residual around 1e-5. With iterative refinement, the default in Python, it
+            reaches double-precision accuracy on all but the most badly conditioned systems, and every solve
+            reports how far it got.</p></details>
+        <details><summary>Supported GPUs</summary>
+          <p>Apple Silicon GPUs through Metal are supported. AMD and NVIDIA GPUs on Windows and Linux run through
+            the Vulkan backend, built on the same device-independent core. It is in alpha: it factorizes and
+            solves correctly, but its kernels are not yet tuned, so expect it to be slower than it will be.</p></details>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="top">
+      <div>
+        <a class="brand" href="#top">SPARTA</a>
+        <p style="margin-top:12px">SParse Accelerated Rapid Triangular Analyser.<br>A GPU sparse direct solver.</p>
+      </div>
+      <div><h4>Product</h4><ul>
+        <li><a href="#capabilities">Capabilities</a></li><li><a href="#example">Integration</a></li>
+        <li><a href="#performance">Performance</a></li><li><a href="#platforms">Platforms</a></li></ul></div>
+      <div><h4>Get SPARTA</h4><ul>
+        <li><a href="https://github.com/FennisRobert/SPARTA">GitHub repository</a></li><li><a href="#get">Licence</a></li>
+        <li><a href="mailto:robertfennis@emerge-numerics.com">Closed-source inquiries</a></li><li><a href="#notes">Additional information</a></li></ul></div>
+      <div><h4>About</h4><ul>
+        <li><a href="https://www.emerge-numerics.com">Robert Fennis</a></li><li><a href="https://milanrother.com/">Milan Rother</a></li></ul></div>
+    </div>
+    <div class="bottom">
+      <span>© 2026 SPARTA · Released under the GNU AGPL</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+
+// Code tabs.
+document.querySelectorAll(".tab").forEach(tab => tab.addEventListener("click", () => {
+  document.querySelectorAll(".tab").forEach(t => t.setAttribute("aria-selected", t === tab));
+  document.querySelectorAll(".panel").forEach(p => p.classList.toggle("on", p.id === tab.dataset.tab));
+}));
+
+// Hero animation: one multifrontal step with random numbers. Two child update
+// matrices are extend-added into a parent front, its first pivot is factored,
+// and the Schur complement is updated and passed up as the next update matrix.
+(() => {
+  const out = $("solve");
+  if (!out) return;
+  const LINES = 13, TICK = 95;
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  const fmt = v => (v < 0 ? "-" : " ") + Math.abs(v).toFixed(4);
+  const esc = t => t.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  let front = 12, A, B, P, steps = [];
+
+  function lower(n) {
+    return Array.from({ length: n }, (_, i) => Array.from({ length: i + 1 }, (_, j) => i === j ? rnd(1.2, 3.8) : rnd(-0.9, 0.9)));
+  }
+  function grid(n, value) { return Array.from({ length: n }, (_, i) => Array.from({ length: i + 1 }, () => value)); }
+  function mat(idx, v, cls) { return { idx, v, cls: cls || grid(idx.length, "") }; }
+
+  // A block as lines of [text, class] segments: the lower triangle, nothing else.
+  function block(m) {
+    const n = m.idx.length, lines = [];
+    for (let i = 0; i < n; i++) {
+      const row = [];
+      for (let j = 0; j <= i; j++) {
+        if (j) row.push(["  ", ""]);
+        const c = m.cls[i][j];
+        row.push([c === "churn" ? fmt(rnd(-4, 4)) : m.v[i][j] === null ? " 0.0000" : fmt(m.v[i][j]), c || (m.v[i][j] === null ? "dim" : "")]);
+      }
+      lines.push(row);
+    }
+    return lines;
+  }
+  const width = line => line.reduce((s, [t]) => s + t.length, 0);
+  function side(a, b) {
+    const w = Math.max(...a.map(width)), rows = Math.max(a.length, b.length), res = [];
+    for (let i = 0; i < rows; i++) {
+      const l = (a[i] || []).slice();
+      l.push([" ".repeat(w - width(a[i] || []) + 8), ""]);
+      res.push(l.concat(b[i] || []));
+    }
+    return res;
+  }
+  function render() {
+    const lines = [...side(block(A), block(B)), [], ...block(P)];
+    while (lines.length < LINES) lines.push([]);
+    out.innerHTML = lines.map(l => l.map(([t, c]) => c ? `<span class="${c}">${esc(t)}</span>` : esc(t)).join("")).join("\n");
+  }
+
+  const wait = n => { for (let k = 0; k < n; k++) steps.push(() => {}); };
+  function setup() {
+    front += 1 + Math.floor(rnd(0, 3));
+    // The parent's rows, sorted; its first row is the pivot. The first child holds the
+    // pivot row; together the two children cover every row.
+    const n = 6 + Math.floor(rnd(0, 2)), ka = 4 + Math.floor(rnd(0, 2)), rows = new Set();
+    while (rows.size < n) rows.add(Math.floor(rnd(front * 3, front * 3 + 60)));
+    const u = [...rows].sort((x, y) => x - y), rest = u.slice(1).sort(() => Math.random() - .5);
+    const a = [u[0], ...rest.slice(0, ka - 1)].sort((x, y) => x - y);
+    const onlyB = rest.slice(ka - 1), kb = Math.max(onlyB.length + 1, 4 + Math.floor(rnd(0, 2)));
+    const b = [...onlyB, ...rest.slice(0, ka - 1).slice(0, kb - onlyB.length)].sort((x, y) => x - y);
+    A = mat(a, lower(a.length), grid(a.length, "churn"));
+    B = mat(b, lower(b.length), grid(b.length, "churn"));
+    P = mat(u, grid(n, null));
+
+    wait(6);
+    steps.push(() => { A.cls = grid(A.idx.length, ""); B.cls = grid(B.idx.length, ""); });
+    // Extend-add: every child entry lands in the parent cell with the same global rows.
+    let last = null;
+    for (const c of [A, B]) {
+      for (let i = 0; i < c.idx.length; i++) for (let j = 0; j <= i; j++) {
+        steps.push(() => {
+          if (last) { last.c.cls[last.i][last.j] = "done"; P.cls[last.pi][last.pj] = ""; }
+          const pi = u.indexOf(c.idx[i]), pj = u.indexOf(c.idx[j]);
+          P.v[pi][pj] = (P.v[pi][pj] || 0) + c.v[i][j];
+          c.cls[i][j] = "hot"; P.cls[pi][pj] = "hot";
+          last = { c, i, j, pi, pj };
+        });
+      }
+    }
+    steps.push(() => { last.c.cls[last.i][last.j] = "done"; P.cls[last.pi][last.pj] = ""; });
+    // Diagonal entries keep the front positive definite enough to look plausible.
+    steps.push(() => { for (let i = 0; i < n; i++) if (P.v[i][i] === null || P.v[i][i] < 1) P.v[i][i] = rnd(1.5, 4); });
+    wait(4);
+    // Pivot: d = F₀₀, then the L column.
+    steps.push(() => { for (let i = 0; i < n; i++) P.cls[i][0] = "churn"; });
+    wait(5);
+    steps.push(() => {
+      const d = P.v[0][0];
+      for (let i = 1; i < n; i++) P.v[i][0] = (P.v[i][0] || 0) / d;
+      for (let i = 0; i < n; i++) P.cls[i][0] = "hot";
+    });
+    wait(6);
+    let prev = null;
+    for (let i = 1; i < n; i++) for (let j = 1; j <= i; j++) {
+      steps.push(() => {
+        if (prev) P.cls[prev[0]][prev[1]] = "up";
+        const d = P.v[0][0];
+        P.v[i][j] = (P.v[i][j] || 0) - P.v[i][0] * d * P.v[j][0];
+        P.cls[i][j] = "hot"; prev = [i, j];
+      });
+    }
+    steps.push(() => {
+      P.cls[prev[0]][prev[1]] = "up";
+      for (let i = 0; i < n; i++) P.cls[i][0] = "done";
+    });
+    wait(16);
+    steps.push(setup);
+  }
+
+  setup();
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    // One finished frame, no motion.
+    while (steps.length && steps[0] !== setup) steps.shift()();
+    render();
+    return;
+  }
+  render();
+  setInterval(() => { const step = steps.shift(); if (step) step(); render(); }, TICK);
+})();
+</script>
+</body>
+</html>

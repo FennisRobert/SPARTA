@@ -1,0 +1,59 @@
+Third-party code included in SPARTA
+===================================
+
+This file states WHAT is third-party and WHERE it came from.
+The licence texts those origins require are in THIRD-PARTY-NOTICES, which is
+the file that must ship with every binary release.
+
+--------------------------------------------------------------------------------
+No third-party source code
+--------------------------------------------------------------------------------
+
+SPARTA compiles no third-party source. Its fill-reducing ordering is SCALPEL,
+original SPARTA work in crates/scalpel. The Rust crates SPARTA links are listed
+with their licences in THIRD-PARTY-NOTICES section 4.
+
+--------------------------------------------------------------------------------
+Algorithms followed, with no code taken
+--------------------------------------------------------------------------------
+
+  SPRAL SSIDS (BSD-3, (c) STFC)  the supernode amalgamation merge rule in
+                                 src/symbolic/supernode.rs follows the rule
+                                 described for SSIDS core_analyse.f90. No SSIDS
+                                 code was used. The STFC notice is reproduced
+                                 as attribution hygiene.
+
+  LAPACK (BSD-3)                 the blocked pivoting in
+                                 src/kernels/ldlt_factor.metal
+                                 follows the published zsytrf/zlasyf algorithm.
+                                 No LAPACK code was used.
+
+--------------------------------------------------------------------------------
+Original SPARTA work
+--------------------------------------------------------------------------------
+
+Everything else in this repository is original and carries no third-party
+licence: the Metal kernels, the GPU storage plan and dispatch schedule, the
+Objective-C bridge, the whole of src/symbolic/, the SCALPEL ordering in
+crates/scalpel/, the Python bindings, devtools/matgen/, and the benchmark
+harness.
+
+Within src/symbolic/, these were written from the published literature and
+share no code with any existing implementation:
+
+  column_counts.rs      Gilbert, Ng & Peyton (1994). Record in COL_COUNTS.md
+                        section 7, removed in a5985e4
+                        (git show a5985e4^:COL_COUNTS.md).
+  elimination_tree.rs   George & Liu (1981) ch. 5; Liu (1990).
+  postorder.rs          standard postorder traversal.
+  supernode.rs          fundamental supernodes per Liu, Ng & Peyton (1993);
+                        merge rule per SSIDS, as above.
+
+devtools/matgen/ discretises the time-harmonic curl-curl Maxwell operator on a
+structured grid. Written from the physics.
+
+NOTHING IN THIS REPOSITORY DERIVES FROM RSLAB OR FERAL. The symbolic analysis
+and fill-reducing orderings that once did were replaced between 14 and
+15 September 2026. The full provenance record -- what each file was written
+from, how the replacements were verified, and the limitations of that record --
+is THIRD-PARTY-NOTICES section 5.1.

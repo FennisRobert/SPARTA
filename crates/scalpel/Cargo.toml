@@ -1,0 +1,10 @@
+[package]
+name = "scalpel"
+version = "0.1.0"
+edition = "2021"
+description = "Parallel nested dissection for sparse matrix ordering"
+authors = ["Robert Fennis", "Milan Rother"]
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+rayon = "1.12"

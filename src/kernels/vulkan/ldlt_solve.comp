@@ -1,0 +1,167 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Complex-symmetric LDL^T: the triangular solve. The port of
+// src/kernels/ldlt_solve.metal, which documents why the sweeps are shaped as
+// they are and which restructurings were measured not to pay.
+//
+// Kernels: solve_forward, solve_backward (one workgroup per front and
+// right-hand side, at the width the host picks per level), solve_diagonal (one
+// workgroup per node and right-hand side). Metal's `_wide` variants are the same
+// kernels at the wider width, which here is a pipeline, not a second function.
+#define SOLUTION_BLOCK
+#include "common.comp"
+
+const uint SOLVE_STAGE = 256;
+// Solution entries of one front held in shared memory while it is solved:
+// fronts up to this many rows (backward) or columns (forward) run their whole
+// triangular solve there. 12 KiB, inside Vulkan's guaranteed 16 KiB with the
+// stage above.
+const uint FRONT_STAGE = 1536;
+#if defined(KERNEL_solve_forward) || defined(KERNEL_solve_backward)
+shared vec2 front_x[FRONT_STAGE];
+#endif
+
+#if defined(KERNEL_solve_forward)
+shared vec2 xs[SOLVE_STAGE];
+// Forward substitution with L over one front, for right-hand side
+// gl_WorkGroupID.y. The front's own rows need no atomics; its trailing rows
+// belong to shared ancestors and take one atomic subtraction each.
+void main() {
+    uint lane = gl_LocalInvocationID.x, width = gl_WorkGroupSize.x;
+    uint s = ids[range.x + gl_WorkGroupID.x];
+    Node node = nodes[s];
+    uint m = node.nr, nc = node.nc;
+    uint x = gl_WorkGroupID.y * range.z;
+    uint l = node.loffset;
+    if (nc <= FRONT_STAGE) {
+        // The same sweep with the front's own entries in shared memory: each
+        // step starts from a shared load instead of a chain of three dependent
+        // device loads (perms, rows, x), and the solved block feeds the
+        // trailing rows without being read back. Same operations in the same
+        // order, so the same result.
+        for (uint i = lane; i < nc; i += width)
+            front_x[i] = x_load(x + global_row(node, i));
+        BARRIER_SHARED();
+        for (uint k = 0; k < nc; k++) {
+            vec2 v = front_x[k];
+            for (uint i = k + 1 + lane; i < nc; i += width)
+                front_x[i] -= mul(factors[l + k * m + i], v);
+            BARRIER_SHARED();
+        }
+        for (uint i = lane; i < nc; i += width)
+            x_store(x + global_row(node, i), front_x[i]);
+        for (uint i = nc + lane; i < m; i += width) {
+            vec2 acc = vec2(0);
+            for (uint c = 0; c < nc; c++)
+                acc += mul(factors[l + c * m + i], front_x[c]);
+            x_atomic_subtract(x + global_row(node, i), acc);
+        }
+        return;
+    }
+    for (uint k = 0; k < nc; k++) {
+        vec2 v = x_load(x + global_row(node, k));
+        for (uint i = k + 1 + lane; i < nc; i += width) {
+            uint at = x + global_row(node, i);
+            x_store(at, x_load(at) - mul(factors[l + k * m + i], v));
+        }
+        BARRIER_DEVICE();
+    }
+    uint tail = m - nc;
+    for (uint r0 = 0; r0 < tail; r0 += width) {
+        uint i = nc + r0 + lane;
+        vec2 acc = vec2(0);
+        for (uint base = 0; base < nc; base += SOLVE_STAGE) {
+            uint count = min(SOLVE_STAGE, nc - base);
+            BARRIER_SHARED();
+            for (uint t = lane; t < count; t += width)
+                xs[t] = x_load(x + global_row(node, base + t));
+            BARRIER_SHARED();
+            if (i < m)
+                for (uint c = 0; c < count; c++)
+                    acc += mul(factors[l + (base + c) * m + i], xs[c]);
+        }
+        if (i < m)
+            x_atomic_subtract(x + global_row(node, i), acc);
+    }
+}
+#endif
+
+#if defined(KERNEL_solve_backward)
+// Backward substitution with L^T over one front, for right-hand side
+// gl_WorkGroupID.y. Ancestor rows are final in reverse level order.
+void main() {
+    uint lane = gl_LocalInvocationID.x, width = gl_WorkGroupSize.x;
+    uint s = ids[range.x + gl_WorkGroupID.x];
+    Node node = nodes[s];
+    uint m = node.nr;
+    uint x = gl_WorkGroupID.y * range.z;
+    uint l = node.loffset;
+    if (m <= FRONT_STAGE) {
+        // The same sweep with every entry the front reads in shared memory:
+        // the trailing rows are final already, and the front's own rows are
+        // the ones being solved (see the forward sweep).
+        for (uint j = lane; j < m; j += width)
+            front_x[j] = x_load(x + global_row(node, j));
+        BARRIER_SHARED();
+        for (uint kk = node.nc; kk > 0; kk--) {
+            uint k = kk - 1;
+            vec2 acc = vec2(0);
+            for (uint j = k + 1 + lane; j < m; j += width)
+                acc -= mul(factors[l + k * m + j], front_x[j]);
+            BARRIER_SHARED();
+            acc = reduce_sum(acc);
+            if (lane == 0)
+                front_x[k] = front_x[k] + acc;
+            BARRIER_SHARED();
+        }
+        for (uint j = lane; j < node.nc; j += width)
+            x_store(x + global_row(node, j), front_x[j]);
+        return;
+    }
+    for (uint kk = node.nc; kk > 0; kk--) {
+        uint k = kk - 1;
+        vec2 acc = vec2(0);
+        for (uint j = k + 1 + lane; j < m; j += width)
+            acc -= mul(factors[l + k * m + j], x_load(x + global_row(node, j)));
+        BARRIER_SHARED();
+        acc = reduce_sum(acc);
+        if (lane == 0) {
+            uint at = x + global_row(node, k);
+            x_store(at, x_load(at) + acc);
+        }
+        BARRIER_DEVICE();
+    }
+}
+#endif
+
+#if defined(KERNEL_solve_diagonal)
+// The block-diagonal solve with D: one workgroup per (node, right-hand side),
+// its lanes sharing the node's pivot blocks. The blocks are independent, so
+// this is Metal's one-lane-per-node loop spread over lanes: a root node's
+// thousand pivots no longer run on one thread. A lane skips the second column
+// of a 2x2, whose first column's lane solves the pair.
+void main() {
+    uint lane = gl_LocalInvocationID.x, width = gl_WorkGroupSize.x;
+    Node node = nodes[range.x + gl_WorkGroupID.x];
+    uint x = gl_WorkGroupID.y * range.z;
+    for (uint k = lane; k < node.nc; k += width) {
+        uint d = node.first + k;
+        if (k > 0 && two[d - 1] != 0)
+            continue;
+        uint i = x + global_row(node, k);
+        if (two[d] != 0) {
+            uint j = x + global_row(node, k + 1);
+            vec2 a = diagonal[d], b = subdiag[d], c = diagonal[d + 1];
+            float scale = max(mag(a), max(mag(b), mag(c)));
+            a = vdiv(a, scale);
+            b = vdiv(b, scale);
+            c = vdiv(c, scale);
+            vec2 det = mul(a, c) - mul(b, b), u = vdiv(x_load(i), scale), v = vdiv(x_load(j), scale);
+            x_store(i, cdiv(mul(u, c) - mul(v, b), det));
+            x_store(j, cdiv(mul(v, a) - mul(u, b), det));
+        } else {
+            x_store(i, cdiv(x_load(i), diagonal[d]));
+        }
+    }
+}
+#endif

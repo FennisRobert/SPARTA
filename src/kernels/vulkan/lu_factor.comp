@@ -1,0 +1,479 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Unsymmetric LU with partial pivoting: the pivoting itself. The port of
+// src/kernels/lu_factor.metal, which documents the three routes, the one-sided
+// permutation, why U12 is solved inside the panel, and the invariant of the
+// panelled path; the arithmetic order is the same.
+//
+// Kernels: factor_nodes_lu, factor_narrow_lu, factor_narrow_tail_lu,
+// factor_panel_lu, factor_panel_tail_lu.
+#include "common.comp"
+
+// Accepts the diagonal when |a_kk| >= LU_DIAG_THRESHOLD * column max. Zero, the
+// default, preserves strict partial pivoting.
+uint lu_prefer_diagonal(vec2 d_value, float largest, uint k, uint best) {
+    float d = mag(d_value);
+    return LU_DIAG_THRESHOLD > 0 && finite1(d) && d > 0 && d >= LU_DIAG_THRESHOLD * largest ? k
+                                                                                          : best;
+}
+
+#if defined(KERNEL_factor_nodes_lu)
+// One thread owns a complete short front, right-looking.
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    if (tid >= range.y)
+        return;
+    uint s = ids[range.x + tid];
+    Node node = nodes[s];
+    uint m = node.nr, n = node.nc;
+    uint a = node.offset;
+    uint perm = node.first;
+    status[s] = 0;
+    for (uint i = 0; i < m * m; i++)
+        fronts[a + i] = vec2(0);
+    for (uint i = 0; i < n; i++)
+        perms[perm + i] = i;
+    for (uint e = 0; e < node.nentries; e++) {
+        Entry entry = entries[node.entries + e];
+        fronts[a + entry.position] = values[entry.source];
+    }
+    for (uint c = 0; c < node.count; c++) {
+        Child child = children[node.children + c];
+        Node cn = nodes[child.node];
+        if (status[child.node] != 0) {
+            status[s] = 0xffffffffu;
+            return;
+        }
+        uint tail = cn.nr - cn.nc;
+        for (uint i = 0; i < tail; i++)
+            for (uint j = 0; j < tail; j++) {
+                uint dest = a + maps[child.map + i] * m + maps[child.map + j];
+                fronts[dest] = fronts[dest] + fronts[cn.soffset + i * cn.sld + j];
+            }
+    }
+    float pfloor = -1.0;
+    uint bumped = 0;
+    state[s] = FrontState(0, 0, 0, 0, 0);
+    for (uint k = 0; k < n; k++) {
+        float best = 0;
+        uint pk = k;
+        for (uint i = k; i < n; i++) {
+            float v = mag(fronts[a + i * m + k]);
+            if (v > best) {
+                best = v;
+                pk = i;
+            }
+        }
+        if (!finite1(best)) {
+            status[s] = PIVOT_NONFINITE | (k + 1);
+            return;
+        }
+        pk = lu_prefer_diagonal(fronts[a + k * m + k], best, k, pk);
+        if (pk != k) {
+            for (uint j = 0; j < m; j++) {
+                vec2 t = fronts[a + k * m + j];
+                fronts[a + k * m + j] = fronts[a + pk * m + j];
+                fronts[a + pk * m + j] = t;
+            }
+            uint t = perms[perm + k];
+            perms[perm + k] = perms[perm + pk];
+            perms[perm + pk] = t;
+        }
+        vec2 d = fronts[a + k * m + k];
+        if (pivot_dead(d)) {
+            if (pfloor < 0) {
+                float big = 0;
+                for (uint i = 0; i < m * m; i++)
+                    big = max(big, mag(fronts[a + i]));
+                pfloor = PIVOT_FLOOR * big;
+            }
+            if (pfloor <= 0) {
+                status[s] = PIVOT_ZERO_COLUMN | (k + 1);
+                return;
+            }
+            d = floor_pivot(d, pfloor);
+            fronts[a + k * m + k] = d;
+            bumped++;
+        }
+        for (uint i = k + 1; i < m; i++)
+            fronts[a + i * m + k] = cdiv(fronts[a + i * m + k], d);
+        for (uint i = k + 1; i < m; i++) {
+            vec2 li = fronts[a + i * m + k];
+            for (uint j = k + 1; j < m; j++)
+                fronts[a + i * m + j] = fronts[a + i * m + j] - mul(li, fronts[a + k * m + j]);
+        }
+    }
+    for (uint i = 0; i < m * m; i++)
+        if (!finite2(fronts[a + i])) {
+            status[s] = 0xfffffffeu;
+            return;
+        }
+    state[s].perturbed = bumped;
+}
+#endif
+
+#if defined(KERNEL_factor_narrow_lu) || defined(KERNEL_factor_panel_lu)
+// Row interchange of `p` and `q` across the whole front, by the workgroup.
+void swap_front_rows(uint a, uint m, uint p, uint q, uint perm, uint lane, uint threads) {
+    if (p != q) {
+        for (uint j = lane; j < m; j += threads) {
+            vec2 t = fronts[a + p * m + j];
+            fronts[a + p * m + j] = fronts[a + q * m + j];
+            fronts[a + q * m + j] = t;
+        }
+        BARRIER_DEVICE();
+        if (lane == 0) {
+            uint t = perms[perm + p];
+            perms[perm + p] = perms[perm + q];
+            perms[perm + q] = t;
+        }
+    }
+    BARRIER_DEVICE();
+}
+#endif
+
+#if defined(KERNEL_factor_narrow_lu)
+// Every pivot of a front with a narrow fully summed block, in one workgroup of
+// PIVOT_THREADS lanes, over the fully summed block only. The rest of the cross
+// is left to factor_narrow_tail_lu, which spreads it over many workgroups:
+// the split the wide path makes between factor_panel_lu and its tail. Metal
+// takes the whole cross here, and a tall narrow front then holds its level on
+// one workgroup.
+void main() {
+    uint group = gl_WorkGroupID.x, lane = gl_LocalInvocationID.x;
+    uint s = ids[range.x + group];
+    Node node = nodes[s];
+    uint m = node.nr, n = node.nc;
+    if (status[s] != 0)
+        return;
+    uint a = node.offset;
+    uint perm = node.first;
+    for (uint k = 0; k < n; k++) {
+        float cm = 0;
+        uint imax = k;
+        for (uint i = k + lane; i < n; i += PIVOT_THREADS) {
+            float v = mag(fronts[a + i * m + k]);
+            if (v > cm || (v == cm && i < imax)) {
+                cm = v;
+                imax = i;
+            }
+        }
+        BARRIER_SHARED();
+        reduce_argmax(cm, imax, cm, imax);
+        if (lane == 0 && !finite1(cm))
+            status[s] = PIVOT_NONFINITE | (k + 1);
+        BARRIER_ALL();
+        if (status[s] != 0)
+            return;
+        imax = lu_prefer_diagonal(fronts[a + k * m + k], cm, k, imax);
+        swap_front_rows(a, m, k, imax, perm, lane, PIVOT_THREADS);
+        vec2 d = fronts[a + k * m + k];
+        if (pivot_dead(d)) {
+            float big = front_scale(a, m, n, lane, PIVOT_THREADS);
+            if (big <= 0) {
+                if (lane == 0)
+                    status[s] = PIVOT_ZERO_COLUMN | (k + 1);
+                return;
+            }
+            d = floor_pivot(d, PIVOT_FLOOR * big);
+            if (lane == 0) {
+                fronts[a + k * m + k] = d;
+                state[s].perturbed++;
+            }
+            BARRIER_DEVICE();
+        }
+        for (uint i = k + 1 + lane; i < n; i += PIVOT_THREADS)
+            fronts[a + i * m + k] = cdiv(fronts[a + i * m + k], d);
+        BARRIER_DEVICE();
+        uint invalid = 0;
+        for (uint i = k + 1 + lane; i < n; i += PIVOT_THREADS)
+            invalid |= uint(!finite2(fronts[a + i * m + k]));
+        BARRIER_SHARED();
+        if (reduce_or(invalid) != 0) {
+            if (lane == 0)
+                status[s] = 0xfffffffeu;
+            return;
+        }
+        // The update inside the fully summed block, each lane owning a row and
+        // walking its columns so its loads overlap. The rest of the cross --
+        // the rows below the block and the block's rows over the trailing
+        // columns -- is factor_narrow_tail_lu's, once the pivots are fixed.
+        for (uint i = k + 1 + lane; i < n; i += PIVOT_THREADS) {
+            vec2 li = fronts[a + i * m + k];
+            for (uint j = k + 1; j < n; j++)
+                fronts[a + i * m + j] = fronts[a + i * m + j] - mul(li, fronts[a + k * m + j]);
+        }
+        BARRIER_DEVICE();
+    }
+    if (lane == 0) {
+        state[s].next = n;
+        state[s].start = 0;
+        state[s].width = 0;
+    }
+}
+#endif
+
+#if defined(KERNEL_factor_narrow_tail_lu)
+// Rows (and columns) one workgroup takes at a time, one lane each: its width.
+const uint NARROW_TAIL_ROWS = 32;
+// The finished fully summed block: unit L11 below the diagonal, U11 on and above.
+shared vec2 block11[NARROW_COLS][NARROW_COLS];
+shared vec2 narrow_block[NARROW_TAIL_ROWS][NARROW_COLS];
+// The cross of a narrow LU front once factor_narrow_lu has fixed its pivots:
+// L21 = A21 U11^-1 row by row, and U12 = L11^-1 A12 column by column, each row
+// and column independent. The same subtractions in the same order as the
+// Metal kernel's whole-front update, so the factors are bit-identical.
+// `range.z` workgroups share a front.
+void main() {
+    uint group = gl_WorkGroupID.x, lane = gl_LocalInvocationID.x, width = gl_WorkGroupSize.x;
+    uint splits = range.z;
+    uint s = ids[range.x + group / splits];
+    uint slice = group - (group / splits) * splits;
+    Node node = nodes[s];
+    uint m = node.nr, n = node.nc;
+    // Group-uniform: a failed front, or a slice past the front's last row.
+    if (status[s] != 0 || n + slice * NARROW_TAIL_ROWS >= m)
+        return;
+    uint a = node.offset;
+    for (uint idx = lane; idx < n * n; idx += width) {
+        uint r = idx / n, c = idx - r * n;
+        block11[r][c] = fronts[a + r * m + c];
+    }
+    BARRIER_SHARED();
+    bool invalid = false;
+    for (uint base = n + slice * NARROW_TAIL_ROWS; base < m; base += splits * NARROW_TAIL_ROWS) {
+        uint nrows = min(NARROW_TAIL_ROWS, m - base);
+        for (uint idx = lane; idx < nrows * n; idx += width) {
+            uint r = idx / n, t = idx - r * n;
+            narrow_block[r][t] = fronts[a + (base + r) * m + t];
+        }
+        BARRIER_SHARED();
+        if (lane < nrows)
+            for (uint t = 0; t < n; t++) {
+                vec2 v = narrow_block[lane][t];
+                for (uint t2 = 0; t2 < t; t2++)
+                    v -= mul(narrow_block[lane][t2], block11[t2][t]);
+                narrow_block[lane][t] = cdiv(v, block11[t][t]);
+            }
+        BARRIER_SHARED();
+        for (uint idx = lane; idx < nrows * n; idx += width) {
+            uint r = idx / n, t = idx - r * n;
+            vec2 v = narrow_block[r][t];
+            invalid = invalid || !finite2(v);
+            fronts[a + (base + r) * m + t] = v;
+        }
+        BARRIER_SHARED();
+    }
+    for (uint j = n + slice * width + lane; j < m; j += splits * width) {
+        vec2 u[NARROW_COLS];
+        for (uint r = 0; r < NARROW_COLS; r++)
+            u[r] = r < n ? fronts[a + r * m + j] : vec2(0);
+        for (uint r = 0; r < NARROW_COLS; r++) {
+            vec2 v = u[r];
+            for (uint r2 = r + 1; r2 < NARROW_COLS; r2++)
+                if (r2 < n)
+                    u[r2] -= mul(block11[r2][r], v);
+        }
+        for (uint r = 0; r < NARROW_COLS; r++)
+            if (r < n)
+                fronts[a + r * m + j] = u[r];
+    }
+    // No reduction, so no scratch past the two blocks: any lane that saw a
+    // non-finite multiplier flags the front itself.
+    if (invalid)
+        atomicExchange(status[s], 0xfffffffeu);
+}
+#endif
+
+#if defined(KERNEL_factor_panel_lu)
+shared vec2 coef[PANEL_COLS];
+// Brings front column `col` current against the panel's first `count` pivots
+// and writes it to panel column `dest`, over rows [p, rows). The panel's own
+// rows take a forward substitution against L11, one column of it per pass
+// across the lanes; the rows below them are searched for the largest
+// magnitude, ties to the lowest row, into `cm` and `imax`.
+void form_column_lu(uint a, uint w, uint m, uint count, uint dest, uint col, uint p, uint lane,
+                    uint threads, uint rows, inout float cm, inout uint imax) {
+    for (uint i = lane; i < count; i += threads)
+        coef[i] = fronts[a + (p + i) * m + col];
+    for (uint t = 0; t + 1 < count; t++) {
+        BARRIER_SHARED();
+        for (uint t2 = t + 1 + lane; t2 < count; t2 += threads)
+            coef[t2] -= mul(panels[w + t * m + p + t2], coef[t]);
+    }
+    BARRIER_SHARED();
+    for (uint i = lane; i < count; i += threads)
+        panels[w + dest * m + p + i] = coef[i];
+    for (uint i = p + count + lane; i < rows; i += threads) {
+        vec2 v = fronts[a + i * m + col];
+        for (uint t = 0; t < count; t++)
+            v -= mul(panels[w + t * m + i], coef[t]);
+        panels[w + dest * m + i] = v;
+        float mv = mag(v);
+        if (mv > cm || (mv == cm && i < imax)) {
+            cm = mv;
+            imax = i;
+        }
+    }
+    BARRIER_ALL();
+}
+// Swaps rows p and q across the panel's formed columns.
+void swap_panel_rows_lu(uint w, uint m, uint columns, uint p, uint q, uint lane, uint threads) {
+    if (p != q)
+        for (uint t = lane; t < columns; t += threads) {
+            vec2 v = panels[w + t * m + p];
+            panels[w + t * m + p] = panels[w + t * m + q];
+            panels[w + t * m + q] = v;
+        }
+    BARRIER_ALL();
+}
+// One PANEL-wide panel of a wide front, LAPACK getrf shape.
+void main() {
+    uint group = gl_WorkGroupID.x, lane = gl_LocalInvocationID.x, width = gl_WorkGroupSize.x;
+    uint s = ids[range.x + group];
+    Node node = nodes[s];
+    uint m = node.nr, n = node.nc, p = state[s].next;
+    if (lane == 0) {
+        state[s].start = p;
+        state[s].width = 0;
+    }
+    BARRIER_DEVICE();
+    if (status[s] != 0 || p >= n)
+        return;
+    uint a = node.offset;
+    uint w = node.woffset;
+    uint perm = node.first;
+    uint t = 0, k = p;
+    while (t < PANEL && k < n) {
+        float cm = 0;
+        uint imax = k;
+        form_column_lu(a, w, m, t, t, k, p, lane, width, n, cm, imax);
+        reduce_argmax(cm, imax, cm, imax);
+        // Every lane holds the same cm, so the failure test is group-uniform.
+        if (!finite1(cm)) {
+            if (lane == 0)
+                status[s] = PIVOT_NONFINITE | (k + 1);
+            return;
+        }
+        imax = lu_prefer_diagonal(panels[w + t * m + k], cm, k, imax);
+        swap_front_rows(a, m, k, imax, perm, lane, width);
+        swap_panel_rows_lu(w, m, t + 1, k, imax, lane, width);
+        vec2 d = panels[w + t * m + k];
+        if (pivot_dead(d)) {
+            float big = front_scale(a, m, n, lane, width);
+            if (big <= 0) {
+                if (lane == 0)
+                    status[s] = PIVOT_ZERO_COLUMN | (k + 1);
+                return;
+            }
+            d = floor_pivot(d, PIVOT_FLOOR * big);
+            if (lane == 0) {
+                panels[w + t * m + k] = d;
+                state[s].perturbed++;
+            }
+            BARRIER_DEVICE();
+        }
+        uint invalid = 0;
+        for (uint i = k + 1 + lane; i < n; i += width) {
+            vec2 v = cdiv(panels[w + t * m + i], d);
+            invalid |= uint(!finite2(v));
+            panels[w + t * m + i] = v;
+        }
+        if (reduce_or(invalid) != 0) {
+            if (lane == 0)
+                status[s] = 0xfffffffeu;
+            return;
+        }
+        t++;
+        k++;
+        BARRIER_ALL();
+    }
+    // Publish the panel's columns over rows p..n: U above the diagonal, L below.
+    uint rows_here = n - p;
+    for (uint idx = lane; idx < t * rows_here; idx += width) {
+        uint t2 = idx / rows_here, i = p + idx - t2 * rows_here;
+        fronts[a + i * m + p + t2] = panels[w + t2 * m + i];
+    }
+    BARRIER_DEVICE();
+    if (lane == 0) {
+        state[s].next = p + t;
+        state[s].start = p;
+        state[s].width = t;
+    }
+}
+#endif
+
+#if defined(KERNEL_factor_panel_tail_lu)
+shared vec2 coefficient[PANEL_COLS][PANEL_COLS];
+shared vec2 block[TAIL_ROWS][PANEL_COLS];
+shared vec2 l11[PANEL * PANEL];
+// Applies a finished LU panel to the rows below the fully summed block, and
+// solves L11 U12 = A12 for the panel's rows across the trailing columns (the
+// getrf TRSM); `range.z` groups share a front.
+void main() {
+    uint group = gl_WorkGroupID.x, lane = gl_LocalInvocationID.x, width = gl_WorkGroupSize.x;
+    uint splits = range.z;
+    uint s = ids[range.x + group / splits];
+    uint slice = group - (group / splits) * splits;
+    Node node = nodes[s];
+    FrontState st = state[s];
+    uint m = node.nr, n = node.nc;
+    uint p = st.start, taken = st.width;
+    if (taken == 0 || status[s] != 0)
+        return;
+    uint a = node.offset;
+    uint w = node.woffset;
+    for (uint idx = lane; idx < taken * taken; idx += width) {
+        uint t = idx / taken, t2 = idx - t * taken;
+        coefficient[t][t2] = t2 <= t ? panels[w + t * m + p + t2] : vec2(0);
+    }
+    BARRIER_SHARED();
+    uint invalid = 0;
+    for (uint base = n + slice * TAIL_ROWS; base < m && n < m; base += splits * TAIL_ROWS) {
+        uint nrows = min(TAIL_ROWS, m - base);
+        for (uint idx = lane; idx < nrows * taken; idx += width) {
+            uint r = idx / taken, t = idx - r * taken;
+            block[r][t] = fronts[a + (base + r) * m + p + t];
+        }
+        BARRIER_SHARED();
+        if (lane < nrows) {
+            for (uint t = 0; t < taken; t++) {
+                vec2 v = block[lane][t];
+                for (uint t2 = 0; t2 < t; t2++)
+                    v -= mul(block[lane][t2], coefficient[t][t2]);
+                block[lane][t] = cdiv(v, coefficient[t][t]);
+            }
+        }
+        BARRIER_SHARED();
+        for (uint idx = lane; idx < nrows * taken; idx += width) {
+            uint r = idx / taken, t = idx - r * taken;
+            vec2 v = block[r][t];
+            invalid |= uint(!finite2(v));
+            fronts[a + (base + r) * m + p + t] = v;
+        }
+        BARRIER_SHARED();
+    }
+    BARRIER_SHARED();
+    for (uint idx = lane; idx < taken * taken; idx += width) {
+        uint r2 = idx / taken, r = idx - r2 * taken;
+        l11[r2 * PANEL + r] = r2 > r ? fronts[a + (p + r2) * m + p + r] : vec2(0);
+    }
+    BARRIER_SHARED();
+    for (uint j = p + taken + slice * width + lane; j < m; j += splits * width) {
+        vec2 u[PANEL];
+        for (uint r = 0; r < PANEL; r++)
+            u[r] = r < taken ? fronts[a + (p + r) * m + j] : vec2(0);
+        for (uint r = 0; r < PANEL; r++) {
+            vec2 v = u[r];
+            for (uint r2 = 0; r2 < PANEL; r2++)
+                if (r2 > r && r2 < taken)
+                    u[r2] -= mul(l11[r2 * PANEL + r], v);
+        }
+        for (uint r = 0; r < PANEL; r++)
+            if (r < taken)
+                fronts[a + (p + r) * m + j] = u[r];
+    }
+    if (reduce_or(invalid) != 0 && lane == 0)
+        status[s] = 0xfffffffeu;
+}
+#endif

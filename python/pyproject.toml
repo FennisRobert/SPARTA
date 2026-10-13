@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+[project]
+name = "sparta-solver"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.21", "scipy>=1.7"]
+description = "Experimental Apple Silicon GPU-resident sparse complex-symmetric solver"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "Robert Fennis" }, { name = "Milan Rother" }]
+[tool.maturin]
+python-source = "."
+module-name = "sparta._sparta"
+features = ["pyo3/extension-module"]

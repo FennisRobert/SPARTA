@@ -1,0 +1,15 @@
+[package]
+name = "sparta-capi"
+version = "0.1.0"
+edition = "2021"
+authors = ["Robert Fennis", "Milan Rother"]
+license = "AGPL-3.0-or-later"
+publish = false
+description = "C and C++ binding for the SPARTA sparse direct solver"
+
+[lib]
+name = "sparta"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+sparta-solver = { path = "../.." }

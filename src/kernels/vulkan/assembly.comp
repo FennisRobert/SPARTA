@@ -1,0 +1,159 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// Front assembly and factor extraction: the port of src/kernels/assembly.metal,
+// plus advance_panel from common.metal. See those files for why each kernel is
+// split and sliced the way it is; the dispatch shapes are the same.
+//
+// Kernels: zero_fronts, initialize_large, initialize_large_lu,
+// assemble_children, store_factors, store_factors_lu, advance_panel.
+#include "common.comp"
+
+#if defined(KERNEL_initialize_large) || defined(KERNEL_initialize_large_lu)
+// Scatters the original entries into a cleared front and resets its pivot
+// bookkeeping. `mirror` reflects each entry across the diagonal (LDL^T stores
+// one triangle); LU is handed both triangles.
+void assemble_front(bool mirror) {
+    uint group = gl_WorkGroupID.x, lane = gl_LocalInvocationID.x, width = gl_WorkGroupSize.x;
+    uint s = ids[range.x + group];
+    Node node = nodes[s];
+    uint m = node.nr;
+    uint a = node.offset;
+    if (lane == 0) {
+        status[s] = 0;
+        state[s] = FrontState(0, 0, 0, 0, 0);
+    }
+    for (uint i = lane; i < node.nc; i += width) {
+        perms[node.first + i] = i;
+        two[node.first + i] = 0;
+        subdiag[node.first + i] = vec2(0);
+    }
+    BARRIER_DEVICE();
+    uint invalid = 0;
+    for (uint e = lane; e < node.nentries; e += width) {
+        Entry v = entries[node.entries + e];
+        uint i = v.position / m, j = v.position % m;
+        vec2 val = values[v.source];
+        invalid |= uint(!finite2(val));
+        fronts[a + i * m + j] = val;
+        if (mirror)
+            fronts[a + j * m + i] = val;
+    }
+    BARRIER_SHARED();
+    uint any = reduce_or(invalid);
+    if (lane == 0 && any != 0)
+        status[s] = 0xfffffffeu;
+}
+void main() {
+#if defined(KERNEL_initialize_large)
+    assemble_front(true);
+#else
+    assemble_front(false);
+#endif
+}
+#endif
+
+#if defined(KERNEL_assemble_children)
+// Adds each front's `range.w`-th child Schur block; `range.z` groups share a front.
+void main() {
+    uint group = gl_WorkGroupID.x, lane = gl_LocalInvocationID.x, width = gl_WorkGroupSize.x;
+    uint splits = range.z, ordinal = range.w;
+    uint s = ids[range.x + group / splits];
+    uint slice = group - (group / splits) * splits;
+    Node node = nodes[s];
+    if (ordinal >= node.count || status[s] == 0xffffffffu)
+        return;
+    Child child = children[node.children + ordinal];
+    if (status[child.node] != 0) {
+        if (lane == 0 && slice == 0)
+            status[s] = 0xffffffffu;
+        return;
+    }
+    uint m = node.nr;
+    Node cn = nodes[child.node];
+    uint tail = cn.nr - cn.nc;
+    uint a = node.offset;
+    uint source = cn.soffset;
+    uint sld = cn.sld;
+    uint invalid = 0;
+    for (uint index = slice * width + lane; index < tail * tail; index += splits * width) {
+        uint i = index / tail, j = index - i * tail;
+        uint dest = maps[child.map + i] * m + maps[child.map + j];
+        vec2 v = fronts[a + dest] + fronts[source + i * sld + j];
+        invalid |= uint(!finite2(v));
+        fronts[a + dest] = v;
+    }
+    BARRIER_SHARED();
+    uint any = reduce_or(invalid);
+    if (lane == 0 && any != 0)
+        status[s] = 0xfffffffeu;
+}
+#endif
+
+#if defined(KERNEL_zero_fronts)
+// Clears the fronts a level is about to assemble; `range.z` groups share a front.
+void main() {
+    uint group = gl_WorkGroupID.x, lane = gl_LocalInvocationID.x, width = gl_WorkGroupSize.x;
+    uint splits = range.z;
+    uint s = ids[range.x + group / splits];
+    uint slice = group - (group / splits) * splits;
+    Node node = nodes[s];
+    uint total = node.nr * node.nr;
+    uint a = node.offset;
+    for (uint i = slice * width + lane; i < total; i += splits * width)
+        fronts[a + i] = vec2(0);
+}
+#endif
+
+#if defined(KERNEL_store_factors) || defined(KERNEL_store_factors_lu)
+// Moves the trailing `nr-nc` square of a finished front into the node's
+// contribution slot, densely (see compact_block in assembly.metal).
+void compact_block(Node node, uint lane, uint width) {
+    uint m = node.nr, nc = node.nc, tail = m - nc;
+    if (tail == 0 || node.soffset == node.offset + nc * m + nc)
+        return;
+    uint a = node.offset;
+    uint block = node.soffset;
+    for (uint idx = lane; idx < tail * tail; idx += width) {
+        uint i = idx / tail, j = idx - i * tail;
+        fronts[block + idx] = fronts[a + (nc + i) * m + nc + j];
+    }
+}
+// Copies a finished front's factor columns into the permanent store,
+// column-major with leading dimension nr; LU also keeps U12 row-major.
+// `range.z` groups share a front.
+void main() {
+    uint group = gl_WorkGroupID.x, threads = gl_WorkGroupSize.x;
+    uint splits = range.z;
+    uint s = ids[range.x + group / splits];
+    uint lane = (group - (group / splits) * splits) * threads + gl_LocalInvocationID.x;
+    uint width = splits * threads;
+    Node node = nodes[s];
+    uint m = node.nr;
+    uint a = node.offset;
+    uint l = node.loffset;
+    for (uint idx = lane; idx < node.nc * m; idx += width) {
+        uint k = idx / m, i = idx - k * m;
+        factors[l + idx] = fronts[a + i * m + k];
+    }
+#if defined(KERNEL_store_factors_lu)
+    uint nc = node.nc, tail = m - nc;
+    uint u = node.uoffset;
+    for (uint idx = lane; idx < nc * tail; idx += width) {
+        uint k = idx / tail, j = idx - k * tail;
+        upper[u + idx] = fronts[a + k * m + nc + j];
+    }
+#endif
+    compact_block(node, lane, width);
+}
+#endif
+
+#if defined(KERNEL_advance_panel)
+// Closes a panel once its Schur contribution has been applied.
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    if (tid >= range.y)
+        return;
+    uint s = ids[range.x + tid];
+    state[s].panel = state[s].next;
+}
+#endif

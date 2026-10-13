@@ -1,0 +1,29 @@
+# Formatting for the Metal kernels in src/kernels/.
+#
+# ReflowComments is off deliberately: the comments in those files carry measured
+# timings and the reasoning behind tuning constants, and they are wrapped by hand
+# to read as prose. A reformat must not touch them.
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 100
+ReflowComments: false
+PointerAlignment: Left
+DerivePointerAlignment: false
+SpaceBeforeParens: ControlStatements
+AllowShortBlocksOnASingleLine: Never
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+AllowShortCaseLabelsOnASingleLine: false
+BreakBeforeBraces: Attach
+AlignAfterOpenBracket: Align
+AlignEscapedNewlines: Left
+MaxEmptyLinesToKeep: 1
+KeepEmptyLinesAtTheStartOfBlocks: false
+SortIncludes: Never
+IndentPPDirectives: None
+# A kernel signature is long enough that clang-format would otherwise park the
+# return type on its own line, which reads worse than a wrapped parameter list.
+PenaltyReturnTypeOnItsOwnLine: 10000
+AlwaysBreakAfterReturnType: None
