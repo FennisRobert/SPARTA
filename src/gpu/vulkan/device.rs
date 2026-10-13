@@ -62,7 +62,13 @@ impl Gpu {
         // SAFETY: loading the system Vulkan loader; its entry points are only
         // called through ash's typed wrappers below.
         let entry = unsafe { ash::Entry::load() }
-            .map_err(|e| Error::Device(format!("no Vulkan loader: {e}")))?;
+            .map_err(|e| {
+                Error::Device(format!(
+                    "no Vulkan driver found ({e}): install a current GPU driver \
+                     with Vulkan 1.3, or select the CPU backend (force_cpu=True \
+                     in Python)"
+                ))
+            })?;
         let app = vk::ApplicationInfo::default()
             .application_name(c"sparta")
             .api_version(vk::API_VERSION_1_3);
@@ -315,7 +321,10 @@ fn choose(candidates: &[Candidate]) -> Result<&Candidate> {
     };
     if candidates.is_empty() {
         return Err(Error::Device(
-            "no Vulkan 1.3 device with subgroup arithmetic in compute shaders".into(),
+            "no Vulkan 1.3 device with subgroup arithmetic in compute shaders: \
+             update the GPU driver, or select the CPU backend (force_cpu=True \
+             in Python)"
+                .into(),
         ));
     }
     if let Ok(wanted) = std::env::var(DEVICE_VARIABLE) {

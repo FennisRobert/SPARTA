@@ -372,9 +372,10 @@ double-precision CPU backend, but has no GPU.
 *Windows.* Any 64-bit machine runs the analysis and the CPU backend. AMD and
 NVIDIA GPUs run through the Vulkan backend, which is in alpha: tested on an
 NVIDIA RTX 3080 and an AMD Radeon integrated GPU, correct but not yet tuned
-for speed. Building it needs `glslc` from the Vulkan SDK and the `vulkan`
-feature (`cargo build --release --features vulkan`); see "Vulkan" in the
-README. For a fast CPU backend, install a BLAS library (@blas).
+for speed. A normal install includes it and needs nothing extra; running it
+needs a GPU driver with Vulkan 1.3. Without one, `gpu_available()` is false and
+`force_cpu=True` selects the CPU backend. For a fast CPU backend, install a
+BLAS library (@blas).
 
 *Linux.* The same as Windows: the analysis, the CPU backend and the alpha
 Vulkan backend. Not yet tested on Linux.
@@ -506,7 +507,7 @@ Rust and no compiler. One wheel works for every Python from 3.9 up, on Apple
 Silicon only:
 
 #code(```sh
-pip install sparta_solver-0.1.0-cp39-abi3-macosx_11_0_arm64.whl
+pip install sparta_solver-0.1.1-cp39-abi3-macosx_11_0_arm64.whl
 ```)
 
 == Checking the installation
@@ -1090,10 +1091,11 @@ orderings.
 
 #table(columns: (auto, auto, auto, 1fr),
   head([Field], [Type], [Default], [What it does]),
-  [`leaf_size`], [`usize`], [`128`], [Parts at most this size (1 to 256) are ordered by exact minimum degree instead of being cut further.],
+  [`leaf_size`], [`usize`], [`32`], [Parts at most this size (1 to 256) are ordered by exact minimum degree instead of being cut further.],
   [`parallel_threshold`], [`usize`], [`4096`], [Parts at least this size may be processed in parallel.],
-  [`refine_all_candidates`], [`bool`], [`false`], [Refine every candidate separator before choosing one.],
-  [`half_levels`], [`bool`], [`false`], [Build starting separators from distances to two ends of the graph.],
+  [`spectral_candidates`], [`usize`], [`4`], [Extra starting separators cut across the graph's smoothest vibration modes. They give flatter cuts and a shallower tree, which factors and solves faster on the GPU. `0` orders faster.],
+  [`refine_all_candidates`], [`bool`], [`true`], [Refine every candidate separator before choosing one.],
+  [`half_levels`], [`bool`], [`true`], [Build starting separators from distances to two ends of the graph.],
   [`balance_quality`], [`bool`], [`true`], [Favour balanced halves as well as small separators.],
   [`refinement_passes`], [`usize`], [`4`], [Greedy improvement sweeps per level. `0` skips them.],
   [`one_sided_refinement`], [`bool`], [`false`], [Move vertices only towards the smaller half.],

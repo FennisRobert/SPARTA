@@ -176,6 +176,19 @@ impl Config {
                 wide_cycles: 4,
                 fm_passes: 4,
                 separator_trials: 4,
+                // Chosen for GPU factorization and solve time, not fill. The
+                // level-set candidates alone cut lopsided, and the slab-shaped
+                // halves that leaves get larger separators further down: a tree
+                // three levels deeper than METIS's, with a longer chain of
+                // panel steps. Spectral cuts, compared after full refinement,
+                // and two-ended level sets give a shallower tree. Device and
+                // solve time against the level-set candidates alone, M4 Pro:
+                // em_m2_sym1 -8.8% / -12.9%, em_m1_sym1 -3.8% / -11.2%,
+                // em_m3_asym1 -0.8% / -0.2%, em_bandcond_sym1 -5.2% / -17.3%,
+                // for 1.3-1.5x the ordering time.
+                spectral_candidates: 4,
+                refine_all_candidates: true,
+                half_levels: true,
                 ..scalpel::Options::default()
             },
             schur_batch: from_env("SPARTA_SCHUR_BATCH", profile.schur_batch),

@@ -18,7 +18,8 @@
 pub enum Device {
     /// Apple Metal on Apple Silicon. `src/kernels/*.metal`, `src/metal.m`.
     Metal,
-    /// Vulkan compute, for AMD and NVIDIA. Not yet implemented; see
+    /// Vulkan compute, for AMD and NVIDIA; the default on Windows and Linux.
+    /// `src/kernels/vulkan/`, `src/gpu/vulkan/`. See
     /// https://github.com/FennisRobert/SPARTA/issues/31.
     Vulkan,
 }

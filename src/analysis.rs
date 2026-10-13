@@ -281,6 +281,53 @@ fn place(gaps: &mut Vec<(usize, usize)>, top: &mut usize, size: usize) -> usize 
     }
 }
 
+/// Moves every wide front to the last level its parent allows, and leaves the
+/// small and narrow fronts where they are. Returns the new level of each node.
+///
+/// A level runs its wide fronts' panel steps in lockstep, as many as its
+/// widest front needs, so the factorization pays the sum over levels of the
+/// widest front's steps. Levels count height above the leaves, which on an
+/// unbalanced tree puts separators of the same depth, and similar width, on
+/// different levels, each paying its own steps. Counting down from the root
+/// instead lines them up. Factorization device time on the M4 Pro is
+/// 3.5 ms/GFLOP plus 86 us per panel step, within 1% on the four EMerge
+/// systems, so a step saved is worth 0.025 GFLOP. Steps and device time, before
+/// and after: `em_m2_sym1` 135 -> 123, -10%; `em_m1_sym1` 285 -> 257, -6%;
+/// `em_bandcond_sym1` 392 -> 338, -1.3%. Moving the small fronts as well
+/// costs more in assembly than the steps save: `em_m2_sym1` +8%.
+fn defer_wide_fronts(
+    nodes: &[Node],
+    parent: &[u32],
+    levels: &[usize],
+    nlevels: usize,
+    config: &Config,
+) -> Vec<usize> {
+    let mut late = levels.to_vec();
+    // Parents come after their children, so a parent is placed first.
+    for s in (0..nodes.len()).rev() {
+        let node = nodes[s];
+        if is_wide(node.nr, node.nc, config.small_front_rows, config.narrow_cols) {
+            late[s] = match parent[s] {
+                u32::MAX => nlevels - 1,
+                up => late[up as usize] - 1,
+            };
+        }
+    }
+    late
+}
+
+/// Panel steps the factorization runs under `levels`: per level, the steps of
+/// its widest front, as `dispatch_plan` schedules them.
+fn panel_steps(nodes: &[Node], levels: &[usize], nlevels: usize, config: &Config) -> u32 {
+    let mut steps = vec![0u32; nlevels];
+    for (node, &l) in nodes.iter().zip(levels) {
+        if is_wide(node.nr, node.nc, config.small_front_rows, config.narrow_cols) {
+            steps[l] = steps[l].max(node.nc.div_ceil(config.panel));
+        }
+    }
+    steps.iter().sum()
+}
+
 /// Places every frontal matrix, and the contribution block it leaves behind, in
 /// one shared workspace, and returns the peak element count.
 ///
@@ -823,7 +870,33 @@ impl Analysis {
             p.nodes.push(descriptor);
         }
         crate::profile::mark("descriptors+maps");
-        p.elements = assign_front_offsets(&mut p.nodes, &levels, &parent, p.levels.len())?;
+        let nlevels = p.levels.len();
+        p.elements = assign_front_offsets(&mut p.nodes, &levels, &parent, nlevels)?;
+        // Deferring spends front workspace, which on a large system is the
+        // scarce resource, so it is taken only for a material saving: at least
+        // 5% of the panel steps for at most 25% more workspace. Measured:
+        // `em_m1_sym1` 10% fewer steps for 17.6% more, `em_bandcond_sym1` 14%
+        // for 5.7%, `em_m2_sym1` 9% for none. `em_m3_asym1` would save 0.7% of
+        // its steps for 20.7% more, and keeps height levels.
+        let late = defer_wide_fronts(&p.nodes, &parent, &levels, nlevels, config);
+        let (before, after) = (
+            panel_steps(&p.nodes, &levels, nlevels, config),
+            panel_steps(&p.nodes, &late, nlevels, config),
+        );
+        if after + before / 20 <= before {
+            let mut nodes = p.nodes.clone();
+            let elements = assign_front_offsets(&mut nodes, &late, &parent, nlevels)?;
+            if elements <= p.elements + p.elements / 4 {
+                p.nodes = nodes;
+                p.elements = elements;
+                for level in &mut p.levels {
+                    level.clear();
+                }
+                for (s, &l) in late.iter().enumerate() {
+                    p.levels[l].push(s as u32);
+                }
+            }
+        }
         crate::profile::mark("front_offsets");
         let (entries, per_node) =
             build_assembly_entries(kind, n, ptr, rows, &sym, &owner, &front_rows)?;

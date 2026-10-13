@@ -87,6 +87,8 @@ impl Preset {
                 scalpel: scalpel::Options {
                     wide_cycles: 0,
                     separator_trials: 1,
+                    spectral_candidates: 0,
+                    refine_all_candidates: false,
                     ..base.scalpel
                 },
                 ordering: OrderingMethod::Scalpel,

@@ -3,7 +3,7 @@ requires = ["maturin>=1.5,<2"]
 build-backend = "maturin"
 [project]
 name = "sparta-solver"
-version = "0.1.0"
+version = "0.1.1"
 requires-python = ">=3.9"
 dependencies = ["numpy>=1.21", "scipy>=1.7"]
 description = "Experimental Apple Silicon GPU-resident sparse complex-symmetric solver"

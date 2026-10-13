@@ -16,9 +16,10 @@ pub(crate) struct Context;
 impl Context {
     pub(crate) fn new(_: &Analysis) -> Result<Self> {
         Err(Error::Unsupported(format!(
-            "no GPU backend compiled in for {}-{}; build with --features metal \
-             or --features vulkan, or select the CPU backend with \
-             Config {{ force_cpu: true, .. }}",
+            "this build of SPARTA has no GPU backend ({}-{} gets none by \
+             default); select the CPU backend (force_cpu=True in Python, \
+             Config {{ force_cpu: true, .. }} in Rust), or rebuild with \
+             --features vulkan",
             std::env::consts::OS,
             std::env::consts::ARCH,
         )))

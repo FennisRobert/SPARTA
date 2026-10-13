@@ -241,7 +241,7 @@ pip downloads its build helper (maturin), NumPy and SciPy from PyPI.
 no compiler, no source code needed.
 
 ```sh
-pip install sparta_solver-0.1.0-cp39-abi3-macosx_11_0_arm64.whl
+pip install sparta_solver-0.1.1-cp39-abi3-macosx_11_0_arm64.whl
 ```
 
 One wheel works for every Python from 3.9 up, on Apple Silicon only. To make a
@@ -255,7 +255,7 @@ pip wheel . --no-deps -w dist      # writes dist/sparta_solver-<version>-cp39-ab
 
 ```python
 import sparta
-print(sparta.__version__, sparta.gpu_available())   # gpu_available() is False if Metal is not visible
+print(sparta.__version__, sparta.gpu_available())   # gpu_available() is False if no GPU is usable
 ```
 
 For development work on the Python layer, `pip install -e .` gives an editable install.
@@ -894,7 +894,7 @@ report the same things in code:
 
 | Property | Tells you |
 |---|---|
-| `sparta.gpu_available()` | Whether Metal is visible to this process |
+| `sparta.gpu_available()` | Whether this build's GPU backend (Metal or Vulkan) can run in this process |
 | `F.n`, `F.path` | Matrix size and the chosen method |
 | `F.info` | Pattern statistics and estimated memory |
 | `F.quality` | How trustworthy the factors are (see [Checking a solve](#checking-a-solve)) |
@@ -928,8 +928,8 @@ decides:
 | Cargo feature | Backend | State |
 |---|---|---|
 | `metal` | Apple Metal, Apple Silicon | Implemented. The default on Apple Silicon |
-| `vulkan` | Vulkan compute, AMD and NVIDIA | Implemented. See [Vulkan](#vulkan) below |
-| neither, off Apple Silicon | none | Analysis and the CPU backend only |
+| `vulkan` | Vulkan compute, AMD and NVIDIA | Alpha. The default on Windows and Linux. See [Vulkan](#vulkan) below |
+| neither, on any other target (Intel Mac) | none | Analysis and the CPU backend only |
 
 ```sh
 cargo build --release                     # the target decides
@@ -944,9 +944,14 @@ backend a binary carries.
 The Vulkan backend runs the same factorizations and solves as Metal, in
 complex64, on AMD and NVIDIA GPUs under Windows and Linux.
 
-- **Building** needs `glslc` from the [Vulkan SDK](https://vulkan.lunarg.com/),
-  which compiles the kernels to SPIR-V. `build.rs` finds it through `GLSLC`,
-  then `VULKAN_SDK`, then the path.
+- **Building** needs nothing extra: a plain `pip install` or `cargo build` on
+  Windows or Linux includes it. The kernels ship compiled to SPIR-V in
+  `src/kernels/vulkan/spirv/`. Only after editing a `.comp` file do you need
+  `glslc` from the [Vulkan SDK](https://vulkan.lunarg.com/); `build.rs` finds
+  it through `GLSLC`, then `VULKAN_SDK`, then the path, and
+  `SPARTA_WRITE_SPIRV=1 cargo build --features vulkan` refreshes the shipped
+  copies. A build without `glslc` whose kernels no longer match the shipped
+  SPIR-V stops with an error rather than using stale kernels.
 - **Running** needs a driver with Vulkan 1.3. Nothing is linked at build time:
   the Vulkan loader is opened when the first solver is created, and without
   one `gpu_available()` is false.
@@ -954,7 +959,7 @@ complex64, on AMD and NVIDIA GPUs under Windows and Linux.
   `SPARTA_VULKAN_DEVICE` picks another, by index or by part of its name:
 
 ```sh
-cargo build --release --features vulkan
+cargo build --release                     # Vulkan by default on Windows and Linux
 SPARTA_VULKAN_DEVICE=amd cargo test --release --features vulkan --test shader
 maturin develop --release --manifest-path python/Cargo.toml --features vulkan
 ```
