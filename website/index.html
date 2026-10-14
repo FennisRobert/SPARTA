@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SPARTA: GPU sparse direct solver</title>
-<meta name="description" content="SPARTA is a GPU sparse direct solver: supernodal multifrontal LDLᵀ and LU on the GPU, from Rust, Python and C/C++. Open source under the GNU AGPL, with a commercial licence for closed-source software.">
+<meta name="description" content="SPARTA is a GPU sparse direct solver: supernodal multifrontal LDLᵀ and LU on the GPU, from Rust, Python, C/C++, MATLAB and Julia. Open source under the GNU AGPL, with a commercial licence for closed-source software.">
 <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -127,9 +127,10 @@ p { margin: 0 0 14px; }
 .plain li { padding: 10px 0; border-top: 1px solid var(--line); font-size: 15px; }
 .plain li b { font-weight: 500; }
 @media (max-width: 900px) { .split { grid-template-columns: 1fr; gap: 28px; } }
-.tabs { display: flex; }
+.tabs { display: flex; flex-wrap: wrap; }
 .tab { border: 0; background: #e3e0e0; color: var(--text); cursor: pointer; padding: 10px 20px; font: 500 14px/1.2 "Roboto", sans-serif; }
 .tab[aria-selected="true"] { background: var(--black); color: #fff; }
+@media (max-width: 480px) { .tab { padding: 10px 13px; } }
 .panel { display: none; }
 .panel.on { display: block; }
 pre { margin: 0; background: var(--black); color: #ece6e6; padding: 22px 24px; overflow-x: auto; font-size: 13.5px; line-height: 1.65; }
@@ -249,7 +250,7 @@ footer .bottom { border-top: 1px solid #2c2729; padding: 16px 0 22px; display: f
       <h1>Sparse direct factorization on the GPU</h1>
       <p class="acronym">SPARSE ACCELERATED RAPID TRIANGULAR ANALYSER</p>
       <p class="lead">Supernodal multifrontal LDLᵀ and LU for large sparse real and complex systems, with every
-        numeric kernel on the GPU. A device-independent Rust core with Python and C/C++ interfaces.</p>
+        numeric kernel on the GPU. A device-independent Rust core with Python, C/C++, MATLAB and Julia interfaces.</p>
       <div class="buttons">
         <a class="btn white" href="#get">Get SPARTA <span class="chev">›</span></a>
         <a class="btn outline" href="#example">Example integration</a>
@@ -261,7 +262,7 @@ footer .bottom { border-top: 1px solid #2c2729; padding: 16px 0 22px; display: f
       <div><b>LDLᵀ and LU</b>supernodal multifrontal, GPU-resident</div>
       <div><b>complex64 + complex128</b>mixed-precision refinement</div>
       <div><b>Nested dissection</b>custom ordering algorithm</div>
-      <div><b>Rust, Python, C/C++</b>native interfaces</div>
+      <div><b>Rust, Python, C/C++</b>plus MATLAB and Julia</div>
     </div>
   </div>
 </header>
@@ -306,6 +307,7 @@ footer .bottom { border-top: 1px solid #2c2729; padding: 16px 0 22px; display: f
         <ul>
           <li>Python: SciPy sparse matrices in, NumPy arrays out</li>
           <li>Rust native API; C ABI with a single header and a C++ wrapper</li>
+          <li>MATLAB and Julia bindings over the C library</li>
           <li>One <code>Config</code> for ordering, supernodes, front geometry and dispatch widths</li>
           <li>Presets for one-off solves, frequency sweeps and difficult systems</li>
           <li>Backend selection and pivot failures always reported to the caller</li>
@@ -325,6 +327,10 @@ footer .bottom { border-top: 1px solid #2c2729; padding: 16px 0 22px; display: f
         <li><b>Python</b> — takes a SciPy sparse matrix; refinement is on by default.</li>
         <li><b>Rust</b> — the native API, with every setting in one <code>Config</code>.</li>
         <li><b>C and C++</b> — one header and one shared library.</li>
+        <li><b>MATLAB</b> — a <code>SpartaSolver</code> class used like <code>decomposition</code>, built as a MEX
+          file. Not yet tested in MATLAB.</li>
+        <li><b>Julia</b> — a <code>Solver</code> type with <code>\</code> and <code>factorize!</code>, calling the
+          library directly.</li>
         <li><b>Installation</b> — <code>pip install</code> from the GitHub repository builds and installs the Python
           package.</li>
       </ul>
@@ -334,6 +340,8 @@ footer .bottom { border-top: 1px solid #2c2729; padding: 16px 0 22px; display: f
         <button class="tab" role="tab" aria-selected="true" data-tab="py">Python</button>
         <button class="tab" role="tab" aria-selected="false" data-tab="rs">Rust</button>
         <button class="tab" role="tab" aria-selected="false" data-tab="c">C</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="m">MATLAB</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="jl">Julia</button>
       </div>
       <div class="panel on" id="py"><pre><span class="k">import</span> numpy <span class="k">as</span> np
 <span class="k">from</span> scipy.sparse <span class="k">import</span> csc_matrix
@@ -363,6 +371,28 @@ sparta_solver_create(&amp;plan, &amp;solver);
 sparta_factor(solver, values);
 sparta_solve(solver, b, x);
 sparta_solver_free(solver);</pre></div>
+      <div class="panel" id="m"><pre>A = sparse([<span class="s">4</span> <span class="s">1</span>; <span class="s">1</span> <span class="s">3</span>]);
+b = [<span class="s">1</span>; <span class="s">2</span>];
+
+S = SpartaSolver(A);    <span class="c">% 1-2. analyze and factor</span>
+x = S \ b;              <span class="c">% 3. solve</span>
+
+<span class="c">% A sweep: same pattern, new values</span>
+factorize(S, A2);
+x2 = S \ b;
+<span class="k">clear</span> S                 <span class="c">% 4. free the GPU memory</span></pre></div>
+      <div class="panel" id="jl"><pre><span class="k">using</span> SPARTA, SparseArrays
+
+A = sparse([<span class="s">4.0</span> <span class="s">1</span>; <span class="s">1</span> <span class="s">3</span>])
+b = [<span class="s">1.0</span>, <span class="s">2</span>]
+
+F = SPARTA.Solver(A)    <span class="c"># 1-2. analyze and factor</span>
+x = F \ b               <span class="c"># 3. solve</span>
+
+<span class="c"># A sweep: same pattern, new values</span>
+factorize!(F, A2)
+x2 = F \ b
+close(F)                <span class="c"># 4. free the GPU memory</span></pre></div>
     </div>
   </div>
 </section>
@@ -473,7 +503,7 @@ sparta_solver_free(solver);</pre></div>
       </div>
     </div>
     <p class="fine" style="text-align:center; margin-top: 26px">Interfaces: Python 3.9 or later with NumPy and SciPy,
-      a Rust toolchain, or a C11 or C++17 compiler.</p>
+      a Rust toolchain, a C11 or C++17 compiler, MATLAB R2018a or later with a C compiler, or Julia 1.9 or later.</p>
   </div>
 </section>
 
@@ -490,7 +520,8 @@ sparta_solver_free(solver);</pre></div>
       <div class="option">
         <h3>Open source</h3>
         <div class="tag">Free, on GitHub</div>
-        <p>The source code, the Python package, the C/C++ binding and the user guide are all in the repository.</p>
+        <p>The source code, the Python package, the C/C++, MATLAB and Julia bindings and the user guide are all in the
+          repository.</p>
         <div class="cmd"><code>pip install "git+https://github.com/FennisRobert/SPARTA.git"</code></div>
         <ul>
           <li>For open-source software under the AGPL</li>

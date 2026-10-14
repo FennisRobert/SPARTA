@@ -68,6 +68,13 @@ The shared library exports only the documented `sparta_*` functions and
 nothing else. The static library (`libsparta.a`, built alongside) exposes every
 internal symbol instead, so ship the shared one unless a customer insists.
 
+## Other languages
+
+MATLAB and Julia bindings built on this library live in
+[`bindings/matlab`](../../bindings/matlab) and
+[`bindings/julia`](../../bindings/julia). Both refine answers in double
+precision on their own side.
+
 ## Accuracy
 
 The GPU computes in single precision, so a solve lands near a relative residual

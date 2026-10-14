@@ -16,7 +16,7 @@
 <p align="center">
   <img alt="Platform: macOS on Apple Silicon" src="https://img.shields.io/badge/platform-macOS%20%7C%20Apple%20Silicon-1f2328?style=flat-square&logo=apple&logoColor=white">
   <img alt="GPU backend: Metal" src="https://img.shields.io/badge/GPU-Metal-ab141a?style=flat-square">
-  <img alt="Languages: Rust, Python, C and C++" src="https://img.shields.io/badge/API-Rust%20%7C%20Python%20%7C%20C%2FC%2B%2B-e0ab32?style=flat-square">
+  <img alt="Languages: Rust, Python, C, C++, MATLAB and Julia" src="https://img.shields.io/badge/API-Rust%20%7C%20Python%20%7C%20C%2FC%2B%2B%20%7C%20MATLAB%20%7C%20Julia-e0ab32?style=flat-square">
 </p>
 
 <p align="center">
@@ -295,9 +295,28 @@ application keeps `libsparta.dylib`. To make the SDK to hand out, run
 
 More in [crates/sparta-capi/README.md](crates/sparta-capi/README.md).
 
+### MATLAB and Julia
+
+Both use the C library above, so build it first with
+`cargo build --release -p sparta-capi`.
+
+**MATLAB** (untested: written without access to MATLAB). From
+`bindings/matlab`, run `build_sparta_mex` once (it needs a C compiler that
+`mex -setup C` accepts), then `test_sparta`. Add that folder to the MATLAB path.
+
+**Julia** (1.9 or later). No compiler is needed:
+
+```julia
+using Pkg
+Pkg.develop(path = "bindings/julia")
+```
+
+Details in [bindings/matlab/README.md](bindings/matlab/README.md) and
+[bindings/julia/README.md](bindings/julia/README.md).
+
 ## Quick start
 
-All three examples solve the same 2×2 system, `[[4, 1], [1, 3]] x = [1, 2]`,
+All the examples solve the same 2×2 system, `[[4, 1], [1, 3]] x = [1, 2]`,
 whose answer is `x = [1/11, 7/11]`.
 
 ### Rust
@@ -377,6 +396,24 @@ sparta_solver_free(solver);                                             /* 4. fr
 Every call returns a `sparta_status`, and `sparta_last_error()` explains a
 failure in a sentence. The C++ header `sparta.hpp` wraps all of this in a
 `sparta::Solver` class. Worked examples are in `crates/sparta-capi/examples`.
+
+### MATLAB and Julia
+
+```matlab
+A = sparse([4 1; 1 3]);
+S = SpartaSolver(A);     % analyze and factor
+x = S \ [1; 2];          % solve
+```
+
+```julia
+using SPARTA, SparseArrays
+F = SPARTA.Solver(sparse([4.0 1; 1 3]))   # analyze and factor
+x = F \ [1.0, 2]                          # solve
+close(F)                                  # free the GPU memory
+```
+
+For a sweep, `factorize(S, A2)` in MATLAB and `factorize!(F, A2)` in Julia
+factor new values of the same pattern without analyzing again.
 
 # Using SPARTA in detail
 

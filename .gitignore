@@ -8,6 +8,11 @@ debug
 # Local toolchain caches, virtualenvs and validation logs
 /.local/
 
+# MATLAB and Julia binding build output
+/bindings/matlab/*.mex*
+/bindings/matlab/*.dll
+/bindings/julia/Manifest.toml
+
 # Python
 __pycache__/
 *.so

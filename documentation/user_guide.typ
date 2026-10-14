@@ -224,7 +224,7 @@
       fact[LDL#super[T] and LU][supernodal multifrontal, GPU-resident],
       fact[complex64 + complex128][mixed-precision refinement],
       fact[Nested dissection][SCALPEL, a parallel ordering],
-      fact[Rust, Python, C/C++][native interfaces])
+      fact[Rust, Python, C/C++][MATLAB and Julia too])
     v(16pt)
     text(size: 9pt, tracking: 0.12em, fill: white)[ROBERT FENNIS #h(0.6em) · #h(0.6em) MILAN ROTHER]
   }))
@@ -335,8 +335,9 @@ double precision on the CPU. @precision explains exactly how.
     Windows and Linux through Vulkan, in alpha: correct, not yet tuned.],
   [CPU], [A double-precision backend on any 64-bit machine, used when you ask
     for it.],
-  [Languages], [Rust and Python, covered in this guide. A C and C++ interface
-    exists as well; see `crates/sparta-capi/README.md`.],
+  [Languages], [Rust and Python, covered in this guide, and MATLAB and Julia
+    (@bindings). A C and C++ interface exists as well; see
+    `crates/sparta-capi/README.md`.],
   [Matrices], [Square, real or complex, stored in compressed sparse column
     form (Rust) or any SciPy sparse format (Python).],
   [Ordering], [SCALPEL, SPARTA's own parallel nested dissection.],
@@ -703,6 +704,133 @@ with sparta.analyze(A) as solver:
     x = solver.solve(b)
 ```)
 
+= MATLAB and Julia <bindings>
+
+SPARTA can also be used from MATLAB and Julia. Both go through SPARTA's C
+library, so they share its abilities and its limits:
+
+- They solve on the GPU only. The CPU backend (`force_cpu`) and the tuning
+  search (@optimize) are not available.
+- Refinement in double precision is done in the binding itself, more simply
+  than in Python: it stops when the residual is small enough or stops
+  improving.
+
+Both are built from the source:
+
+1. Build the C library from the repository's top folder. This needs Rust
+   and nothing else.
+
+   #code(```sh
+   cargo build --release -p sparta-capi
+   ```)
+
+2. Use the files in `bindings/matlab` or `bindings/julia`, as below.
+
+The settings have the same names and meanings as in @all-settings. The
+binding-specific ones are as follows:
+
+- `kind` chooses between LDLᵀ and LU, as `mtype` does in Python.
+- `preset` picks the starting point (@presets).
+- `refinement_steps` and `refinement_rtol` control refinement, as they do in
+  Python.
+
+== MATLAB
+
+#block(fill: luma(245), inset: 8pt, radius: 3pt, width: 100%)[
+  *Not yet tested in MATLAB.*
+  - The binding was written without access to MATLAB.
+  - Its C part has been run against the library through a stand-in for
+    MATLAB, but the MATLAB class itself has not been run.
+  - Run `test_sparta` first, and report a failure as a GitHub issue.]
+
+*Requirements:*
+
+- MATLAB R2018a or later.
+- A C compiler that `mex -setup C` accepts. On Windows that is Visual Studio.
+- On Apple Silicon, the native MATLAB, R2023b or later.
+
+*Building:* in MATLAB, from `bindings/matlab`:
+
+#code(```matlab
+build_sparta_mex     % compiles the gateway against target/release
+test_sparta          % checks the binding end to end
+```)
+
+Then add that folder to the MATLAB path.
+
+*Solving:* `SpartaSolver` works like MATLAB's own `decomposition`:
+
+#code(```matlab
+S = SpartaSolver(A);                    % analyze and factor
+x = S \ b;                              % solve; b may have several columns
+
+S = SpartaSolver(A, 'preset', 'sweep', 'nemin', 32);
+for f = frequencies
+    factorize(S, K - f^2 * M);          % same pattern: plan and memory reused
+    x = S \ b;
+end
+clear S                                 % frees the GPU memory
+```)
+
+Settings go in as name-value pairs. Errors carry identifiers such as
+`sparta:pivot` for a singular matrix. `help SpartaSolver` and
+`bindings/matlab/README.md` list the rest.
+
+== Julia
+
+*Requirements:* Julia 1.9 or later. The package calls the library directly,
+so it needs no compiler.
+
+*Installing:* add the package to an environment, then run its tests:
+
+#code(```julia
+using Pkg
+Pkg.develop(path = "bindings/julia")
+Pkg.test("SPARTA")
+```)
+
+It loads the library from `target/release`. To use a library elsewhere, set
+the environment variable `SPARTA_LIB` to its path.
+
+*Solving:*
+
+#code(```julia
+using SPARTA, SparseArrays
+
+F = SPARTA.Solver(A)                    # analyze and factor
+x = F \ b                               # solve; b may have several columns
+
+F = SPARTA.Solver(A; preset = :sweep, nemin = 32)
+for f in frequencies
+    factorize!(F, K - f^2 * M)          # same pattern: plan and memory reused
+    x = F \ b
+end
+close(F)                                # frees the GPU memory now
+```)
+
+Settings are keyword arguments. A failed call throws `SpartaError`, whose
+`kind` is one of the following:
+
+- `:pivot`: the matrix is singular or too badly scaled.
+- `:unsupported`: no GPU is available.
+- `:device`: the GPU failed.
+- `:invalid`: an input or setting was rejected.
+
+Several tasks may share one solver, because its calls are serialized.
+`bindings/julia/README.md` lists the rest.
+
+== Both bindings
+
+- *Pass the whole matrix*, both triangles, even when it is symmetric.
+  Refinement multiplies by it.
+- *Changing pattern.* A later matrix may lack some entries of the first, for
+  example because MATLAB drops entries that compute to exactly zero. The plan
+  is then kept, with zeros in their place. A matrix with an entry the plan
+  does not have is analyzed again.
+- *Precision.* Answers come back in double precision (`complex double` in
+  MATLAB, `ComplexF64` in Julia). With `refinement_steps` set to 0 they carry
+  the GPU's single-precision accuracy.
+
 = Settings and configuration
 
 The defaults are measured and suit most systems. This chapter explains every
@@ -1002,7 +1130,7 @@ let config = sparta::profiles::load("antenna")?.config;
 `cargo run --release --example optimize -- NAME` tunes on the standard
 problems and saves the result as `NAME`.
 
-== All settings
+== All settings <all-settings>
 
 Types are given in a language-neutral form. `uint32` is `u32` in Rust and
 `int` in Python; `uint64` is `usize` and `int`; `float64` is `f64` and
