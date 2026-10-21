@@ -56,7 +56,7 @@ class GoalApiTests(unittest.TestCase):
             def __init__(self, *args, **kwargs):
                 """Accept native symbolic metadata."""
                 pass
-            def factor(self, values):
+            def factor(self, values, hybrid_cpu=0.0):
                 """Allocate one numerical factor."""
                 return Native(values)
         with patch.object(solver_impl, '_Analysis', Plan):
@@ -94,7 +94,7 @@ class GoalApiTests(unittest.TestCase):
             def __init__(self,n,ptr,rows,limit,lu,*args,**kwargs):
                 """Capture lower CSC indices for the numerical stand-in."""
                 self.ptr,self.rows=ptr,rows
-            def factor(self,values):
+            def factor(self,values,hybrid_cpu=0.0):
                 """Allocate the test factor."""
                 self.refactor(values)
                 return self
@@ -155,7 +155,7 @@ class GoalApiTests(unittest.TestCase):
         package = Path(sparta.__file__).parent
         public = {'analyze', 'solve', 'solve_many', 'factorize', 'diagnostics', 'destroy',
                   'n', 'info', 'refinement_reports', 'perturbed_pivots', 'reanalyses',
-                  'factor_device_seconds', 'factor_seconds', 'converged', 'estimated_relative_error',
+                  'factor_device_seconds', 'factor_seconds', 'compute_dtype', 'hybrid_timing', 'converged', 'estimated_relative_error',
                   # FactorQuality, reachable as Solver.quality.
                   'quality', 'pivot_ratio', 'verdict', 'usable',
                   # Config and its constructors, which mirror sparta::Config.

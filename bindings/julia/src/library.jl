@@ -29,6 +29,7 @@ struct RawConfig
     narrow_cols::UInt32
     pivot_threads::UInt32
     schur_chunk::UInt32
+    hybrid_cpu::Cdouble
 end
 
 """
@@ -120,7 +121,7 @@ end
 """
     version() -> String
 
-The SPARTA library version, such as `"0.1.1"`.
+The SPARTA library version, such as `"0.2.0"`.
 """
 version() = unsafe_string(ccall(sym(:sparta_version), Cstring, ()))
 

@@ -7,6 +7,27 @@ import numpy as np
 
 from ._types import MatrixType, Ordering
 
+#: CPU share of the work that hybrid=True starts from. The share is rebalanced
+#: after every factorization, so this only sets the first one. 0.3 was the
+#: fastest start on the 887k-unknown EMerge sweep (M4 Pro, LDL^T), where the
+#: settled split runs 1.37x faster than the GPU alone.
+HYBRID_SHARE = 0.3
+
+
+def _hybrid_share(hybrid: bool | float) -> float:
+    """Return the hybrid_cpu share a hybrid= argument stands for.
+
+    True is HYBRID_SHARE, False is 0 (GPU only), and a number is the share
+    itself, between 0 and 1.
+    """
+    if hybrid is True:
+        return HYBRID_SHARE
+    if hybrid is False:
+        return 0.0
+    if isinstance(hybrid, (int, float)) and 0 <= hybrid < 1:
+        return float(hybrid)
+    raise ValueError("hybrid must be True, False, or a CPU share between 0 and 1")
+
 
 @dataclass(frozen=True)
 class _Options:
@@ -54,6 +75,7 @@ class _Options:
     pivot_threads: int | None
     schur_chunk: int | None
     force_cpu: bool
+    hybrid_cpu: float
     cpu_panel: int | None
     cpu_block_rows: int | None
     cpu_blas_min_rows: int | None
@@ -63,6 +85,9 @@ class _Options:
         
         if type(self.force_cpu) is not bool:
             raise ValueError("force_cpu must be a boolean")
+
+        if not isinstance(self.hybrid_cpu, (int, float)) or not 0 <= self.hybrid_cpu < 1:
+            raise ValueError("hybrid_cpu must be at least 0 and below 1")
         
         if type(self.verbose) is not bool:
             raise ValueError("verbose must be a boolean")

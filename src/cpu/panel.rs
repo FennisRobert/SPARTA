@@ -1,5 +1,6 @@
 //! LAPACK-shaped panels: stale LDLᵀ fronts and right-looking LU panels.
-use super::{block, div, factor::Front, finite, update, C};
+use super::Scalar;
+use super::{block, div, factor::Front, finite, update, C, R};
 use crate::{Kind, PivotFailure};
 
 type Failure = (usize, PivotFailure);
@@ -33,7 +34,7 @@ impl Front<'_> {
         w: &[C],
         width: usize,
     ) -> Vec<C> {
-        let mut coefficient = vec![C::new(0.0, 0.0); count];
+        let mut coefficient = vec![C::from_re(0.0); count];
         let mut t = 0;
         while t < count {
             let p = start + t;
@@ -48,7 +49,7 @@ impl Front<'_> {
                 t += 1;
             }
         }
-        let mut out = vec![C::new(0.0, 0.0); self.m];
+        let mut out = vec![C::from_re(0.0); self.m];
         for i in k..self.m {
             let mut v = self.a[i * self.m + col];
             for t in 0..count {
@@ -63,9 +64,9 @@ impl Front<'_> {
     fn ldlt_panel(&mut self, start: usize) -> Result<usize, Failure> {
         let capacity = self.config.cpu_panel.min(self.n - start);
         let width = capacity + 1;
-        let mut w = vec![C::new(0.0, 0.0); self.m * width];
+        let mut w = vec![C::from_re(0.0); self.m * width];
         let mut k = start;
-        let alpha = (1.0 + 17.0_f64.sqrt()) / 8.0;
+        let alpha = (1.0 + (17.0 as R).sqrt()) / 8.0;
         while k < self.n && k - start < capacity {
             let t = k - start;
             let mut col = self.column(k, k, start, t, &w, width);
@@ -89,7 +90,7 @@ impl Front<'_> {
                 let rm = (k..self.n)
                     .filter(|&j| j != imax)
                     .map(|j| row[j].norm())
-                    .fold(0.0, f64::max);
+                    .fold(0.0, R::max);
                 if akk >= alpha * cm * (cm / rm) {
                     pick = k;
                 } else if row[imax].norm() >= alpha * rm {
@@ -113,7 +114,7 @@ impl Front<'_> {
                 if !finite(det) {
                     return Err((k, PivotFailure::NonFinite));
                 }
-                if det.norm() <= f64::EPSILON {
+                if det.norm() <= R::EPSILON {
                     step = 1;
                     if da.norm() == 0.0 {
                         col[k] = self.rescue(k, false, &mut None, PivotFailure::TinyTwoByTwo)?;
@@ -175,7 +176,7 @@ impl Front<'_> {
                 }
             }
             let d = self.a[k * m + k].norm();
-            let threshold = self.config.lu_diag_threshold;
+            let threshold = self.config.lu_diag_threshold as R;
             if threshold > 0.0 && d > 0.0 && d >= threshold * best {
                 pick = k;
             }

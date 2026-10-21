@@ -6,10 +6,11 @@ from scipy.sparse import csc_matrix
 
 def _equilibrate(pattern: csc_matrix, values: np.ndarray, symmetric: bool
                 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Balance complex CSC values in five infinity-norm passes.
+    """Balance real or complex CSC values in five infinity-norm passes.
 
     pattern supplies row/column indices; symmetric selects D A D scaling for
-    lower-triangle storage. Return scaled complex128 values and positive real
+    lower-triangle storage. Return scaled values, float64 for real input and
+    complex128 for complex input, and positive real
     row/column multipliers. Empty rows/columns retain unit multipliers.
     """
     rows = pattern.indices
@@ -18,7 +19,7 @@ def _equilibrate(pattern: csc_matrix, values: np.ndarray, symmetric: bool
     ordering = csc_matrix((np.arange(len(values)), rows, pattern.indptr), shape=pattern.shape).tocsr()
     row_nonempty = np.flatnonzero(np.diff(ordering.indptr))
     col_nonempty = np.flatnonzero(np.diff(pattern.indptr))
-    data = np.array(values, dtype=np.complex128, copy=True)
+    data = np.array(values, dtype=np.result_type(values.dtype, np.float64), copy=True)
     left = np.ones(pattern.shape[0])
     right = np.ones(pattern.shape[1])
     for _ in range(5):

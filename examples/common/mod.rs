@@ -163,6 +163,33 @@ impl System {
             .map(|r| &r[port * self.n..(port + 1) * self.n])
     }
 
+    /// The same matrix with both triangles stored, for factoring a symmetric
+    /// system with LU. A system that is already full is returned as it is.
+    #[allow(dead_code)]
+    pub fn mirrored(self) -> Self {
+        if self.full {
+            return self;
+        }
+        let mut columns: Vec<Vec<(usize, C64)>> = vec![Vec::new(); self.n];
+        for j in 0..self.n {
+            for k in self.col_ptr[j]..self.col_ptr[j + 1] {
+                let (i, a) = (self.row_idx[k], self.values[k]);
+                columns[j].push((i, a));
+                if i != j {
+                    columns[i].push((j, a));
+                }
+            }
+        }
+        let (mut col_ptr, mut row_idx, mut values) = (vec![0], Vec::new(), Vec::new());
+        for mut column in columns {
+            column.sort_unstable_by_key(|e| e.0);
+            row_idx.extend(column.iter().map(|e| e.0));
+            values.extend(column.iter().map(|e| e.1));
+            col_ptr.push(row_idx.len());
+        }
+        Self { full: true, col_ptr, row_idx, values, ..self }
+    }
+
     /// `A x` in double precision. Used to score the single-precision GPU solve.
     ///
     /// A symmetric system stores only its lower triangle, so every off-diagonal

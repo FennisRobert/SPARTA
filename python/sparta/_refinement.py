@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from collections.abc import Callable
 import numpy as np
-from scipy.sparse import csc_matrix, csr_matrix
+from scipy.sparse import csc_matrix, csr_matrix, tril
 
 try:
     from ._sparta import _residual_product
@@ -81,8 +81,35 @@ def _column_scale(x: np.ndarray) -> np.ndarray:
     return np.maximum(np.abs(x.real).max(axis=0), np.abs(x.imag).max(axis=0))
 
 
+class _Transposed:
+    """Per row of a CSC matrix, the columns of its entries and their slots.
+
+    Built once per pattern and shared by every _Operator on it. With
+    symmetric=True the CSC is a lower triangle and only its strict lower part
+    is indexed, because the triangle's own columns already give the upper
+    part's rows. Indices are int32 when they fit, otherwise int64.
+    """
+
+    def __init__(self, a: csc_matrix, symmetric: bool) -> None:
+        """Index the transposed pattern of canonical CSC a."""
+        n, nnz = a.shape[0], a.nnz
+        self.index = np.dtype(np.int32 if max(n, nnz) < 2**31 else np.int64)
+        rows = np.ascontiguousarray(a.indices, dtype=self.index)
+        columns = np.repeat(np.arange(n, dtype=self.index), np.diff(a.indptr))
+        source = np.arange(nnz, dtype=self.index)
+        if symmetric:
+            off = rows != columns
+            rows, columns, source = rows[off], columns[off], source[off]
+        # Stable, so each row keeps its columns in ascending order.
+        order = np.argsort(rows, kind='stable')
+        self.indices = columns[order]
+        self.source = source[order]
+        self.indptr = np.zeros(n + 1, dtype=self.index)
+        np.cumsum(np.bincount(rows, minlength=n), out=self.indptr[1:])
+
+
 class _Operator:
-    """The original matrix in complex128, applied to dense blocks of columns.
+    """The original matrix in double precision, applied to dense blocks of columns.
 
     Refinement measures its residual against this, and it is the only part of a
     solve that does not run on the GPU. That matters as soon as there are
@@ -92,25 +119,48 @@ class _Operator:
 
     So the product is handed to the compiled extension, which splits the rows
     across workers and advances every right-hand side together within a row.
-    The accumulation stays row-wise, so the result does not depend on how many
-    workers ran. SciPy remains the fallback for anything the extension will not
-    take.
+    It reads the solver's own canonical CSC arrays plus a _Transposed index,
+    rather than a CSR copy of the matrix. The accumulation order is fixed per
+    row, so the result does not depend on how many workers ran. SciPy remains
+    the fallback when the extension is unavailable.
     """
 
-    def __init__(self, matrix: csr_matrix) -> None:
-        """Wrap a complex128 CSR matrix, caching the index arrays Rust needs."""
-        self.matrix = matrix
-        self.shape = matrix.shape
-        self._indptr = np.ascontiguousarray(matrix.indptr, dtype=np.int64)
-        self._indices = np.ascontiguousarray(matrix.indices, dtype=np.int64)
-        self._values = np.ascontiguousarray(matrix.data, dtype=np.complex128)
+    def __init__(self, a: csc_matrix, symmetric: bool, transposed: _Transposed | None = None) -> None:
+        """Wrap canonical CSC a: its lower triangle when symmetric, else all of it.
+
+        transposed is a's _Transposed index, shared across factorizations of
+        one pattern; None builds it. The arrays of a are used in place when
+        they already have the precision and index type the product needs.
+        """
+        self.shape = a.shape
+        self.symmetric = symmetric
+        self.real = not np.iscomplexobj(a.data)
+        self._transposed = _Transposed(a, symmetric) if transposed is None else transposed
+        index = self._transposed.index
+        self._indptr = np.ascontiguousarray(a.indptr, dtype=index)
+        self._indices = np.ascontiguousarray(a.indices, dtype=index)
+        self._values = np.ascontiguousarray(a.data, dtype=np.float64 if self.real else np.complex128)
+
+    def _scipy(self) -> csc_matrix:
+        """The represented matrix as SciPy CSC, for the fallback product."""
+        a = csc_matrix((self._values, self._indices, self._indptr), shape=self.shape)
+        return a + tril(a, -1, format='csc').T if self.symmetric else a
 
     def _multiply(self, x: np.ndarray) -> np.ndarray:
-        """Return the matrix times a dense (n, k) complex128 block."""
-        block = np.ascontiguousarray(x, dtype=np.complex128)
+        """Return the matrix times a dense (n, k) block, in float64 when both
+        are real and complex128 otherwise."""
+        complex_x = np.iscomplexobj(x)
+        block = np.ascontiguousarray(x, dtype=np.complex128 if complex_x or not self.real else np.float64)
         if _residual_product is None:
-            return np.column_stack([self.matrix @ block[:, j] for j in range(block.shape[1])])
-        return _residual_product(self._indptr, self._indices, self._values, block)
+            matrix = self._scipy()
+            return np.column_stack([matrix @ block[:, j] for j in range(block.shape[1])])
+        t = self._transposed
+        arrays = (self._indptr, self._indices, self._values, t.indptr, t.indices, t.source, self.symmetric)
+        if self.real and complex_x:
+            # A real matrix applies to the real and imaginary parts alike, so
+            # the complex block goes in as its float64 view, twice as wide.
+            return _residual_product(*arrays, block.view(np.float64)).view(np.complex128)
+        return _residual_product(*arrays, block)
 
     def __matmul__(self, x: np.ndarray) -> np.ndarray:
         """Support `operator @ vector` for the one-off residuals verbose prints."""
@@ -139,15 +189,18 @@ def _refine_block(a: csc_matrix | csr_matrix, b: np.ndarray,
                   minimize: bool = False) -> tuple[np.ndarray, tuple[RefinementReport, ...]]:
     """Refine every column of b together, one batched solve per correction.
 
-    a is the original complex128 matrix, b an (n, k) complex128 right-hand-side
-    block, and solve applies the complex64 factors to a whole block. steps is the
+    a is the original matrix, b an (n, k) right-hand-side block, and solve
+    applies the single precision factors to a whole block. The work is float64
+    when a and b are both real, complex128 otherwise. steps is the
     maximum correction count or -1 for as many as rtol needs; minimize selects an
     optimal complex step length per column. Columns stop independently: once one
     converges or stalls it leaves the batch, so later corrections only carry the
     columns that still need them. Returns the block of best iterates and one
     report per column, in the caller's column order.
     """
-    b = np.asarray(b, dtype=np.complex128)
+    real = not np.iscomplexobj(b) and getattr(a, 'real', False) is True
+    b = np.asarray(b, dtype=np.float64 if real else np.complex128)
+    narrow = np.float32 if real else np.complex64
     n, k = b.shape
     scale = _column_scale(b)
     # A zero column has no scale to divide by and is measured absolutely.
@@ -156,10 +209,10 @@ def _refine_block(a: csc_matrix | csr_matrix, b: np.ndarray,
     divisor = np.where(scale > 0, np.where(divisor > 0, divisor, 1.0), 1.0)
 
     def _correction(rhs: np.ndarray) -> np.ndarray:
-        """Narrow a complex128 block to complex64 column by column and solve it."""
+        """Narrow a block to single precision column by column and solve it."""
         size = _column_scale(rhs)
         by = np.where(size > 0, size, 1.0)
-        out = np.asarray(solve(np.ascontiguousarray(rhs/by, dtype=np.complex64)), dtype=np.complex128)
+        out = np.asarray(solve(np.ascontiguousarray(rhs/by, dtype=narrow)), dtype=b.dtype)
         return out*by
 
     def _residual(x: np.ndarray, columns: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

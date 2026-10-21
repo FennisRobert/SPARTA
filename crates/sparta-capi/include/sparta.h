@@ -45,7 +45,7 @@ extern "C" {
 #define SPARTA_VERSION_MINOR 1
 #define SPARTA_VERSION_PATCH 4
 
-/** Returns the library version as text, for example "0.1.1". */
+/** Returns the library version as text, for example "0.2.0". */
 const char *sparta_version(void);
 
 /** Returns the GPU backend this library was built for: "metal" or "vulkan".
@@ -265,6 +265,16 @@ typedef struct {
 
     /** Panel columns staged per pass of the trailing update. Default 16. */
     uint32_t schur_chunk;
+
+    /* ---- CPU and GPU together. ---- */
+
+    /** Share of the factorization work, from 0 to below 1, that the CPU does
+     *  while the GPU does the rest at the same time. 0 is the GPU alone; 0.3 is
+     *  a good start. The share then adapts after every factorization to the
+     *  measured speed of each. Read when the solver is created. Only the Metal
+     *  backend has a hybrid path; elsewhere it is ignored. Default 0, or the
+     *  SPARTA_HYBRID_CPU environment variable. */
+    double hybrid_cpu;
 } sparta_config;
 
 /** Fills `config` with the default settings. */
@@ -342,7 +352,7 @@ typedef struct sparta_solver sparta_solver;
 sparta_status sparta_solver_create(sparta_analysis **analysis,
                                    sparta_solver **out);
 
-/** Factors a matrix on the GPU.
+/** Factors a complex matrix on the GPU.
  *
  *  Call it again with different numbers to factor another matrix sharing the
  *  analyzed pattern; the plan and the GPU memory are reused.
@@ -356,9 +366,18 @@ sparta_status sparta_solver_create(sparta_analysis **analysis,
  *          way, so a failed call leaves nothing to solve with. */
 sparta_status sparta_factor(sparta_solver *solver, const sparta_complex *values);
 
-/** Solves A x = b using the factors from the last sparta_factor.
+/** Factors a real matrix on the GPU. Same as sparta_factor, with one float per
+ *  nonzero. For now the GPU runs it through the complex kernels with a zero
+ *  imaginary part, so it is as fast as sparta_factor, not faster.
  *
- *  @param solver  A solver whose last sparta_factor succeeded.
+ *  Solve against the result with sparta_solve_real, or with sparta_solve for
+ *  a complex right-hand side. */
+sparta_status sparta_factor_real(sparta_solver *solver, const float *values);
+
+/** Solves A x = b for a complex right-hand side, using the factors from the
+ *  last sparta_factor or sparta_factor_real.
+ *
+ *  @param solver  A solver whose last factorization succeeded.
  *  @param b       The right-hand side: n numbers.
  *  @param x       Receives the solution: n numbers. May be the same array
  *                 as `b`, which solves in place. */
@@ -377,6 +396,21 @@ sparta_status sparta_solve_many(sparta_solver *solver,
                                 const sparta_complex *b,
                                 sparta_complex *x,
                                 int64_t count);
+
+/** Solves A x = b for a real right-hand side, using the factors from the last
+ *  sparta_factor_real. Returns SPARTA_ERROR_INVALID after sparta_factor: the
+ *  solution of a complex matrix is complex.
+ *
+ *  @param b  n floats.
+ *  @param x  Receives n floats. May be the same array as `b`. */
+sparta_status sparta_solve_real(sparta_solver *solver, const float *b, float *x);
+
+/** Solves for several real right-hand sides at once; see sparta_solve_many
+ *  for the layout and sparta_solve_real for when it applies. */
+sparta_status sparta_solve_many_real(sparta_solver *solver,
+                                     const float *b,
+                                     float *x,
+                                     int64_t count);
 
 /** Returns the number of rows the solver was built for, or 0 if `solver` is
  *  NULL. */

@@ -24,7 +24,7 @@ class VerboseTests(unittest.TestCase):
                 """Accept symbolic constructor arguments."""
                 pass
 
-            def factor(self, values):
+            def factor(self, values, hybrid_cpu=0.0):
                 """Store complex diagonal values."""
                 self.values = values
                 return self

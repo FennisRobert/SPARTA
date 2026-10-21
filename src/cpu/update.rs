@@ -1,6 +1,7 @@
 //! Dense CPU updates for the panel path. Large products go to whichever BLAS
 //! `build.rs` linked; smaller ones, and builds with no BLAS at all, use the
 //! Rust loops below.
+use super::Scalar;
 use super::{dense, factor::Front, C};
 use crate::Kind;
 
@@ -12,7 +13,7 @@ pub(super) fn trailing(front: &mut Front<'_>, start: usize, end: usize) {
     if tail == 0 {
         return;
     }
-    let mut left = vec![C::new(0.0, 0.0); tail * width];
+    let mut left = vec![C::from_re(0.0); tail * width];
     let mut right = left.clone();
     for i in end..m {
         let mut k = start;

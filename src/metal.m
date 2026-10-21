@@ -112,8 +112,14 @@ static const char* const kSpartaClassNames[SPARTA_CLASSES]={
  id<MTLComputePipelineState> solveForwardLuWide, solveBackwardLuWide;
  id<MTLBuffer> buffers[SPARTA_BUFFERS];
  uint32_t nodes,n,schurBatch,panelThreads,solveThreads,pivotThreads,lu,rhsCapacity; size_t valuesBytes; NSData* levels; NSData* steps;
+ // Hybrid factorization: the GPU's own share of the fronts, as a second level
+ // table and id/tile buffers bound in place of 5, 16 and 18 while factoring.
+ // The solve always uses the full plan above. `pending` holds the command
+ // buffers of a factorization started but not yet finished.
+ NSData* factorLevels; NSData* factorSteps; id<MTLBuffer> factorIds,factorTiles,factorSchur;
+ int bindFactor; NSMutableArray<id<MTLCommandBuffer>>* pending;
  // Opt-in profiling only; zero cost and untouched when SPARTA_PROFILE is unset.
- int profile; NSMutableArray<id<MTLCommandBuffer>>* profBuffers; NSMutableArray<NSNumber*>* profClass,* profSize;
+ int profile; NSMutableArray<id<MTLCommandBuffer>>* profBuffers; NSMutableArray<NSNumber*>* profClass,* profSize,* profLevel; uint32_t profLevelNow;
  double profSeconds[SPARTA_CLASSES]; uint64_t profCalls[SPARTA_CLASSES],profGroups[SPARTA_CLASSES];
 }
 @end
@@ -368,6 +374,11 @@ int sparta_v1_pivot_range(void* context,double* lo,double* hi){
 static id<MTLComputeCommandEncoder> begin(SpartaContext* c,id<MTLCommandBuffer> command) {
  id<MTLComputeCommandEncoder> encoder=[command computeCommandEncoder];if(!encoder)return nil;
  for(unsigned i=0;i<SPARTA_BUFFERS;i++)if(i!=14)[encoder setBuffer:c->buffers[i] offset:0 atIndex:i];
+ if(c->bindFactor&&c->factorIds){
+  [encoder setBuffer:c->factorIds offset:0 atIndex:5];
+  [encoder setBuffer:c->factorTiles offset:0 atIndex:16];
+  [encoder setBuffer:c->factorSchur offset:0 atIndex:18];
+ }
  return encoder;
 }
 // Threads per front for one solve level, from the rows of its largest front.
@@ -455,7 +466,7 @@ static void encode(SpartaContext* c,id<MTLComputeCommandEncoder> encoder,id<MTLC
    c->profCalls[klass]++;c->profGroups[klass]+=_g; \
    [encoder endEncoding]; \
    [c->profBuffers addObject:command];[c->profClass addObject:@(klass)]; \
-   [c->profSize addObject:@(_g)]; \
+   [c->profSize addObject:@(_g)];[c->profLevel addObject:@(c->profLevelNow)]; \
    [submitted addObject:command];[command commit]; \
    command=[c->queue commandBuffer]; \
    if(!command){message(error,cap,@"No profiling command buffer");return 0;} \
@@ -463,14 +474,14 @@ static void encode(SpartaContext* c,id<MTLComputeCommandEncoder> encoder,id<MTLC
    if(!encoder){message(error,cap,@"No profiling compute encoder");return 0;}}}}while(0)
 
 static void report_profile(SpartaContext* c,double total){
- if(c->profile>=2)fprintf(stderr,"\nSPARTA_PROFILE_DISPATCH  seq,kernel,groups,seconds\n");
+ if(c->profile>=2)fprintf(stderr,"\nSPARTA_PROFILE_DISPATCH  seq,kernel,groups,seconds,level\n");
  for(unsigned i=0;i<[c->profBuffers count];i++){
   id<MTLCommandBuffer> b=c->profBuffers[i];
   unsigned k=[c->profClass[i] unsignedIntValue];
   double dt=MAX(0,b.GPUEndTime-b.GPUStartTime);
   c->profSeconds[k]+=dt;
-  if(c->profile>=2)fprintf(stderr,"D,%u,%s,%u,%.6f\n",i,kSpartaClassNames[k],
-                           [c->profSize[i] unsignedIntValue],dt);
+  if(c->profile>=2)fprintf(stderr,"D,%u,%s,%u,%.6f,%u\n",i,kSpartaClassNames[k],
+                           [c->profSize[i] unsignedIntValue],dt,[c->profLevel[i] unsignedIntValue]);
  }
  double sum=0;for(unsigned k=0;k<SPARTA_CLASSES;k++)sum+=c->profSeconds[k];
  fprintf(stderr,"\nSPARTA_PROFILE  instrumented device total %.4fs over %lu dispatches\n",
@@ -483,22 +494,18 @@ static void report_profile(SpartaContext* c,double total){
           (unsigned long long)c->profGroups[k],(unsigned long long)c->profCalls[k]);
  }
  fprintf(stderr,"  %-22s %10.4f\n","sum of classes",sum);
- [c->profBuffers removeAllObjects];[c->profClass removeAllObjects];[c->profSize removeAllObjects];
+ [c->profBuffers removeAllObjects];[c->profClass removeAllObjects];[c->profSize removeAllObjects];[c->profLevel removeAllObjects];
  for(unsigned k=0;k<SPARTA_CLASSES;k++){c->profSeconds[k]=0;c->profCalls[k]=0;c->profGroups[k]=0;}
 }
 
-int sparta_v1_run(void* context,int factoring,const void* input,void* output,uint32_t nrhs,uint32_t* status,uint64_t* perturbed,double* seconds,char* error,size_t cap){
- @autoreleasepool {
-  // Retain every submitted command and join even on an encoding exception.
-  // Rust may reuse/free buffers immediately after this function returns.
-  NSMutableArray<id<MTLCommandBuffer>>* submitted=[NSMutableArray new];
-  @try {
-   SpartaContext* c=(__bridge SpartaContext*)context;
-   // One schedule, two kernel sets. Everything about the dispatch below --
-   // level order, panel steps, tile prefixes and suffixes, the drain cadence,
-   // the 64-pass command split -- is a property of the plan, not of the
-   // factorization, so the only thing the LU path changes is which pipelines
-   // these names resolve to and that there is no block diagonal to solve.
+// Encode and commit factorization levels [first, last) into `submitted`.
+//
+// Each level is complete in itself -- assembly, every panel step, the final
+// drain and the factor copy -- so a factorization can be split between any two
+// levels. The commands are committed but not waited for.
+static int encode_factor(SpartaContext* c,uint32_t first,uint32_t last,NSMutableArray<id<MTLCommandBuffer>>* submitted,char* error,size_t cap){
+   uint32_t nrhs=1;
+   // The LU path changes only which pipelines these names resolve to.
    id<MTLComputePipelineState> kFactor=c->lu?c->factorLu:c->factor;
    id<MTLComputePipelineState> kInit=c->lu?c->initializeLargeLu:c->initializeLarge;
    id<MTLComputePipelineState> kNarrow=c->lu?c->factorNarrowLu:c->factorNarrow;
@@ -506,38 +513,17 @@ int sparta_v1_run(void* context,int factoring,const void* input,void* output,uin
    id<MTLComputePipelineState> kStrip=c->lu?c->updateStripLu:c->updateStrip;
    id<MTLComputePipelineState> kSchur=c->lu?c->updateSchurLu:c->updateSchur;
    id<MTLComputePipelineState> kStore=c->lu?c->storeFactorsLu:c->storeFactors;
-   id<MTLComputePipelineState> kForward=c->lu?c->solveForwardLu:c->solveForward;
-   id<MTLComputePipelineState> kBackward=c->lu?c->solveBackwardLu:c->solveBackward;
-   id<MTLComputePipelineState> kForwardWide=c->lu?c->solveForwardLuWide:c->solveForwardWide;
-   id<MTLComputePipelineState> kBackwardWide=c->lu?c->solveBackwardLuWide:c->solveBackwardWide;
-   if(c->profile&&!c->profBuffers){c->profBuffers=[NSMutableArray new];c->profClass=[NSMutableArray new];c->profSize=[NSMutableArray new];}
-   if(factoring)nrhs=1;
-   else if(!nrhs){message(error,cap,@"at least one right-hand side required");return 0;}
-   // The solution block, and on the LU path the pivot-order handover scratch,
-   // hold one column each. Grow them the first time a wider block arrives and
-   // keep the capacity: a sweep solves the same shape over and over.
-   if(!factoring&&nrhs>c->rhsCapacity){
-    size_t want=(size_t)c->n*nrhs*8;
-    id<MTLBuffer> grown=[c->device newBufferWithLength:MAX(want,4) options:MTLResourceStorageModeShared];
-    if(!grown){message(error,cap,[NSString stringWithFormat:@"allocating %.2f GiB for %u right-hand sides failed",want/1073741824.0,nrhs]);return 0;}
-    c->buffers[13]=grown;
-    if(c->lu){
-     id<MTLBuffer> scratch=[c->device newBufferWithLength:MAX(want,4) options:MTLResourceStorageModeShared];
-     if(!scratch){message(error,cap,@"allocating LU solve scratch failed");return 0;}
-     c->buffers[8]=scratch;
-    }
-    c->rhsCapacity=nrhs;
-   }
-   memcpy(c->buffers[factoring?6:13].contents,input,factoring?c->valuesBytes:(size_t)c->n*nrhs*8);
    id<MTLCommandBuffer> command=[c->queue commandBuffer];if(!command){message(error,cap,@"No command buffer");return 0;}
    id<MTLComputeCommandEncoder> encoder=begin(c,command);
    if(!encoder){message(error,cap,@"No compute encoder");return 0;}
-   if(factoring){
-    const SpartaLevel* levels=c->levels.bytes;size_t count=c->levels.length/sizeof(SpartaLevel);
-    const SpartaStep* steps=c->steps.bytes;
+    NSData* table=c->bindFactor?c->factorLevels:c->levels;
+    const SpartaLevel* levels=table.bytes;size_t count=table.length/sizeof(SpartaLevel);
+    const SpartaStep* steps=(c->bindFactor?c->factorSteps:c->steps).bytes;
+    if(last>count)last=(uint32_t)count;
     unsigned passes=0;
-    for(size_t l=0;l<count;l++){
+    for(size_t l=first;l<last;l++){
      SpartaLevel level=levels[l];
+     c->profLevelNow=(uint32_t)l;
      STEP(kFactor,level.smallStart,level.smallCount,0,P_FACTOR);
      // Narrow and wide cooperative fronts are adjacent in the id list, so one
      // assembly dispatch covers both.
@@ -642,7 +628,72 @@ int sparta_v1_run(void* context,int factoring,const void* input,void* output,uin
       }
      }
     }
+   [encoder endEncoding];
+   [submitted addObject:command];[command commit];
+   return 1;
+}
+// Wait for `submitted`, add its GPU time to `seconds`, and on a factorization
+// copy out the per-node status words and total the perturbed pivots.
+static int collect(SpartaContext* c,NSMutableArray<id<MTLCommandBuffer>>* submitted,uint32_t* status,uint64_t* perturbed,double* seconds,char* error,size_t cap){
+ for(id<MTLCommandBuffer> job in submitted)[job waitUntilCompleted];
+ *seconds=0;
+ for(id<MTLCommandBuffer> job in submitted){
+  if(job.status!=MTLCommandBufferStatusCompleted){message(error,cap,job.error.localizedDescription?:@"GPU execution failed");return 0;}
+  *seconds+=MAX(0,job.GPUEndTime-job.GPUStartTime);
+ }
+ if(c->profile)report_profile(c,*seconds);
+ if(status){
+  memcpy(status,c->buffers[12].contents,c->nodes*4);
+  // Total the per-front perturbation counts. FrontState is {next,start,width,
+  // panel,perturbed} and must match analysis::FrontState.
+  *perturbed=0;
+  const uint32_t* st=c->buffers[15].contents;
+  for(uint32_t i=0;i<c->nodes;i++)*perturbed+=st[i*5+4];
+ }
+ return 1;
+}
+int sparta_v1_run(void* context,int factoring,const void* input,void* output,uint32_t nrhs,uint32_t* status,uint64_t* perturbed,double* seconds,char* error,size_t cap){
+ @autoreleasepool {
+  // Retain every submitted command and join even on an encoding exception.
+  // Rust may reuse/free buffers immediately after this function returns.
+  NSMutableArray<id<MTLCommandBuffer>>* submitted=[NSMutableArray new];
+  @try {
+   SpartaContext* c=(__bridge SpartaContext*)context;
+   // One schedule, two kernel sets. Everything about the dispatch below --
+   // level order, panel steps, tile prefixes and suffixes, the drain cadence,
+   // the 64-pass command split -- is a property of the plan, not of the
+   // factorization, so the only thing the LU path changes is which pipelines
+   // these names resolve to and that there is no block diagonal to solve.
+   id<MTLComputePipelineState> kForward=c->lu?c->solveForwardLu:c->solveForward;
+   id<MTLComputePipelineState> kBackward=c->lu?c->solveBackwardLu:c->solveBackward;
+   id<MTLComputePipelineState> kForwardWide=c->lu?c->solveForwardLuWide:c->solveForwardWide;
+   id<MTLComputePipelineState> kBackwardWide=c->lu?c->solveBackwardLuWide:c->solveBackwardWide;
+   if(c->profile&&!c->profBuffers){c->profBuffers=[NSMutableArray new];c->profClass=[NSMutableArray new];c->profSize=[NSMutableArray new];c->profLevel=[NSMutableArray new];}
+   if(factoring)nrhs=1;
+   else if(!nrhs){message(error,cap,@"at least one right-hand side required");return 0;}
+   // The solution block, and on the LU path the pivot-order handover scratch,
+   // hold one column each. Grow them the first time a wider block arrives and
+   // keep the capacity: a sweep solves the same shape over and over.
+   if(!factoring&&nrhs>c->rhsCapacity){
+    size_t want=(size_t)c->n*nrhs*8;
+    id<MTLBuffer> grown=[c->device newBufferWithLength:MAX(want,4) options:MTLResourceStorageModeShared];
+    if(!grown){message(error,cap,[NSString stringWithFormat:@"allocating %.2f GiB for %u right-hand sides failed",want/1073741824.0,nrhs]);return 0;}
+    c->buffers[13]=grown;
+    if(c->lu){
+     id<MTLBuffer> scratch=[c->device newBufferWithLength:MAX(want,4) options:MTLResourceStorageModeShared];
+     if(!scratch){message(error,cap,@"allocating LU solve scratch failed");return 0;}
+     c->buffers[8]=scratch;
+    }
+    c->rhsCapacity=nrhs;
+   }
+   memcpy(c->buffers[factoring?6:13].contents,input,factoring?c->valuesBytes:(size_t)c->n*nrhs*8);
+   if(factoring){
+    c->bindFactor=0;
+    if(!encode_factor(c,0,UINT32_MAX,submitted,error,cap))return 0;
    }else{
+    id<MTLCommandBuffer> command=[c->queue commandBuffer];if(!command){message(error,cap,@"No command buffer");return 0;}
+    id<MTLComputeCommandEncoder> encoder=begin(c,command);
+    if(!encoder){message(error,cap,@"No compute encoder");return 0;}
     // Fronts within a level are independent, so each gets its own threadgroup.
     // Forward runs leaves first, backward runs roots first.
     const SpartaLevel* levels=c->levels.bytes;size_t count=c->levels.length/sizeof(SpartaLevel);
@@ -667,26 +718,78 @@ int sparta_v1_run(void* context,int factoring,const void* input,void* output,uin
      STEPW(wide?kBackwardWide:kBackward,levels[l-1].smallStart,fronts,7,P_BWD,
            wide?SPARTA_SOLVE_THREADS_WIDE:SPARTA_SOLVE_THREADS_NARROW);
     }
+    [encoder endEncoding];
+    [submitted addObject:command];[command commit];
    }
-   [encoder endEncoding];
-   [submitted addObject:command];[command commit];
-   for(id<MTLCommandBuffer> job in submitted)[job waitUntilCompleted];
-   *seconds=0;
-   for(id<MTLCommandBuffer> job in submitted){
-    if(job.status!=MTLCommandBufferStatusCompleted){message(error,cap,job.error.localizedDescription?:@"GPU execution failed");return 0;}
-    *seconds+=MAX(0,job.GPUEndTime-job.GPUStartTime);
-   }
-   if(c->profile)report_profile(c,*seconds);
-   if(factoring){
-    memcpy(status,c->buffers[12].contents,c->nodes*4);
-    // Total the per-front perturbation counts. FrontState is {next,start,width,
-    // panel,perturbed} and must match analysis::FrontState.
-    *perturbed=0;
-    const uint32_t* st=c->buffers[15].contents;
-    for(uint32_t i=0;i<c->nodes;i++)*perturbed+=st[i*5+4];
-   }else memcpy(output,c->buffers[13].contents,(size_t)c->n*nrhs*8);
+   if(!collect(c,submitted,factoring?status:NULL,perturbed,seconds,error,cap))return 0;
+   if(!factoring)memcpy(output,c->buffers[13].contents,(size_t)c->n*nrhs*8);
    return 1;
   }@catch(NSException* e){message(error,cap,e.reason);return 0;}
   @finally {for(id<MTLCommandBuffer> job in submitted)if(job.status>=MTLCommandBufferStatusCommitted)[job waitUntilCompleted];}
  }
+}
+
+// The hybrid factorization's entry points. The host factors some subtrees on
+// the CPU while the GPU factors the rest, so the GPU runs only its own share of
+// the fronts (`set_factor_plan`), in two level ranges with the host's handover
+// in between (`factor_start` twice, each followed by `factor_finish`).
+
+// Install the GPU's share of the factorization: the level and step tables and
+// the id, strip-tile and Schur-tile lists built for that share alone. Returns 0
+// and writes `error` on failure.
+int sparta_v1_set_factor_plan(void* context,const void* ids,size_t idsBytes,const void* tiles,size_t tilesBytes,
+                              const void* schur,size_t schurBytes,const uint32_t* level_data,uint32_t level_count,
+                              const uint32_t* step_data,uint32_t step_count,char* error,size_t cap){
+ @autoreleasepool {@try {
+  SpartaContext* c=(__bridge SpartaContext*)context;
+  id<MTLBuffer> b[3];const void* src[3]={ids,tiles,schur};size_t len[3]={idsBytes,tilesBytes,schurBytes};
+  for(int i=0;i<3;i++){
+   b[i]=[c->device newBufferWithLength:MAX(len[i],4) options:MTLResourceStorageModeShared];
+   if(!b[i]){message(error,cap,@"allocating the hybrid dispatch tables failed");return 0;}
+   if(len[i])memcpy(b[i].contents,src[i],len[i]);
+  }
+  c->factorIds=b[0];c->factorTiles=b[1];c->factorSchur=b[2];
+  c->factorLevels=[NSData dataWithBytes:level_data length:level_count*sizeof(SpartaLevel)];
+  c->factorSteps=[NSData dataWithBytes:step_data length:step_count*sizeof(SpartaStep)];
+  return 1;
+ }@catch(NSException* e){message(error,cap,e.reason);return 0;}}
+}
+
+// Host address and length of device buffer `index`. Every buffer is
+// StorageModeShared, so the host may write a node's factors and contribution
+// block directly, provided no command in flight touches the same bytes.
+void* sparta_v1_buffer(void* context,uint32_t index,size_t* length){
+ SpartaContext* c=(__bridge SpartaContext*)context;
+ if(index>=SPARTA_BUFFERS||!c->buffers[index]){*length=0;return NULL;}
+ *length=c->buffers[index].length;
+ return c->buffers[index].contents;
+}
+
+// Commit factorization levels [first, last) of the GPU's share and return
+// without waiting. `input`, when not NULL, is copied in first as the values of
+// a new factorization. Returns 0 and writes `error` on failure.
+int sparta_v1_factor_start(void* context,const void* input,uint32_t first,uint32_t last,char* error,size_t cap){
+ @autoreleasepool {@try {
+  SpartaContext* c=(__bridge SpartaContext*)context;
+  if(!c->factorIds){message(error,cap,@"no hybrid factor plan installed");return 0;}
+  if(c->profile&&!c->profBuffers){c->profBuffers=[NSMutableArray new];c->profClass=[NSMutableArray new];c->profSize=[NSMutableArray new];c->profLevel=[NSMutableArray new];}
+  if(!c->pending)c->pending=[NSMutableArray new];
+  if(input)memcpy(c->buffers[6].contents,input,c->valuesBytes);
+  c->bindFactor=1;
+  int ok=encode_factor(c,first,last,c->pending,error,cap);
+  c->bindFactor=0;
+  return ok;
+ }@catch(NSException* e){message(error,cap,e.reason);return 0;}}
+}
+
+// Wait for every level range started since the last finish. Writes the GPU
+// time of those ranges to `seconds`, the status words of every node, and the
+// pivots perturbed so far by the GPU.
+int sparta_v1_factor_finish(void* context,uint32_t* status,uint64_t* perturbed,double* seconds,char* error,size_t cap){
+ @autoreleasepool {@try {
+  SpartaContext* c=(__bridge SpartaContext*)context;
+  NSMutableArray<id<MTLCommandBuffer>>* jobs=c->pending?:[NSMutableArray new];
+  c->pending=nil;
+  return collect(c,jobs,status,perturbed,seconds,error,cap);
+ }@catch(NSException* e){message(error,cap,e.reason);return 0;}}
 }

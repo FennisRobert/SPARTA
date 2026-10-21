@@ -40,6 +40,32 @@ residual(A, x, b) = norm(b - A * x) / norm(b)
         @test size(F \ zeros(n, 0)) == (n, 0)
     end
 
+    @testset "hybrid" begin
+        H = SPARTA.Solver(A; hybrid = true)
+        @test residual(A, H \ (A * want), A * want) < 1e-6
+        factorize!(H, A)
+        @test residual(A, H \ (A * want), A * want) < 1e-6
+        close(H)
+        @test_throws ArgumentError SPARTA.Solver(A; hybrid = 1.5)
+    end
+
+    @testset "real matrix" begin
+        R = L - 0.3 * Id
+        G = SPARTA.Solver(R)
+        x = collect((1:n) ./ n)
+        @test G.values isa Vector{Float32}
+        y = G \ (R * x)
+        @test eltype(y) == Float64
+        @test residual(R, y, R * x) < 1e-6
+        z = G \ (R * want)
+        @test eltype(z) == ComplexF64
+        @test residual(R, z, R * want) < 1e-6
+        factorize!(G, R + 0.1im * Id)
+        @test G.values isa Vector{ComplexF32}
+        @test residual(R + 0.1im * Id, G \ ((R + 0.1im * Id) * want), (R + 0.1im * Id) * want) < 1e-6
+        close(G)
+    end
+
     @testset "sweep" begin
         for s in (0.2, 0.7)
             A = L + s * im * Id
@@ -73,7 +99,7 @@ residual(A, x, b) = norm(b - A * x) / norm(b)
     @testset "real input" begin
         R = SPARTA.Solver(L; kind = :symmetric, preset = :structured_grid)
         @test residual(L, R \ ones(n), ones(n)) < 1e-6
-        @test eltype(R \ ones(n)) == ComplexF64
+        @test eltype(R \ ones(n)) == Float64
     end
 
     @testset "errors" begin

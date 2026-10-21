@@ -133,8 +133,8 @@ impl Report {
             return;
         }
         let total: f64 = self.seconds.iter().sum();
-        // Eight real flops per complex multiply-add.
-        let rate = |work: f64, seconds: f64| 8.0 * work / seconds.max(f64::MIN_POSITIVE) / 1e9;
+        // Real flops per multiply-add of this copy's value type.
+        let rate = |work: f64, seconds: f64| super::FLOPS * work / seconds.max(f64::MIN_POSITIVE) / 1e9;
         eprintln!("\nSPARTA_PROFILE  CPU factorization");
         eprintln!(
             "  {:<12} {:>10} {:>8} {:>10} {:>10}",
@@ -147,7 +147,7 @@ impl Report {
                 name,
                 seconds * 1e3,
                 100.0 * seconds / total.max(f64::MIN_POSITIVE),
-                8.0 * work / 1e9,
+                super::FLOPS * work / 1e9,
                 rate(work, seconds)
             );
         }
@@ -157,7 +157,7 @@ impl Report {
             "total",
             total * 1e3,
             100.0,
-            8.0 * work / 1e9,
+            super::FLOPS * work / 1e9,
             rate(work, total)
         );
         eprintln!(

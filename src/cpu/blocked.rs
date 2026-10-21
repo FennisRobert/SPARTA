@@ -14,6 +14,7 @@
 use super::dense::{self, Side, Threading, Tri};
 use rayon::prelude::*;
 use super::profile::{Phase, Report};
+use super::Scalar;
 use super::{block, div, factor::Front, finite, C};
 use crate::PivotFailure;
 
@@ -37,9 +38,9 @@ unsafe impl Sync for Cells {}
 #[derive(Default)]
 pub(crate) struct Scratch {
     /// Column-major copy of the fully summed block, order `nc`.
-    leading: Vec<C>,
+    pub(super) leading: Vec<C>,
     /// LAPACK interchanges for the fully summed block.
-    ipiv: Vec<i32>,
+    pub(super) ipiv: Vec<i32>,
     /// LAPACK's preferred `zsytrf` workspace, and the order it was sized for.
     work: Vec<C>,
     fitted: usize,
@@ -86,9 +87,9 @@ impl Scratch {
 }
 
 /// Extend `buffer` with zeros until it holds at least `want` elements.
-fn grow(buffer: &mut Vec<C>, want: usize) {
+pub(super) fn grow(buffer: &mut Vec<C>, want: usize) {
     if buffer.len() < want {
-        buffer.resize(want, C::new(0.0, 0.0));
+        buffer.resize(want, C::from_re(0.0));
     }
 }
 
@@ -116,10 +117,11 @@ impl Front<'_> {
             }
         }
         let ipiv = &mut s.ipiv[..n];
-        // The only kernel here whose parallelism SPARTA cannot express itself:
-        // a panelled factorization has a serial chain down the diagonal, so
-        // Accelerate splits it far better from the inside than row blocks would
-        // from the outside. Everything else runs one thread per Rayon task.
+        // A panelled factorization has a serial chain down the diagonal that
+        // row blocks cannot split from the outside, so this is left to the
+        // library. Accelerate (macOS 26) runs `?sytrf` and `?getrf` on one
+        // thread either way, legacy and `$NEWLAPACK` alike; the setting is
+        // for libraries that do thread them.
         dense::set_threading(Threading::Machine);
         let info = dense::sytrf(n, leading, n, ipiv, &mut s.work);
         dense::set_threading(Threading::Caller);
@@ -144,16 +146,7 @@ impl Front<'_> {
                 packed
                     .par_chunks_mut(n * self.config.cpu_block_rows.max(1))
                     .for_each(|block| {
-                        dense::trsm(
-                            Side::Right,
-                            Tri::UnitUpper,
-                            block.len() / n,
-                            n,
-                            tri,
-                            n,
-                            block,
-                            n,
-                        );
+                        dense::trsm(Side::Right, Tri::UnitUpper, block.len() / n, n, tri, n, block, n);
                     });
             } else {
                 dense::trsm(Side::Right, Tri::UnitUpper, tail, n, tri, n, packed, n);
@@ -167,9 +160,8 @@ impl Front<'_> {
             self.schur(packed);
             report.stop(Phase::Schur, clock);
         }
-        if self.a.iter().any(|&v| !finite(v)) {
-            return Err((n - 1, PivotFailure::NonFinite));
-        }
+        // Non-finite values are caught when the factor columns are stored;
+        // see `Shared::node`.
         Ok(true)
     }
 
@@ -220,13 +212,13 @@ impl Front<'_> {
         inv: &mut [C],
         off: &mut [C],
     ) -> Result<(), Failure> {
-        let (n, one) = (self.n, C::new(1.0, 0.0));
+        let (n, one) = (self.n, C::from_re(1.0));
         let mut k = 0;
         while k < n {
             self.d[k] = leading[k * n + k];
             if !self.two[k] {
                 inv[k] = div(one, self.d[k]);
-                off[k] = C::new(0.0, 0.0);
+                off[k] = C::from_re(0.0);
                 if !finite(inv[k]) {
                     return Err((k, PivotFailure::NonFinite));
                 }
@@ -235,13 +227,13 @@ impl Front<'_> {
             }
             self.sub[k] = leading[k * n + k + 1];
             self.d[k + 1] = leading[(k + 1) * n + k + 1];
-            leading[k * n + k + 1] = C::new(0.0, 0.0);
+            leading[k * n + k + 1] = C::from_re(0.0);
             let (aa, bb, cc, scale, det) = block(self.d[k], self.sub[k], self.d[k + 1]);
             let r = div(one, det * scale);
             inv[k] = cc * r;
             inv[k + 1] = aa * r;
             off[k] = bb * r;
-            off[k + 1] = C::new(0.0, 0.0);
+            off[k + 1] = C::from_re(0.0);
             if !finite(inv[k]) || !finite(inv[k + 1]) || !finite(off[k]) {
                 return Err((k, PivotFailure::NonFinite));
             }

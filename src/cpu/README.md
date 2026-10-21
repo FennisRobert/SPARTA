@@ -1,7 +1,17 @@
-# Complex128 CPU backend
+# CPU backend
 
 `Config { force_cpu: true, ..Config::default() }` selects CPU factorization and
-solves. The default remains Metal complex64; failures do not switch backends.
+solves. The default remains the GPU; failures do not switch backends.
+
+Wide LU fronts take the blocked route in `blocked_lu.rs` (`?getrf`, two
+triangular solves, one Schur GEMM), as wide LDLᵀ fronts take `blocked.rs`;
+`panel.rs` is the fallback for exactly singular blocks and for
+`lu_diag_threshold > 0`.
+
+The backend is compiled once per value type from this one source: `cpu_z`
+complex128, `cpu_c` complex64, `cpu_d` float64, `cpu_s` float32 (see
+`src/scalar.rs`). `Solver::factor_values` picks the copy from the
+values' type. The examples below use complex128.
 The CPU path never creates a Metal context.
 
 ```rust
@@ -26,8 +36,9 @@ X = solver.solve_many(B)
 solver.factorize(A_new)  # same sparsity pattern
 ```
 
-Keep `A` and `b` in complex128 to retain their original precision. CPU Python
-outputs are always complex128. Scaling and iterative refinement remain available;
+Keep `A` and `b` in double precision to retain their original precision. CPU
+Python factors in float64 for a real matrix and complex128 for a complex one,
+and returns that precision. Scaling and iterative refinement remain available;
 `refinement_steps=0` tests the direct factors without corrections. Rust's existing
 complex64 methods also work on CPU, but round their inputs/outputs to complex64;
 use `factor_c128`, `solve_c128`, and `solve_many_c128` for end-to-end complex128.
@@ -37,7 +48,11 @@ The benchmark accepts `--force-cpu` (also `--force_cpu`):
 cargo run --release --example bench -- --force-cpu test_matrices/em_m2_sym1.sparta
 ```
 
-The C/C++ ABI continues to expose its existing complex64 GPU interface.
+It factors in complex128; `--single` with `--force-cpu` factors in complex64,
+the precision of the hybrid's CPU half.
+
+The C/C++ ABI exposes the GPU only: complex64, and float32 through
+`sparta_factor_real`.
 
 ## Shared architecture
 
@@ -98,9 +113,10 @@ scheduling.
 
 ## Precision and settings
 
-All CPU front, factor, panel, diagonal, RHS and output scalars are complex128.
-The scaled 2×2 determinant threshold is `f64::EPSILON`; dead pivots are rescued
-at `sqrt(f64::EPSILON)` times the front scale. Finite nonzero 1×1 pivots are not
+All CPU front, factor, panel, diagonal, RHS and output scalars are the copy's
+value type `C`, and thresholds use its real type `R`. The scaled 2×2
+determinant threshold is `R::EPSILON`; dead pivots are rescued at
+`sqrt(R::EPSILON)` times the front scale. Finite nonzero 1×1 pivots are not
 blanket-floored. Perturbations are counted, and failed factorizations invalidate
 the factors until a later successful refactor. Destroy releases storage permanently.
 Higher precision does not eliminate singularity or conditioning limits.
@@ -110,7 +126,7 @@ The independent CPU settings are available in Rust `Config` and in Python
 
 | Setting | Default | Effect |
 |---|---:|---|
-| `force_cpu` | false | Explicitly select CPU complex128 |
+| `force_cpu` | false | Explicitly select the CPU backend |
 | `cpu_panel` | 32 | Pivots before a trailing update, panel path only |
 | `cpu_block_rows` | 96 | Rows per block of the trailing update, and the unit of work when one front is split across threads |
 | `cpu_blas_min_rows` | 64 | Minimum trailing rows before the panel path calls BLAS |

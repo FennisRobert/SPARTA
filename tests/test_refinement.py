@@ -70,7 +70,7 @@ class RefinementTests(unittest.TestCase):
             """Dense test double with canonical lower storage."""
             def __init__(self, n, ptr, rows, limit, lu, *args, **kwargs):
                 self.ptr, self.rows = ptr, rows
-            def factor(self, values):
+            def factor(self, values, hybrid_cpu=0.0):
                 self.refactor(values)
                 return self
             def refactor(self, values):
@@ -150,7 +150,7 @@ class ResidualProductTests(unittest.TestCase):
         """The threaded product agrees with SciPy's to complex128 rounding."""
         a = self._matrix()
         rng = np.random.default_rng(12)
-        operator = _Operator(a)
+        operator = _Operator(a.tocsc(), symmetric=False)
         for k in (1, 2, 5, 16):
             x = rng.standard_normal((a.shape[0], k)) + 1j*rng.standard_normal((a.shape[0], k))
             want = np.column_stack([a @ x[:, j] for j in range(k)])
@@ -163,18 +163,45 @@ class ResidualProductTests(unittest.TestCase):
         """`operator @ vector` keeps the one-dimensional shape its callers expect."""
         a = self._matrix()
         x = np.random.default_rng(13).standard_normal(a.shape[0]).astype(np.complex128)
-        got = _Operator(a) @ x
+        got = _Operator(a.tocsc(), symmetric=False) @ x
         self.assertEqual(got.shape, (a.shape[0],))
         self.assertLess(np.abs(got - a @ x).max(), 1e-12*np.abs(a @ x).max())
 
+    def test_symmetric_from_the_lower_triangle(self) -> None:
+        """The product from a stored lower triangle equals the mirrored matrix's."""
+        a = self._matrix()
+        a = (a + a.T).tocsc()
+        lower = sparse.tril(a, format='csc')
+        x = np.random.default_rng(14).standard_normal((a.shape[0], 3)) + 0j
+        got = _Operator(lower, symmetric=True)._multiply(x)
+        want = a @ x
+        self.assertLess(np.abs(got - want).max(), 1e-12*np.abs(want).max())
+
+    def test_real_matrix_complex_block(self) -> None:
+        """A real matrix applies to a complex block through its float64 view."""
+        a = sparse.tril(self._matrix().real, format='csc')
+        full = a + sparse.tril(a, -1).T
+        x = np.random.default_rng(15).standard_normal((a.shape[0], 2)) * (1 + 2j)
+        got = _Operator(a, symmetric=True)._multiply(x)
+        self.assertEqual(got.dtype, np.complex128)
+        self.assertLess(np.abs(got - full @ x).max(), 1e-12*np.abs(full @ x).max())
+
+    def test_uses_the_stored_arrays_in_place(self) -> None:
+        """Double-precision values and int32 indices are read, not copied."""
+        a = sparse.tril(self._matrix(), format='csc')
+        operator = _Operator(a, symmetric=True)
+        self.assertTrue(np.shares_memory(operator._values, a.data))
+        self.assertTrue(np.shares_memory(operator._indices, a.indices))
+
     def test_rejects_a_mismatched_row_pointer(self) -> None:
         """A pattern that does not describe the block is refused, not read past."""
-        a = self._matrix(64)
+        a = self._matrix(64).tocsc()
+        operator = _Operator(a, symmetric=False)
+        t = operator._transposed
         x = np.zeros((63, 1), dtype=np.complex128)
         with self.assertRaises(ValueError):
-            _residual_product(np.ascontiguousarray(a.indptr, dtype=np.int64),
-                              np.ascontiguousarray(a.indices, dtype=np.int64),
-                              np.ascontiguousarray(a.data, dtype=np.complex128), x)
+            _residual_product(operator._indptr, operator._indices, operator._values,
+                              t.indptr, t.indices, t.source, False, x)
 
 
 @unittest.skipUnless(sparta.gpu_available(), 'Metal GPU required')

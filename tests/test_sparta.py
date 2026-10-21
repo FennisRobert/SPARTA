@@ -45,7 +45,7 @@ class SymbolicTests(unittest.TestCase):
         analysis=sparta.analyze(a)
         native=Native()
         import sparta._solver as impl
-        with patch.object(impl, '_Analysis', return_value=type('Plan', (), {'factor': lambda self, values: (native.refactor(values), native)[1]})()):
+        with patch.object(impl, '_Analysis', return_value=type('Plan', (), {'factor': lambda self, values, hybrid_cpu=0.0: (native.refactor(values), native)[1]})()):
             # Output precision follows the input dtypes only when refinement is
             # off; refinement accumulates in complex128 whatever it was given.
             f=sparta.analyze(a,refinement_steps=0).factorize()

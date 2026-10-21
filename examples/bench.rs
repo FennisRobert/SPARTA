@@ -9,8 +9,9 @@
 //! Throughput is reported in MDOF/s, millions of unknowns per second: `fact`
 //! over the device (or CPU) factorization time, `step` over one sweep step's
 //! factor and solve wall time.
-//! Options: `--max-front N`, `--skip-solve`, and `--curl-curl K` to generate a
-//! synthetic `K^3` curl-curl system instead of reading files.
+//! Options: `--max-front N`, `--skip-solve`, `--lu` to factor symmetric systems
+//! with LU, and `--curl-curl K` to generate a synthetic `K^3` curl-curl system
+//! instead of reading files.
 mod common;
 
 use common::{gib, relative_difference, System};
@@ -28,6 +29,8 @@ fn main() {
     let mut max_front = usize::MAX;
     let mut skip_solve = false;
     let mut force_cpu = false;
+    let mut lu = false;
+    let mut single = false;
     let mut paths = Vec::new();
     let mut generate = Vec::new();
     let mut args = std::env::args().skip(1);
@@ -41,6 +44,9 @@ fn main() {
                     .unwrap()
             }
             "--force-cpu" | "--force_cpu" => force_cpu = true,
+            "--lu" => lu = true,
+            // With --force-cpu: factor in complex64, the hybrid's CPU precision.
+            "--single" => single = true,
             "--skip-solve" => skip_solve = true,
             "--curl-curl" => generate.push(
                 args.next()
@@ -52,7 +58,7 @@ fn main() {
         }
     }
     if paths.is_empty() && generate.is_empty() {
-        eprintln!("usage: bench [--max-front N] [--skip-solve] [--force-cpu] [--curl-curl K] FILE...");
+        eprintln!("usage: bench [--max-front N] [--skip-solve] [--force-cpu [--single]] [--lu] [--curl-curl K] FILE...");
         std::process::exit(2);
     }
 
@@ -63,6 +69,10 @@ fn main() {
             .iter()
             .map(|p| System::load(p).unwrap_or_else(|e| panic!("{e}"))),
     );
+    // `--lu` factors symmetric systems with LU, both triangles stored.
+    if lu {
+        systems = systems.into_iter().map(System::mirrored).collect();
+    }
     // The container's storage flag picks the factorization: a lower triangle is
     // complex-symmetric and takes LDL^T, a full matrix takes LU. Mixing the two
     // in one run would analyze one pattern and factor another.
@@ -123,7 +133,8 @@ fn main() {
     );
 
     if force_cpu {
-        println!("backend  CPU complex128 ({})", env!("SPARTA_DENSE_LIBRARY"));
+        let precision = if single { "complex64" } else { "complex128" };
+        println!("backend  CPU {precision} ({})", env!("SPARTA_DENSE_LIBRARY"));
     } else {
         println!("backend  {} complex64", sparta::Device::COMPILED.name());
     }
@@ -165,14 +176,16 @@ fn main() {
             "{}: column pointers differ",
             system.name
         );
-        let values = if force_cpu {
+        let values = if force_cpu && !single {
             Vec::new()
         } else {
             to_single(&system.values)
         };
 
         let clock = Instant::now();
-        let result = if force_cpu {
+        let result = if force_cpu && single {
+            solver.factor_values(&values)
+        } else if force_cpu {
             solver.factor_c128(&system.values)
         } else {
             solver.factor(&values)
@@ -195,6 +208,17 @@ fn main() {
             );
         }
 
+        if let Some(h) = solver.hybrid_timing() {
+            println!(
+                "  hybrid: CPU share {:.1}% of work, CPU {:.4}s, waited {:.4}s, hand-over {:.4}s; GPU {:.4}s below the cut, {:.4}s above",
+                100.0 * h.share,
+                h.cpu_seconds,
+                h.wait_seconds,
+                h.copy_seconds,
+                h.gpu_below,
+                h.gpu_above
+            );
+        }
         if skip_solve {
             println!(
                 "{:<14} {:>7.3} {:>9.4} {:>9.4} {:>9} {:>11} {:>11}",
@@ -203,7 +227,14 @@ fn main() {
             continue;
         }
         let clock = Instant::now();
-        let wide = if force_cpu {
+        let wide = if force_cpu && single {
+            solver
+                .solve_values(&to_single(system.rhs_port(0)), 1)
+                .unwrap_or_else(|e| panic!("solve: {e}"))
+                .iter()
+                .map(|v| common::C64::new(v.re as f64, v.im as f64))
+                .collect()
+        } else if force_cpu {
             solver
                 .solve_c128(system.rhs_port(0))
                 .unwrap_or_else(|e| panic!("solve: {e}"))

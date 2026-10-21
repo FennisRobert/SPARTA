@@ -7,14 +7,24 @@
 //! MKL all export, and `build.rs` decides which library the names resolve to:
 //! Accelerate on Apple, otherwise whatever `SPARTA_BLAS_LIB` named.
 //!
-//! On Apple these are the legacy unsuffixed symbols, not the `$NEWLAPACK`
-//! ones: the new interface needs macOS 13.3 and SPARTA supports macOS 13. The
-//! one exception is `zsytrf`, which [`sytrf`] resolves at run time and calls
-//! through the new symbol when the OS has it; see [`zsytrf`] for the numbers.
+//! On Apple the names link to the legacy unsuffixed symbols, because the
+//! `$NEWLAPACK` interface needs macOS 13.3 and SPARTA supports macOS 13. Each
+//! routine then switches to its `$NEWLAPACK` symbol at run time where the OS
+//! has it ([`newest!`] and [`zsytrf`]), which is several times faster. The
+//! one routine kept on the legacy symbol is complex64 GEMM; see [`gemm`].
 //!
 //! With no library linked, [`available`] reports false and every caller keeps
 //! to the portable Rust loops in `panel.rs` and `update.rs`.
-use crate::Complex64 as C;
+use super::C;
+#[cfg(any(sparta_accelerate, sparta_blas))]
+use crate::scalar::{Scalar, ScalarKind};
+#[cfg(any(sparta_accelerate, sparta_blas))]
+use std::ffi::c_void;
+
+/// Which of the four copies of the backend this is; every BLAS and LAPACK
+/// call below picks its `s`, `d`, `c` or `z` routine from it.
+#[cfg(any(sparta_accelerate, sparta_blas))]
+const KIND: ScalarKind = <C as Scalar>::KIND;
 
 /// Reports whether this build links a BLAS and LAPACK.
 pub(super) const fn available() -> bool {
@@ -68,10 +78,10 @@ pub(super) fn set_threading(threading: Threading) -> bool {
         // abort with "Error on loading function". Every worker passes through
         // here before its first dense call and waits for this to finish, so
         // call each routine once now, on one thread.
-        let mut unit = [C::new(1.0, 0.0)];
-        gemm_nt(1, 1, 1, &[C::new(0.0, 0.0)], 1, &[C::new(0.0, 0.0)], 1, &mut unit, 1);
-        trsm(Side::Right, Tri::UnitUpper, 1, 1, &[C::new(1.0, 0.0)], 1, &mut unit, 1);
-        let mut work = vec![C::new(0.0, 0.0); sytrf_workspace(1).max(1)];
+        let mut unit = [C::from_re(1.0)];
+        gemm_nt(1, 1, 1, &[C::from_re(0.0)], 1, &[C::from_re(0.0)], 1, &mut unit, 1);
+        trsm(Side::Right, Tri::UnitUpper, 1, 1, &[C::from_re(1.0)], 1, &mut unit, 1);
+        let mut work = vec![C::from_re(0.0); sytrf_workspace(1).max(1)];
         sytrf(1, &mut unit, 1, &mut [0], &mut work);
         let find = ffi::loaded_symbol;
         let accelerate = find(b"BLASSetThreading\0");
@@ -118,13 +128,16 @@ pub(super) fn set_threading(_: Threading) -> bool {
 
 #[cfg(any(sparta_accelerate, sparta_blas))]
 mod ffi {
-    use super::C;
+    use std::ffi::c_void;
     // CBLAS enumerators, which are ABI constants rather than a header import.
     pub const ROW_MAJOR: i32 = 101;
     pub const NO_TRANS: i32 = 111;
     pub const TRANS: i32 = 112;
     pub const UPPER: i32 = 121;
+    pub const LOWER: i32 = 122;
+    pub const NON_UNIT: i32 = 131;
     pub const UNIT: i32 = 132;
+    pub const LEFT: i32 = 141;
     pub const RIGHT: i32 = 142;
 
     /// Address of `name` (null-terminated) in any image already loaded into
@@ -187,55 +200,166 @@ mod ffi {
     }
 
     // `build.rs` emits the link directive naming the library these resolve in.
-    extern "C" {
-        #[allow(clippy::too_many_arguments)]
-        pub fn cblas_zgemm(
-            order: i32,
-            trans_a: i32,
-            trans_b: i32,
-            m: i32,
-            n: i32,
-            k: i32,
-            alpha: *const C,
-            a: *const C,
-            lda: i32,
-            b: *const C,
-            ldb: i32,
-            beta: *const C,
-            c: *mut C,
-            ldc: i32,
-        );
-        #[allow(clippy::too_many_arguments)]
-        pub fn cblas_ztrsm(
-            order: i32,
-            side: i32,
-            uplo: i32,
-            trans_a: i32,
-            diag: i32,
-            m: i32,
-            n: i32,
-            alpha: *const C,
-            a: *const C,
-            lda: i32,
-            b: *mut C,
-            ldb: i32,
-        );
-        pub fn zsytrf_(
-            uplo: *const u8,
-            n: *const i32,
-            a: *mut C,
-            lda: *const i32,
-            ipiv: *mut i32,
-            work: *mut C,
-            lwork: *const i32,
-            info: *mut i32,
-        );
+    // One set per scalar type. The complex routines take `alpha` and `beta`
+    // by pointer, the real ones by value.
+    macro_rules! routines {
+        ($types:ident, $gemm:ident, $trsm:ident, $sytrf:ident, $getrf:ident, $scale:ty) => {
+            /// The signatures below as pointer types, which [`super::newest`]
+            /// resolves the `$NEWLAPACK` symbols into.
+            #[allow(dead_code)]
+            pub mod $types {
+                use std::ffi::c_void;
+                pub type Gemm = unsafe extern "C" fn(
+                    i32, i32, i32, i32, i32, i32, $scale, *const c_void, i32, *const c_void, i32, $scale, *mut c_void, i32,
+                );
+                pub type Trsm = unsafe extern "C" fn(
+                    i32, i32, i32, i32, i32, i32, i32, $scale, *const c_void, i32, *mut c_void, i32,
+                );
+                pub type Getrf = unsafe extern "C" fn(*const i32, *const i32, *mut c_void, *const i32, *mut i32, *mut i32);
+            }
+            extern "C" {
+                #[allow(clippy::too_many_arguments)]
+                pub fn $gemm(
+                    order: i32,
+                    trans_a: i32,
+                    trans_b: i32,
+                    m: i32,
+                    n: i32,
+                    k: i32,
+                    alpha: $scale,
+                    a: *const c_void,
+                    lda: i32,
+                    b: *const c_void,
+                    ldb: i32,
+                    beta: $scale,
+                    c: *mut c_void,
+                    ldc: i32,
+                );
+                #[allow(clippy::too_many_arguments)]
+                pub fn $trsm(
+                    order: i32,
+                    side: i32,
+                    uplo: i32,
+                    trans_a: i32,
+                    diag: i32,
+                    m: i32,
+                    n: i32,
+                    alpha: $scale,
+                    a: *const c_void,
+                    lda: i32,
+                    b: *mut c_void,
+                    ldb: i32,
+                );
+                pub fn $getrf(
+                    m: *const i32,
+                    n: *const i32,
+                    a: *mut c_void,
+                    lda: *const i32,
+                    ipiv: *mut i32,
+                    info: *mut i32,
+                );
+                pub fn $sytrf(
+                    uplo: *const u8,
+                    n: *const i32,
+                    a: *mut c_void,
+                    lda: *const i32,
+                    ipiv: *mut i32,
+                    work: *mut c_void,
+                    lwork: *const i32,
+                    info: *mut i32,
+                );
+            }
+        };
+    }
+    routines!(z, cblas_zgemm, cblas_ztrsm, zsytrf_, zgetrf_, *const c_void);
+    routines!(c, cblas_cgemm, cblas_ctrsm, csytrf_, cgetrf_, *const c_void);
+    routines!(d, cblas_dgemm, cblas_dtrsm, dsytrf_, dgetrf_, f64);
+    routines!(s, cblas_sgemm, cblas_strsm, ssytrf_, sgetrf_, f32);
+}
+
+/// `$legacy` as the pointer type `$kind`, or, where this OS exports it,
+/// Accelerate's `$NEWLAPACK` symbol of the same routine. Resolved once.
+///
+/// The new interface arrived in macOS 13.3 and SPARTA supports macOS 13, so it
+/// is looked up at run time rather than linked, as [`zsytrf`] does. Both take
+/// the same 32-bit arguments; the new one is simply faster, and on M4 Pro by
+/// a wide margin: `ctrsm` on a 2680 by 996 unknown takes 6.4 ms against 58 ms,
+/// and threads where the legacy one does not; `cgetrf` at order 1286 runs at
+/// 418 GFLOP/s against 191; `zgemm` at 200 by 200 by 64 at 341 against 163.
+/// The complex128 LU of the 86k EMerge system went from 1.31 to 1.15 s and
+/// its complex64 LU from 0.63 to 0.50 s.
+#[cfg(any(sparta_accelerate, sparta_blas))]
+macro_rules! newest {
+    ($legacy:path, $kind:ty, $name:literal) => {{
+        static ENTRY: std::sync::OnceLock<$kind> = std::sync::OnceLock::new();
+        *ENTRY.get_or_init(|| {
+            let found = if cfg!(sparta_accelerate) {
+                ffi::loaded_symbol(concat!($name, "$NEWLAPACK\0").as_bytes())
+            } else {
+                std::ptr::null_mut()
+            };
+            if found.is_null() {
+                $legacy as $kind
+            } else {
+                // SAFETY: Accelerate declares the `$NEWLAPACK` symbol with the
+                // legacy routine's signature, which `$kind` spells out. Some
+                // call sites already sit inside an `unsafe` block.
+                #[allow(unused_unsafe)]
+                let routine = unsafe { std::mem::transmute::<*mut (), $kind>(found) };
+                routine
+            }
+        })
+    }};
+}
+
+/// `c = alpha * a * op(b) + beta * c`, row-major, through this copy's GEMM.
+///
+/// # Safety
+/// The operands must be valid for the given shapes and strides, and `c` must
+/// not overlap `a` or `b`.
+#[cfg(any(sparta_accelerate, sparta_blas))]
+#[allow(clippy::too_many_arguments)]
+unsafe fn gemm(
+    trans_b: i32,
+    (m, n, k): (usize, usize, usize),
+    alpha: C,
+    a: *const C,
+    lda: usize,
+    b: *const C,
+    ldb: usize,
+    beta: C,
+    c: *mut C,
+    ldc: usize,
+) {
+    let (m, n, k, lda, ldb, ldc) = (m as i32, n as i32, k as i32, lda as i32, ldb as i32, ldc as i32);
+    let (a, b, c) = (a.cast::<c_void>(), b.cast::<c_void>(), c.cast::<c_void>());
+    let (order, no) = (ffi::ROW_MAJOR, ffi::NO_TRANS);
+    let (pa, pb) = ((&alpha as *const C).cast(), (&beta as *const C).cast());
+    match KIND {
+        ScalarKind::Complex64 => newest!(ffi::cblas_zgemm, ffi::z::Gemm, "cblas_zgemm")(order, no, trans_b, m, n, k, pa, a, lda, b, ldb, pb, c, ldc),
+        // The legacy symbol on purpose. The `$NEWLAPACK` `cgemm` loses the
+        // imaginary part when it accumulates into C: on C -= A B^T at
+        // 600x600x1200, with imaginary parts a hundredth of the real ones, its
+        // imaginary error is 4.5e-6 relative against the legacy 1.3e-7, the
+        // real part unchanged; it tripled the residual of the 887k EMerge
+        // system factored in complex64 (6.2e-4 to 1.9e-3). `zgemm`, `sgemm`
+        // and `dgemm` show no such loss.
+        ScalarKind::Complex32 => ffi::cblas_cgemm(order, no, trans_b, m, n, k, pa, a, lda, b, ldb, pb, c, ldc),
+        ScalarKind::F64 => {
+            let (alpha, beta) = (alpha.re_f64(), beta.re_f64());
+            newest!(ffi::cblas_dgemm, ffi::d::Gemm, "cblas_dgemm")(order, no, trans_b, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)
+        }
+        ScalarKind::F32 => {
+            let (alpha, beta) = (alpha.re_f64() as f32, beta.re_f64() as f32);
+            newest!(ffi::cblas_sgemm, ffi::s::Gemm, "cblas_sgemm")(order, no, trans_b, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc)
+        }
     }
 }
 
 /// Side of a triangular solve: the triangular factor left or right of the unknown.
 #[derive(Clone, Copy)]
 pub(super) enum Side {
+    Left,
     Right,
 }
 
@@ -244,6 +368,46 @@ pub(super) enum Side {
 pub(super) enum Tri {
     /// Unit upper triangle: a column-major unit lower factor read row-major.
     UnitUpper,
+    /// Unit lower triangle, read row-major: LU's `L11`.
+    UnitLower,
+    /// Upper triangle with its diagonal, read row-major: LU's `U11`.
+    Upper,
+}
+
+/// The CBLAS side, triangle and diagonal enumerators for a solve.
+#[cfg(any(sparta_accelerate, sparta_blas))]
+fn solve_codes(side: Side, tri: Tri) -> (i32, i32, i32) {
+    let side = match side {
+        Side::Left => ffi::LEFT,
+        Side::Right => ffi::RIGHT,
+    };
+    let (uplo, diag) = match tri {
+        Tri::UnitUpper => (ffi::UPPER, ffi::UNIT),
+        Tri::UnitLower => (ffi::LOWER, ffi::UNIT),
+        Tri::Upper => (ffi::UPPER, ffi::NON_UNIT),
+    };
+    (side, uplo, diag)
+}
+
+/// This copy's `?trsm` on raw operands, with `alpha = 1`.
+///
+/// # Safety
+/// `t` must hold the triangle and `b` the `m` by `n` unknown, row-major with
+/// strides `ldt` and `ldb`, and the two must not overlap.
+#[cfg(any(sparta_accelerate, sparta_blas))]
+#[allow(clippy::too_many_arguments)]
+unsafe fn trsm_raw(side: Side, tri: Tri, m: usize, n: usize, t: *const C, ldt: usize, b: *mut C, ldb: usize) {
+    let (side, uplo, diag) = solve_codes(side, tri);
+    let (order, no, m, n, ldt, ldb) = (ffi::ROW_MAJOR, ffi::NO_TRANS, m as i32, n as i32, ldt as i32, ldb as i32);
+    let one = C::from_re(1.0);
+    let (t, b) = (t.cast::<c_void>(), b.cast::<c_void>());
+    let pone = (&one as *const C).cast();
+    match KIND {
+        ScalarKind::Complex64 => newest!(ffi::cblas_ztrsm, ffi::z::Trsm, "cblas_ztrsm")(order, side, uplo, no, diag, m, n, pone, t, ldt, b, ldb),
+        ScalarKind::Complex32 => newest!(ffi::cblas_ctrsm, ffi::c::Trsm, "cblas_ctrsm")(order, side, uplo, no, diag, m, n, pone, t, ldt, b, ldb),
+        ScalarKind::F64 => newest!(ffi::cblas_dtrsm, ffi::d::Trsm, "cblas_dtrsm")(order, side, uplo, no, diag, m, n, 1.0, t, ldt, b, ldb),
+        ScalarKind::F32 => newest!(ffi::cblas_strsm, ffi::s::Trsm, "cblas_strsm")(order, side, uplo, no, diag, m, n, 1.0, t, ldt, b, ldb),
+    }
 }
 
 /// `c[m][n] -= a[m][k] * b[n][k]^T`, all row-major with the given row strides.
@@ -270,27 +434,12 @@ pub(super) fn gemm_nt(
     assert!(a.len() >= (m - 1) * lda + k, "left operand out of bounds");
     assert!(b.len() >= (n - 1) * ldb + k, "right operand out of bounds");
     assert!(c.len() >= (m - 1) * ldc + n, "target out of bounds");
-    let (minus, one) = (C::new(-1.0, 0.0), C::new(1.0, 0.0));
+    let (minus, one) = (C::from_re(-1.0), C::from_re(1.0));
     // SAFETY: the dimensions are checked above and fit i32 because Analysis
     // bounds every front to u32 elements. The operands are distinct slices and
     // the library completes before returning.
     unsafe {
-        ffi::cblas_zgemm(
-            ffi::ROW_MAJOR,
-            ffi::NO_TRANS,
-            ffi::TRANS,
-            m as i32,
-            n as i32,
-            k as i32,
-            &minus,
-            a.as_ptr(),
-            lda as i32,
-            b.as_ptr(),
-            ldb as i32,
-            &one,
-            c.as_mut_ptr(),
-            ldc as i32,
-        );
+        gemm(ffi::TRANS, (m, n, k), minus, a.as_ptr(), lda, b.as_ptr(), ldb, one, c.as_mut_ptr(), ldc);
     }
 }
 
@@ -317,29 +466,14 @@ pub(super) fn gemm_nt_front(
     assert!(a_at + k <= c_at, "gemm operands overlap");
     assert!(c_at + (m - 1) * ld + n <= front.len(), "target out of bounds");
     assert!(b.len() >= (n - 1) * ldb + k, "right operand out of bounds");
-    let (minus, one) = (C::new(-1.0, 0.0), C::new(1.0, 0.0));
+    let (minus, one) = (C::from_re(-1.0), C::from_re(1.0));
     let base = front.as_mut_ptr();
     // SAFETY: both rectangles lie in `front`, asserted above, and are disjoint
     // because each row's left-operand columns end where the target's begin.
     // Accelerate reads one and writes the other, and completes before it
     // returns, so the aliasing `&mut front` would imply never materialises.
     unsafe {
-        ffi::cblas_zgemm(
-            ffi::ROW_MAJOR,
-            ffi::NO_TRANS,
-            ffi::TRANS,
-            m as i32,
-            n as i32,
-            k as i32,
-            &minus,
-            base.add(a_at),
-            ld as i32,
-            b.as_ptr(),
-            ldb as i32,
-            &one,
-            base.add(c_at),
-            ld as i32,
-        );
+        gemm(ffi::TRANS, (m, n, k), minus, base.add(a_at), ld, b.as_ptr(), ldb, one, base.add(c_at), ld);
     }
 }
 
@@ -363,46 +497,150 @@ pub(super) fn trsm(
     if m == 0 || n == 0 {
         return;
     }
-    let one = C::new(1.0, 0.0);
-    let (uplo, diag) = match tri {
-        Tri::UnitUpper => (ffi::UPPER, ffi::UNIT),
-    };
     // SAFETY: dimensions fit i32 as in `gemm_nt`; `t` and `b` are distinct
     // allocations and the triangular order matches the requested side.
-    unsafe {
-        ffi::cblas_ztrsm(
-            ffi::ROW_MAJOR,
+    unsafe { trsm_raw(side, tri, m, n, t.as_ptr(), ldt, b.as_mut_ptr(), ldb) }
+}
+
+/// [`trsm`] with the triangle and the unknown inside one row-major buffer of
+/// row stride `ld`, at element offsets `t_at` and `b_at`. The triangle has
+/// order `m` (left) or `n` (right).
+#[cfg(any(sparta_accelerate, sparta_blas))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn trsm_front(side: Side, tri: Tri, m: usize, n: usize, front: &mut [C], t_at: usize, b_at: usize, ld: usize) {
+    if m == 0 || n == 0 {
+        return;
+    }
+    let order = match side {
+        Side::Left => m,
+        Side::Right => n,
+    };
+    assert!(t_at + (order - 1) * ld + order <= front.len(), "triangle out of bounds");
+    assert!(b_at + (m - 1) * ld + n <= front.len(), "unknown out of bounds");
+    let base = front.as_mut_ptr();
+    // SAFETY: both rectangles lie in `front`, asserted above. The callers pass
+    // the fully summed block as the triangle and a block of other rows or
+    // other columns as the unknown, which never overlap; the library reads one,
+    // writes the other, and completes before it returns.
+    unsafe { trsm_raw(side, tri, m, n, base.add(t_at), ld, base.add(b_at), ld) }
+}
+
+/// [`trsm_front`] spread over the Rayon pool: the unknown is cut into blocks
+/// of rows (right side) or columns (left side), which a triangular solve
+/// treats independently, and each block is one single-threaded solve.
+///
+/// Accelerate's legacy `?trsm` does not thread at all, and its `$NEWLAPACK`
+/// one threads less well than this: on a 2680 by 996 complex64 unknown, the
+/// legacy `ctrsm` takes 59 ms threaded and 62 ms not, the new one 6.4 ms, and
+/// ten row blocks of the new one on ten threads 5.3 ms (M4 Pro). On the 86k
+/// EMerge system factored as LU, spreading takes the factorization from 1.47
+/// to 1.15 s in complex128 and from 0.59 to 0.50 s in complex64. The calling
+/// thread must have [`Threading::Caller`] set, as every pool thread does.
+#[cfg(any(sparta_accelerate, sparta_blas))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn trsm_front_spread(side: Side, tri: Tri, m: usize, n: usize, front: &mut [C], t_at: usize, b_at: usize, ld: usize) {
+    use rayon::prelude::*;
+    if m == 0 || n == 0 {
+        return;
+    }
+    let order = match side {
+        Side::Left => m,
+        Side::Right => n,
+    };
+    assert!(t_at + (order - 1) * ld + order <= front.len(), "triangle out of bounds");
+    assert!(b_at + (m - 1) * ld + n <= front.len(), "unknown out of bounds");
+    // Two blocks per thread, so stealing can even out a slow one.
+    let width = match side {
+        Side::Left => n,
+        Side::Right => m,
+    };
+    let blocks = 2 * rayon::current_num_threads();
+    let step = width.div_ceil(blocks).next_multiple_of(16).max(64);
+    /// The front as a pointer the tasks can share; see the SAFETY note below.
+    #[derive(Clone, Copy)]
+    struct Base(*mut C);
+    // SAFETY: carries no rights of its own; the tasks write disjoint blocks.
+    unsafe impl Send for Base {}
+    unsafe impl Sync for Base {}
+    impl Base {
+        /// Element `at` of the front. A method, so the tasks capture the
+        /// whole `Send` wrapper rather than the bare pointer inside it.
+        fn at(self, at: usize) -> *mut C {
+            // SAFETY: every caller's offset lies inside `front`, asserted above.
+            unsafe { self.0.add(at) }
+        }
+    }
+    let base = Base(front.as_mut_ptr());
+    (0..width.div_ceil(step)).into_par_iter().for_each(|block| {
+        let (first, count) = (block * step, step.min(width - block * step));
+        // SAFETY: inside `front` as asserted above. The blocks partition the
+        // unknown, so no two tasks write the same element, and the triangle
+        // they all read is disjoint from the unknown, as for `trsm_front`.
+        unsafe {
+            let t = base.at(t_at);
             match side {
-                Side::Right => ffi::RIGHT,
-            },
-            uplo,
-            ffi::NO_TRANS,
-            diag,
-            m as i32,
-            n as i32,
-            &one,
-            t.as_ptr(),
-            ldt as i32,
-            b.as_mut_ptr(),
-            ldb as i32,
-        );
+                Side::Left => trsm_raw(side, tri, m, count, t, ld, base.at(b_at + first), ld),
+                Side::Right => trsm_raw(side, tri, count, n, t, ld, base.at(b_at + first * ld), ld),
+            }
+        }
+    });
+}
+
+/// `c[m][n] -= a[m][k] * b[k][n]` with all three operands inside one row-major
+/// buffer of row stride `ld`, at element offsets `a_at`, `b_at` and `c_at`.
+/// The caller guarantees the target overlaps neither operand.
+#[cfg(any(sparta_accelerate, sparta_blas))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn gemm_nn_front(m: usize, n: usize, k: usize, front: &mut [C], a_at: usize, b_at: usize, c_at: usize, ld: usize) {
+    if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+    assert!(a_at + (m - 1) * ld + k <= front.len(), "left operand out of bounds");
+    assert!(b_at + (k - 1) * ld + n <= front.len(), "right operand out of bounds");
+    assert!(c_at + (m - 1) * ld + n <= front.len(), "target out of bounds");
+    let (minus, one) = (C::from_re(-1.0), C::from_re(1.0));
+    let base = front.as_mut_ptr();
+    // SAFETY: the three rectangles lie in `front`, asserted above; the target
+    // is disjoint from both operands by the caller's contract, and the library
+    // completes before it returns.
+    unsafe {
+        gemm(ffi::NO_TRANS, (m, n, k), minus, base.add(a_at), ld, base.add(b_at), ld, one, base.add(c_at), ld);
     }
 }
 
-/// `zsytrf`'s signature, which the legacy and `$NEWLAPACK` symbols share.
+/// LU with partial pivoting of the column-major `n` by `n` block `a`, leading
+/// dimension `lda`. Returns LAPACK's `info`: zero on success, `k > 0` when
+/// `U(k,k)` is exactly zero. `ipiv` receives `n` one-based interchanges.
+#[cfg(any(sparta_accelerate, sparta_blas))]
+pub(super) fn getrf(n: usize, a: &mut [C], lda: usize, ipiv: &mut [i32]) -> i32 {
+    debug_assert!(n == 0 || (a.len() >= (n - 1) * lda + n && ipiv.len() >= n));
+    let (order, stride, mut info) = (n as i32, lda as i32, 0);
+    let getrf = match KIND {
+        ScalarKind::Complex64 => newest!(ffi::zgetrf_, ffi::z::Getrf, "zgetrf"),
+        ScalarKind::Complex32 => newest!(ffi::cgetrf_, ffi::c::Getrf, "cgetrf"),
+        ScalarKind::F64 => newest!(ffi::dgetrf_, ffi::d::Getrf, "dgetrf"),
+        ScalarKind::F32 => newest!(ffi::sgetrf_, ffi::s::Getrf, "sgetrf"),
+    };
+    // SAFETY: an `n` by `n` column-major block with stride `lda` and room for
+    // `n` interchanges, both sized above.
+    unsafe { getrf(&order, &order, a.as_mut_ptr().cast(), &stride, ipiv.as_mut_ptr(), &mut info) };
+    info
+}
+
+/// `?sytrf`'s signature, which every type's legacy and `$NEWLAPACK` symbols share.
 #[cfg(any(sparta_accelerate, sparta_blas))]
 type Sytrf = unsafe extern "C" fn(
     *const u8,
     *const i32,
-    *mut C,
+    *mut c_void,
     *const i32,
     *mut i32,
-    *mut C,
+    *mut c_void,
     *const i32,
     *mut i32,
 );
 
-/// The `zsytrf` to call: Accelerate's `$NEWLAPACK` symbol where the OS has it,
+/// The `?sytrf` to call: Accelerate's `$NEWLAPACK` symbol where the OS has it,
 /// otherwise the legacy one.
 ///
 /// The new symbol arrived in macOS 13.3 and SPARTA supports macOS 13, so it is
@@ -420,9 +658,14 @@ fn zsytrf() -> Sytrf {
     static ENTRY: OnceLock<Sytrf> = OnceLock::new();
     *ENTRY.get_or_init(|| {
         // Null when this macOS does not have the symbol.
-        let new = ffi::loaded_symbol(b"zsytrf$NEWLAPACK\0");
+        let new = ffi::loaded_symbol(match KIND {
+            ScalarKind::Complex64 => b"zsytrf$NEWLAPACK\0",
+            ScalarKind::Complex32 => b"csytrf$NEWLAPACK\0",
+            ScalarKind::F64 => b"dsytrf$NEWLAPACK\0",
+            ScalarKind::F32 => b"ssytrf$NEWLAPACK\0",
+        });
         if new.is_null() {
-            ffi::zsytrf_
+            legacy_sytrf()
         } else {
             // SAFETY: Accelerate's lapack.h declares this symbol with the
             // legacy signature, 32-bit integers and no hidden string length.
@@ -433,7 +676,18 @@ fn zsytrf() -> Sytrf {
 
 #[cfg(all(sparta_blas, not(sparta_accelerate)))]
 fn zsytrf() -> Sytrf {
-    ffi::zsytrf_
+    legacy_sytrf()
+}
+
+/// This copy's unsuffixed `?sytrf`.
+#[cfg(any(sparta_accelerate, sparta_blas))]
+fn legacy_sytrf() -> Sytrf {
+    match KIND {
+        ScalarKind::Complex64 => ffi::zsytrf_,
+        ScalarKind::Complex32 => ffi::csytrf_,
+        ScalarKind::F64 => ffi::dsytrf_,
+        ScalarKind::F32 => ffi::ssytrf_,
+    }
 }
 
 /// Bunch-Kaufman `LDL^T` of the lower triangle of column-major `a`, order `n`.
@@ -453,10 +707,10 @@ pub(super) fn sytrf(n: usize, a: &mut [C], lda: usize, ipiv: &mut [i32], work: &
         zsytrf()(
             b"L".as_ptr(),
             &order,
-            a.as_mut_ptr(),
+            a.as_mut_ptr().cast(),
             &stride,
             ipiv.as_mut_ptr(),
-            work.as_mut_ptr(),
+            work.as_mut_ptr().cast(),
             &lwork,
             &mut info,
         );
@@ -468,7 +722,7 @@ pub(super) fn sytrf(n: usize, a: &mut [C], lda: usize, ipiv: &mut [i32], work: &
 #[cfg(any(sparta_accelerate, sparta_blas))]
 pub(super) fn sytrf_workspace(n: usize) -> usize {
     let (order, stride, query) = (n as i32, n.max(1) as i32, -1i32);
-    let (mut best, mut info) = (C::new(0.0, 0.0), 0);
+    let (mut best, mut info) = (C::from_re(0.0), 0);
     // SAFETY: a workspace query touches neither `a` nor `ipiv`, which LAPACK
     // declares nullable, and writes one complex length into `best`.
     unsafe {
@@ -478,12 +732,12 @@ pub(super) fn sytrf_workspace(n: usize) -> usize {
             std::ptr::null_mut(),
             &stride,
             std::ptr::null_mut(),
-            &mut best,
+            (&mut best as *mut C).cast(),
             &query,
             &mut info,
         );
     }
-    (best.re as usize).max(n)
+    (best.re() as usize).max(n)
 }
 
 #[cfg(not(any(sparta_accelerate, sparta_blas)))]
@@ -492,7 +746,7 @@ mod unavailable {
     const NO: &str = "this build links no BLAS; see build.rs";
 
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::cpu) fn gemm_nt(
+    pub(in super::super) fn gemm_nt(
         _: usize,
         _: usize,
         _: usize,
@@ -506,7 +760,7 @@ mod unavailable {
         unreachable!("{NO}")
     }
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::cpu) fn gemm_nt_front(
+    pub(in super::super) fn gemm_nt_front(
         _: usize,
         _: usize,
         _: usize,
@@ -521,7 +775,7 @@ mod unavailable {
     }
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::cpu) fn trsm(
+    pub(in super::super) fn trsm(
         _: Side,
         _: Tri,
         _: usize,
@@ -533,12 +787,30 @@ mod unavailable {
     ) {
         unreachable!("{NO}")
     }
-    pub(in crate::cpu) fn sytrf(_: usize, _: &mut [C], _: usize, _: &mut [i32], _: &mut [C]) -> i32 {
+    pub(in super::super) fn sytrf(_: usize, _: &mut [C], _: usize, _: &mut [i32], _: &mut [C]) -> i32 {
         unreachable!("{NO}")
     }
-    pub(in crate::cpu) fn sytrf_workspace(_: usize) -> usize {
+    pub(in super::super) fn sytrf_workspace(_: usize) -> usize {
+        unreachable!("{NO}")
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn trsm_front(_: Side, _: Tri, _: usize, _: usize, _: &mut [C], _: usize, _: usize, _: usize) {
+        unreachable!("{NO}")
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn trsm_front_spread(_: Side, _: Tri, _: usize, _: usize, _: &mut [C], _: usize, _: usize, _: usize) {
+        unreachable!("{NO}")
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn gemm_nn_front(_: usize, _: usize, _: usize, _: &mut [C], _: usize, _: usize, _: usize, _: usize) {
+        unreachable!("{NO}")
+    }
+    pub(in super::super) fn getrf(_: usize, _: &mut [C], _: usize, _: &mut [i32]) -> i32 {
         unreachable!("{NO}")
     }
 }
 #[cfg(not(any(sparta_accelerate, sparta_blas)))]
-pub(super) use unavailable::{gemm_nt, gemm_nt_front, sytrf, sytrf_workspace, trsm};
+pub(super) use unavailable::{
+    gemm_nn_front, gemm_nt, gemm_nt_front, getrf, sytrf, sytrf_workspace, trsm,
+    trsm_front, trsm_front_spread,
+};

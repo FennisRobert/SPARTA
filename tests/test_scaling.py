@@ -38,7 +38,7 @@ class ScalingTests(unittest.TestCase):
                 def __init__(self, n, ptr, rows, limit, lu, *args, **kwargs):
                     """Retain canonical CSC pattern and factorization kind."""
                     self.ptr, self.rows, self.lu = ptr, rows, lu
-                def factor(self, values):
+                def factor(self, values, hybrid_cpu=0.0):
                     """Store transformed values as a dense test matrix."""
                     self.refactor(values)
                     return self

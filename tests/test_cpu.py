@@ -63,8 +63,12 @@ class CpuTests(unittest.TestCase):
                 f.factorize()
         f = sparta.analyze(sparse.eye(3, dtype=np.float32, format='csc'),
                           force_cpu=True, refinement_steps=0).factorize()
-        self.assertEqual(f.solve(np.ones(3, dtype=np.float32)).dtype, np.complex128)
-        self.assertEqual(f.solve_many(np.empty((3, 0), dtype=np.float32)).dtype, np.complex128)
+        # A real matrix is factored in float64 on the CPU: a real RHS stays
+        # real, a complex one comes back complex128.
+        self.assertEqual(f.compute_dtype, np.float64)
+        self.assertEqual(f.solve(np.ones(3, dtype=np.float32)).dtype, np.float64)
+        self.assertEqual(f.solve(np.ones(3, dtype=np.complex64)).dtype, np.complex128)
+        self.assertEqual(f.solve_many(np.empty((3, 0), dtype=np.float32)).dtype, np.float64)
 
     def test_select_cpu_at_factorize(self) -> None:
         """Late CPU selection reuses analysis, preserves c128 values, and updates byte estimates."""

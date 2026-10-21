@@ -83,6 +83,17 @@ pub struct Config {
     /// pivoting. Above 0 the factorization accepts a diagonal pivot within
     /// this fraction of the column's best candidate.
     pub lu_diag_threshold: f64,
+    /// Share of the factorization work, between 0 and 1, that the CPU takes
+    /// while the GPU factors the rest at the same time (the hybrid
+    /// factorization). The CPU factors whole subtrees of the elimination tree
+    /// in the GPU's precision and hands their results to the GPU, which then
+    /// factors the fronts above them. The share is rebalanced after every
+    /// factorization from the measured CPU and GPU times, so this is the
+    /// starting point of a sweep. 0, the default, leaves the whole
+    /// factorization on the GPU. LDL^T and LU alike. Only the Metal backend
+    /// has a hybrid path; everywhere else, including the CPU backend, the
+    /// setting is ignored.
+    pub hybrid_cpu: f64,
 
     // ---- Frontal geometry. Compiled into the Metal kernels. ----
     /// Pivots accumulated per panel before the trailing update runs.
@@ -198,6 +209,7 @@ impl Config {
             // than speed, so it should be visible at the call site that asked
             // for it, never compiled into a binary as a silent default.
             lu_diag_threshold: from_env("SPARTA_LU_DIAG_THRESHOLD", 0.0),
+            hybrid_cpu: from_env("SPARTA_HYBRID_CPU", 0.0),
             panel: profile.panel,
             schur_block: profile.schur_block,
             strip_block: profile.strip_block,
@@ -222,6 +234,10 @@ impl Config {
             .or(rule(self.cpu_block_rows >= 1 && self.cpu_block_rows <= u32::MAX as usize, "cpu_block_rows must be between 1 and u32::MAX"))
             .or(rule(self.cpu_blas_min_rows >= 1, "cpu_blas_min_rows must be at least 1"))
             .or(rule(self.nemin >= 1, "nemin must be at least 1"))
+            .or(rule(
+                (0.0..1.0).contains(&self.hybrid_cpu),
+                "hybrid_cpu must be at least 0 and below 1",
+            ))
             .or(rule(
                 self.max_front.is_none_or(|f| f >= 1),
                 "max_front must be None or at least 1",
@@ -270,6 +286,23 @@ impl Config {
                 "16 * strip_block must be a multiple of panel",
             ))
             .or(rule(self.narrow_cols >= 1, "narrow_cols must be at least 1"))
+            // The Vulkan narrow-front tail kernels stage the fully summed block
+            // in shared memory: `factor_narrow_tail` its packed coefficients
+            // plus 32 rows, `factor_narrow_tail_lu` the whole block plus 32
+            // rows. Metal's kernels stage less and are not bounded by this.
+            .or(rule(
+                self.device != Device::Vulkan || {
+                    let n = self.narrow_cols as usize;
+                    let ldlt = (n * n.saturating_sub(1) / 2 + 1) * 8 + n * 4 + 32 * n * 8;
+                    let lu = n * n * 8 + 32 * n * 8;
+                    ldlt.max(lu) <= shared as usize
+                },
+                &format!(
+                    "narrow_cols complex columns exceed {} KiB of shared memory in \
+                     factor_narrow_tail on {device}: lower narrow_cols",
+                    shared / 1024
+                ),
+            ))
             // A width that is not a whole number of lanes leaves part of the
             // last one idle for the whole search.
             .or(rule(
@@ -328,6 +361,18 @@ mod tests {
     /// The defaults are usable as delivered.
     fn defaults_are_valid() {
         assert_eq!(Config::default().check(), Ok(()));
+    }
+
+    #[test]
+    /// A narrow front wider than the Vulkan tail kernels can stage is refused
+    /// at analysis rather than as a pipeline that will not build; Metal's
+    /// kernels take the same width.
+    fn vulkan_narrow_cols_is_bounded_by_shared_memory() {
+        let vulkan = Config::for_device(crate::Device::Vulkan);
+        assert_eq!(vulkan.check(), Ok(()));
+        assert!(Config { narrow_cols: 64, ..vulkan }.check().is_err());
+        let metal = Config::for_device(crate::Device::Metal);
+        assert_eq!(Config { narrow_cols: 64, ..metal }.check(), Ok(()));
     }
 
     #[test]

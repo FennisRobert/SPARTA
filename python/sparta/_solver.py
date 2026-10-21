@@ -8,10 +8,10 @@ import numpy as np
 from scipy import sparse
 from ._sparta import _Analysis, _Factor, _CpuFactor, device as _device
 from ._types import Ordering, MatrixType, Path
-from ._options import _Options
-from ._matrix import _prepare_matrix, _validate_choices, _gpu_values, _value_gather
+from ._options import _Options, _hybrid_share
+from ._matrix import _prepare_matrix, _validate_choices, _gpu_values, _value_gather, VALUE_TYPES
 from ._scaling import _equilibrate
-from ._refinement import RefinementReport, _Operator, _refine_block
+from ._refinement import RefinementReport, _Operator, _Transposed, _refine_block
 from ._quality import FactorQuality
 
 
@@ -63,30 +63,6 @@ def _reader(matrix: sparse.spmatrix, a: sparse.csc_matrix, triangle: str,
     return gather, (c.shape, c.indptr.copy(), c.indices.copy())
 
 
-def _csr_layout(a: sparse.csc_matrix, ldlt: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return the CSR layout of the matrix a represents, and its value map.
-
-    a is canonical CSC (lower triangle when ldlt is True). The result is
-    (indptr, indices, source): the first two describe the CSR pattern of the
-    represented matrix, and source[k] is the index in a.data that belongs to
-    CSR slot k. LDLT mirrors each off-diagonal entry, so one CSC value can feed
-    two CSR slots; nothing is conjugated.
-    """
-    columns = np.repeat(np.arange(a.shape[0], dtype=np.intp), np.diff(a.indptr))
-    rows = a.indices
-    source = np.arange(a.nnz, dtype=np.int64)
-    if ldlt:
-        # The stored lower triangle also stands for its transpose.
-        off = rows != columns
-        rows, columns = np.concatenate([rows, columns[off]]), np.concatenate([columns, rows[off]])
-        source = np.concatenate([source, source[off]])
-    # Carrying source+1 as the values makes tocsr permute the map for us.
-    layout = sparse.coo_matrix((source + 1, (rows, columns)), shape=a.shape).tocsr()
-    if layout.nnz != source.size:
-        raise ValueError('The represented matrix has duplicate stored entries')
-    return layout.indptr, layout.indices, layout.data - 1
-
-
 class Solver:
     """Reusable analysis and GPU factorization, created by :func:`sparta.analyze`.
 
@@ -95,18 +71,20 @@ class Solver:
     - _analysis: Rust symbolic analysis; fixed ordering, pattern and buffer layout.
     - _native: Rust/Metal factor allocation; created by factorize, reused on updates.
     - _row_scale/_column_scale: optional transformations around native solves.
-    - _residual_matrix: original values in complex128 CSR behind the threaded
-      product, only for refinement.
+    - _residual_matrix: the threaded product over _a's own arrays, only for
+      refinement; _transposed is its per-pattern row index.
 
-    analyze prepares _a and _analysis. factorize sends scaled complex64 values to
-    _native. solve either calls that native factor once or uses it repeatedly
+    analyze prepares _a and _analysis. factorize sends scaled values to
+    _native in the backend's precision. solve either calls that native factor once or uses it repeatedly
     inside _refine, which measures residuals using _residual_matrix.
 
     Use this object only on its creating thread. factorize replaces values on
     the analyzed pattern; given a different pattern it repeats the symbolic
     analysis first. solve and solve_many reuse the factors.
-    Numerical factors use complex64 on Metal or complex128 with force_cpu=True.
-    Refinement retains original complex128 values and returns complex128 solutions.
+    A real matrix is factored with real arithmetic and a complex one with
+    complex arithmetic: float32 or complex64 on the GPU, float64 or complex128
+    with force_cpu=True. Refinement retains the original values in double
+    precision and returns double precision solutions.
     """
 
     def __init__(self, matrix: sparse.spmatrix, path: Path, options: _Options) -> None:
@@ -125,12 +103,13 @@ class Solver:
         self._row_scale: np.ndarray | None = None
         self._column_scale: np.ndarray | None = None
         self._residual_matrix: _Operator | None = None
-        # Fixed CSR layout for CPU residuals, built on first use.
-        self._residual_map: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        # Row index of the analyzed pattern for CPU residuals, built on first use.
+        self._transposed: _Transposed | None = None
         self._refinement_reports: tuple[RefinementReport, ...] = ()
 
     def factorize(self, matrix: sparse.spmatrix | None = None, *,
                   safe_mode: bool | None = None, force_cpu: bool | None = None,
+                  hybrid: bool | float | None = None,
                   ordering: Ordering | None = None, mtype: MatrixType | None = None,
                   path: Path | None = None, triangle: str | None = None,
                   max_front: int | None = None, equilibrate: bool | None = None,
@@ -149,10 +128,17 @@ class Solver:
             and reanalyses counts it. None reuses the latest successful values,
             initially the analyzed matrix. Raw data arrays are not accepted.
         force_cpu : bool or None
-            True selects CPU complex128; False selects Metal complex64. None keeps
+            True selects CPU double precision (float64 for a real matrix,
+            complex128 for a complex one); False selects GPU single precision
+            (float32 or complex64). None keeps
             the current backend, initially chosen by analyze(). Switching reuses
             symbolic analysis and releases old numerical storage before allocating
             the new factors. A failed switch disables solves until factorize succeeds.
+        hybrid : bool, float or None
+            Factor with the CPU and the GPU together; see analyze(). Changing it
+            rebuilds the GPU factors, as switching backend does. Ignored with
+            force_cpu and on backends without a hybrid path. None keeps the
+            current setting.
         safe_mode : bool or None
             Run every new matrix through the full checked input pipeline. Off, a
             matrix stored exactly like the analyzed one is read straight into the
@@ -201,7 +187,9 @@ class Solver:
             Input validation failures preserve old factors too.
         """
         self._live()
-        updates = dict(force_cpu=force_cpu, verbose=verbose, safe_mode=safe_mode, ordering=ordering, mtype=mtype, triangle=triangle, max_front=max_front,
+        updates = dict(force_cpu=force_cpu,
+                       hybrid_cpu=None if hybrid is None else _hybrid_share(hybrid),
+                       verbose=verbose, safe_mode=safe_mode, ordering=ordering, mtype=mtype, triangle=triangle, max_front=max_front,
                        equilibrate=equilibrate, refinement_steps=refinement_steps,
                        refinement_rtol=refinement_rtol, refinement_minimize=refinement_minimize)
         # None means keep the current value; _Options has no separate defaults.
@@ -219,7 +207,7 @@ class Solver:
         # A new pattern needs a new plan. Built before anything is released, so
         # an analysis failure leaves the old factors usable.
         analysis = _symbolic(a, self.path, options) if changed else self._analysis
-        layout = (_csr_layout(a, self.path == Path.LDLT)
+        layout = (_Transposed(a, self.path == Path.LDLT)
                   if changed and options.refinement_steps != 0 else None)
         try:
             scaled, left, right = self._scaled(a, options)
@@ -230,7 +218,10 @@ class Solver:
             if changed:
                 analysis.destroy()
             raise
-        switching = options.force_cpu != self._options.force_cpu
+        # A new hybrid share is fixed when the GPU factors are created, so it
+        # rebuilds them; the CPU backend has no hybrid path and keeps its own.
+        switching = (options.force_cpu != self._options.force_cpu
+                     or (not options.force_cpu and options.hybrid_cpu != self._options.hybrid_cpu))
         try:
             if (switching or changed) and self._native is not None:
                 self._native.destroy()
@@ -238,7 +229,7 @@ class Solver:
             if self._native is None:
                 # The selected backend allocates buffers and factors the CSC values.
                 self._native = (analysis.factor_cpu(converted) if options.force_cpu
-                                else analysis.factor(converted))
+                                else analysis.factor(converted, options.hybrid_cpu))
             else:
                 # Same pattern: retain the allocation and replace numerical factors.
                 self._native.refactor(converted)
@@ -286,8 +277,8 @@ class Solver:
             if (c.shape == shape and np.array_equal(c.indptr, indptr)
                     and np.array_equal(c.indices, indices)):
                 data = c.data[self._gather]
-                if data.dtype.kind != 'c':
-                    data = data.astype(np.complex128)
+                if data.dtype.kind in 'biu':
+                    data = data.astype(np.float64)
                 return sparse.csc_matrix((data, self._a.indices, self._a.indptr),
                                          shape=self._a.shape, copy=False), False
         a, _ = _prepare_matrix(matrix, self._options.mtype, self.path, self._options.triangle)
@@ -299,18 +290,18 @@ class Solver:
         return a, not same_pattern
 
     def _adopt(self, analysis: _Analysis, matrix: sparse.spmatrix, a: sparse.csc_matrix,
-               layout: tuple[np.ndarray, np.ndarray, np.ndarray] | None, verbose: bool) -> None:
+               layout: _Transposed | None, verbose: bool) -> None:
         """Replace the analyzed pattern after a factorization on a new one succeeded.
 
         analysis is the new Rust plan, matrix the caller's matrix and a its
-        canonical CSC copy. layout is a's CSR residual layout, or None to build
+        canonical CSC copy. layout is a's residual row index, or None to build
         it on first use. verbose prints one line to stderr.
         """
         self._analysis.destroy()
         self._analysis = analysis
         self._n = a.shape[0]
         self._gather, self._input_pattern = _reader(matrix, a, self._options.triangle, self.path)
-        self._residual_map = layout
+        self._transposed = layout
         self._reanalyses += 1
         if verbose:
             print(f"  new sparsity pattern: repeated the symbolic analysis (n={a.shape[0]}, "
@@ -333,8 +324,9 @@ class Solver:
 
         b : ndarray, shape (n,)
             Finite float32, float64, complex64 or complex128 RHS vector.
-        Returns a complex vector of shape (n,); refinement returns complex128,
-        otherwise precision follows the wider matrix/RHS input dtype.
+        Returns a vector of shape (n,), real when the matrix and b are both
+        real and complex otherwise. Refinement and force_cpu return double
+        precision; otherwise precision follows the wider matrix/RHS dtype.
         Raises ValueError if factorize has not succeeded or b has invalid shape/type.
         Inspect refinement_reports: an unconverged best iterate can be returned.
         """
@@ -359,15 +351,16 @@ class Solver:
             self._refinement_reports = reports
             return result[:, 0]
         result = self._solve_scaled(b)
-        return result.astype((np.complex128 if self._options.force_cpu else np.result_type(self._a.dtype, b.dtype)), copy=False)
+        return result.astype(self._result_dtype(b.dtype), copy=False)
 
     def solve_many(self, b: np.ndarray) -> np.ndarray:
         """Solve A X = B using existing factors.
 
         b : ndarray, shape (n, nrhs)
             Finite real or complex RHS columns. Rows are matrix unknowns, not ports.
-        Returns a complex array with the same shape. Columns currently execute
-        sequentially; refinement_reports contains one report per column.
+        Returns an array with the same shape, real when the matrix and b are
+        both real and complex otherwise; refinement_reports contains one report
+        per column.
         Zero-column arrays are accepted only after successful factorization.
         """
         started = time.perf_counter() if self._options.verbose else 0.0
@@ -375,8 +368,7 @@ class Solver:
         b = self._validate_rhs(b, dimensions=2)
         self._refinement_reports = ()
         if b.shape[1] == 0:
-            dtype = np.complex128 if self._options.refinement_steps else (np.complex128 if self._options.force_cpu else np.result_type(self._a.dtype, b.dtype))
-            result = np.empty(b.shape, dtype=dtype)
+            result = np.empty(b.shape, dtype=self._result_dtype(b.dtype))
             if self._options.verbose:
                 self._print_summary(b, result, time.perf_counter() - started)
             return result
@@ -384,7 +376,7 @@ class Solver:
         if self._residual_matrix is None:
             # No refinement: every column goes through the factors together.
             result = self._solve_scaled_block(b)
-            result = result.astype((np.complex128 if self._options.force_cpu else np.result_type(self._a.dtype, b.dtype)), copy=False)
+            result = result.astype(self._result_dtype(b.dtype), copy=False)
         else:
             # Refinement batches as well: one dispatch per correction, not per column.
             result, reports = _refine_block(
@@ -396,6 +388,44 @@ class Solver:
         if self._options.verbose:
             self._print_summary(b, result, time.perf_counter() - started)
         return result
+
+    def _result_dtype(self, rhs: np.dtype) -> np.dtype:
+        """Return the dtype a solve with a right-hand side of dtype rhs returns.
+
+        Real when the matrix and rhs are both real. Double precision with
+        refinement or on the CPU; otherwise the wider of the matrix and rhs.
+        """
+        complex_ = np.iscomplexobj(self._a.data) or rhs.kind == 'c'
+        if self._options.refinement_steps or self._options.force_cpu:
+            return np.dtype(np.complex128 if complex_ else np.float64)
+        return np.result_type(self._a.dtype, rhs)
+
+    @property
+    def compute_dtype(self) -> np.dtype:
+        """The dtype the factors are computed in.
+
+        float32 or complex64 on the GPU, float64 or complex128 with
+        force_cpu, real for a real matrix and complex for a complex one.
+        """
+        complex_ = np.iscomplexobj(self._a.data)
+        if self._options.force_cpu:
+            return np.dtype(np.complex128 if complex_ else np.float64)
+        return np.dtype(np.complex64 if complex_ else np.float32)
+
+    @property
+    def hybrid_timing(self) -> dict[str, float] | None:
+        """How the latest factorization divided its work between CPU and GPU.
+
+        None when it ran on one device only. Otherwise the CPU's share of the
+        work, and seconds: CPU time, time then spent waiting for the GPU, the
+        hand-over copy, and GPU time below and above the meeting point.
+        """
+        native = self._native
+        timing = getattr(native, 'hybrid_timing', None) if native is not None else None
+        if timing is None:
+            return None
+        names = ('share', 'cpu_seconds', 'wait_seconds', 'copy_seconds', 'gpu_below_seconds', 'gpu_above_seconds')
+        return dict(zip(names, timing))
 
     def _require_factor(self) -> _Factor | _CpuFactor:
         """Return valid numerical storage or reject a premature solve."""
@@ -432,7 +462,7 @@ class Solver:
         self._analysis = None
         self._a = None
         self._residual_matrix = None
-        self._residual_map = None
+        self._transposed = None
         self._row_scale = None
         self._column_scale = None
         self._refinement_reports = ()
@@ -524,7 +554,8 @@ class Solver:
         return {
             **self.info,
             'backend': 'cpu' if self._options.force_cpu else _device(),
-            'compute_dtype': 'complex128' if self._options.force_cpu else 'complex64',
+            'compute_dtype': str(self.compute_dtype),
+            'hybrid': self.hybrid_timing,
             'options': asdict(self._options),
             'factorized': self._native is not None,
             'reanalyses': self._reanalyses,
@@ -532,62 +563,61 @@ class Solver:
         }
 
 
-    def _residual_layout(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Return the CSR layout and value map of the analyzed pattern, see _csr_layout.
+    def _residual_layout(self) -> _Transposed:
+        """Return the residual row index of the analyzed pattern.
 
         Built once per analysis; factorize replaces it when the pattern changes.
         """
-        if self._residual_map is None:
-            self._residual_map = _csr_layout(self._a, self.path == Path.LDLT)
-        return self._residual_map
+        if self._transposed is None:
+            self._transposed = _Transposed(self._a, self.path == Path.LDLT)
+        return self._transposed
 
     def _build_residual_matrix(self, matrix: sparse.csc_matrix, enabled: bool,
-                               layout: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None) -> _Operator | None:
-        """Copy the represented matrix into complex128 CSR for CPU residuals.
+                               layout: _Transposed | None = None) -> _Operator | None:
+        """Wrap the represented matrix for CPU residuals, in double precision.
 
         matrix is canonical CSC (lower for LDLT, full for LU); enabled determines
-        whether refinement needs this extra storage. Returns None when disabled.
-        LDLT reconstructs the upper triangle by transpose, never conjugation.
-        layout is matrix's CSR layout from _csr_layout; None uses the cached
-        layout of the analyzed pattern, so each factorization only gathers values.
+        whether refinement needs it. Returns None when disabled. The operator
+        reads matrix's own arrays, copying only values not already in double
+        precision. LDLT reconstructs the upper triangle by transpose, never
+        conjugation. layout is matrix's row index; None uses the cached index
+        of the analyzed pattern.
         """
         if not enabled:
             return None
-        indptr, indices, source = self._residual_layout() if layout is None else layout
-        values = matrix.data.astype(np.complex128, copy=False)[source]
-        # CSR makes repeated row-wise residual matrix-vector products cheaper,
-        # and is the layout the threaded product in the extension expects.
-        return _Operator(sparse.csr_matrix((values, indices, indptr), shape=matrix.shape))
+        return _Operator(matrix, self.path == Path.LDLT, self._residual_layout() if layout is None else layout)
 
     def _validate_rhs(self, values: np.ndarray, dimensions: int) -> np.ndarray:
-        """Return a finite complex RHS array with one or two dimensions.
+        """Return a finite RHS array with one or two dimensions.
 
         values holds n rows of real/complex floating-point data. dimensions is
-        1 for solve and 2 for solve_many. Real inputs retain their precision when
-        promoted to complex. The caller's array is never modified.
+        1 for solve and 2 for solve_many. A real RHS against a complex matrix is
+        promoted to complex of the same precision; against a real matrix it
+        stays real. The caller's array is never modified.
         """
         rhs = np.asarray(values)
-        if rhs.dtype in (np.dtype('float32'), np.dtype('float64')):
-            rhs = rhs.astype(np.complex64 if rhs.dtype == np.float32 else np.complex128)
         if rhs.ndim != dimensions or rhs.shape[0] != self.n:
             raise ValueError('RHS must have n rows and match solve/solve_many dimensions')
-        if rhs.dtype not in (np.dtype('complex64'), np.dtype('complex128')) or not np.isfinite(rhs).all():
+        if rhs.dtype not in VALUE_TYPES or not np.isfinite(rhs).all():
             raise ValueError('RHS must contain finite real or complex floating-point values')
+        if np.iscomplexobj(self._a.data) and not np.iscomplexobj(rhs):
+            rhs = rhs.astype(np.complex64 if rhs.dtype == np.float32 else np.complex128)
         return rhs
 
     def _native_values(self, values: np.ndarray, name: str, safe: bool = True,
                        force_cpu: bool | None = None) -> np.ndarray:
-        """Convert values for force_cpu (None keeps current backend); name labels safe validation errors."""
+        """Convert values to the precision of force_cpu's backend (None keeps the
+        current one), keeping real values real; name labels safe validation errors."""
         cpu = self._options.force_cpu if force_cpu is None else force_cpu
         if cpu:
-            out = np.ascontiguousarray(values, dtype=np.complex128)
+            out = np.ascontiguousarray(values, dtype=np.complex128 if np.iscomplexobj(values) else np.float64)
             if not np.isfinite(out).all():
-                raise ValueError(f'{name} must contain finite complex128 values')
+                raise ValueError(f'{name} must contain finite values')
             return out
         return _gpu_values(values, name, safe)
 
     def _solve_scaled(self, rhs: np.ndarray) -> np.ndarray:
-        """Apply existing GPU factors to an original-system complex RHS vector.
+        """Apply existing factors to an original-system RHS vector.
 
         rhs has shape (n,). For factors of R A C, solve (R A C)y = R rhs, then
         return x = C y. Normalization keeps the scaled RHS representable in float32.
@@ -597,20 +627,21 @@ class Solver:
         if self._row_scale is None:
             return native.solve(self._native_values(rhs, 'b'))
 
-        scaled_rhs = np.asarray(rhs, dtype=np.complex128) * self._row_scale
+        scaled_rhs = np.asarray(rhs, dtype=np.result_type(rhs.dtype, np.float64)) * self._row_scale
         magnitude = float(max(
             np.max(np.abs(scaled_rhs.real), initial=0),
             np.max(np.abs(scaled_rhs.imag), initial=0),
         ))
         normalized = scaled_rhs / magnitude if magnitude else scaled_rhs
-        solution = native.solve(self._native_values(normalized, 'scaled b')).astype(np.complex128)
+        solution = native.solve(self._native_values(normalized, 'scaled b'))
+        solution = solution.astype(np.result_type(solution.dtype, np.float64))
         if magnitude:
             solution *= magnitude
         return solution * self._column_scale
 
 
     def _solve_scaled_block(self, rhs: np.ndarray) -> np.ndarray:
-        """Apply existing GPU factors to every column of a complex RHS block.
+        """Apply existing factors to every column of an RHS block.
 
         rhs has shape (n, nrhs). Returns the solutions in the same shape. This is
         the same transformation _solve_scaled performs, applied per column, but
@@ -623,11 +654,12 @@ class Solver:
             block = self._native_values(np.ascontiguousarray(rhs.T), 'b')
             return np.asarray(native.solve_many(block)).T
 
-        scaled = np.asarray(rhs, dtype=np.complex128) * self._row_scale[:, None]
+        scaled = np.asarray(rhs, dtype=np.result_type(rhs.dtype, np.float64)) * self._row_scale[:, None]
         magnitude = np.maximum(np.abs(scaled.real).max(axis=0), np.abs(scaled.imag).max(axis=0))
         divisor = np.where(magnitude > 0, magnitude, 1.0)
         block = self._native_values(np.ascontiguousarray((scaled/divisor).T), 'scaled b')
-        solution = np.asarray(native.solve_many(block)).T.astype(np.complex128)
+        solution = np.asarray(native.solve_many(block)).T
+        solution = solution.astype(np.result_type(solution.dtype, np.float64))
         return solution * divisor * self._column_scale[:, None]
 
     def _print_summary(self, rhs: np.ndarray, solution: np.ndarray, seconds: float) -> None:
@@ -638,8 +670,8 @@ class Solver:
         Logging work is excluded from the displayed solve duration.
         """
         self._analysis._print_stats()
-        backend = 'CPU complex128' if self._options.force_cpu else 'Metal complex64'
-        print(f"  {backend} | input={self._a.dtype} | RHS={rhs.shape[1]}", file=sys.stderr)
+        backend = 'CPU' if self._options.force_cpu else _device().capitalize()
+        print(f"  {backend} {self.compute_dtype} | input={self._a.dtype} | RHS={rhs.shape[1]}", file=sys.stderr)
         print(f"  factor={self.factor_seconds:.6f}s | solve={seconds:.6f}s | rescued pivots={self.perturbed_pivots}", file=sys.stderr)
         print(f"  scaling={self._options.equilibrate} | refinement cap={self._options.refinement_steps} | minimize={self._options.refinement_minimize}", file=sys.stderr)
         matrix = self._residual_matrix

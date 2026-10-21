@@ -34,8 +34,10 @@ where almost every entry of A is zero, by factoring A on the GPU. It runs on
 Apple Silicon GPUs through Metal today. A Vulkan backend for AMD and NVIDIA
 GPUs is planned but not written yet.
 
-The GPU works in single precision, which is fast but carries only about seven
-significant digits. When that is not accurate enough, SPARTA can close the gap
+Matrices may be real or complex. A real matrix is factored with real
+arithmetic and a complex one with complex arithmetic; SPARTA picks from the
+type of the values you pass. The GPU works in single precision, which is fast
+but carries only about seven significant digits. When that is not accurate enough, SPARTA can close the gap
 in two ways. **Iterative refinement**, on by default in Python, corrects the GPU
 answer in double precision on the CPU. A **CPU backend** does the whole
 factorization in double precision when you ask for it.
@@ -241,7 +243,7 @@ pip downloads its build helper (maturin), NumPy and SciPy from PyPI.
 no compiler, no source code needed.
 
 ```sh
-pip install sparta_solver-0.1.1-cp39-abi3-macosx_11_0_arm64.whl
+pip install sparta_solver-0.2.0-cp39-abi3-macosx_11_0_arm64.whl
 ```
 
 One wheel works for every Python from 3.9 up, on Apple Silicon only. To make a
@@ -322,28 +324,35 @@ whose answer is `x = [1/11, 7/11]`.
 ### Rust
 
 ```rust
-use sparta::{Analysis, Complex32, Config, Solver};
+use sparta::{Analysis, Config, Solver};
 
 fn main() -> sparta::Result<()> {
     // Symmetric, so pass the lower triangle in CSC form.
     let n = 2;
     let col_ptr = [0, 2, 3];
     let row_idx = [0, 1, 1];
-    let values = [4.0, 1.0, 3.0].map(|v| Complex32::new(v, 0.0));
+    let values: [f32; 3] = [4.0, 1.0, 3.0];
 
     let analysis = Analysis::ldlt(n, &col_ptr, &row_idx, &Config::default())?; // 1. analyze (CPU)
     let mut solver = Solver::new(analysis)?;
-    solver.factor(&values)?;                                                  // 2. factor (GPU)
-    let b = [1.0, 2.0].map(|v| Complex32::new(v, 0.0));
-    let x = solver.solve(&b)?;                                                // 3. solve (GPU)
+    solver.factor_values(&values)?;                                           // 2. factor (GPU)
+    let b: [f32; 2] = [1.0, 2.0];
+    let x = solver.solve_values(&b, 1)?;                                      // 3. solve (GPU)
     println!("{x:?}");
     solver.destroy();                                                         // 4. free
     Ok(())
 }
 ```
 
-`Analysis` takes the pattern in CSC form, and `factor` takes the values in the
-same order. Values are `Complex32`; give real matrices an imaginary part of zero.
+`Analysis` takes the pattern in CSC form, and `factor_values` takes the values
+in the same order. The type of the values picks the arithmetic:
+
+- **Real matrix:** pass `f32` values, as above. `x` comes back as `f32`.
+- **Complex matrix:** pass `Complex32` values instead, for example
+  `[4.0, 1.0, 3.0].map(|v| Complex32::new(v, 0.5))`, and a `Complex32` b.
+
+A complex b may be solved against a real matrix; its x is complex. A real b
+against a complex matrix is refused, because its x is complex.
 
 ### Python
 
@@ -371,8 +380,15 @@ F.destroy()             # 4. hand back the GPU memory
    see [Memory and diagnostics](#memory-and-diagnostics).
 
 `analyze` takes any square SciPy sparse matrix holding float32, float64,
-complex64 or complex128 values. SPARTA copies it and never modifies yours.
-Results are complex arrays, also for real input.
+complex64 or complex128 values. SPARTA never modifies yours. It keeps one
+copy of the matrix (the lower triangle for a symmetric one) so that later
+changes to your array cannot desynchronise refinement from the factors; with
+refinement on, the kept data is about the size of your matrix for a symmetric
+one and about twice it for an unsymmetric one.
+A real matrix is factored with real arithmetic. On the CPU that is about twice
+as fast as the same matrix stored as complex. On the GPU, real matrices run
+through the complex kernels for now, so they are no faster there yet. Results
+are real when the matrix and b are both real, and complex otherwise.
 
 ### C and C++
 
@@ -381,21 +397,35 @@ Results are complex arrays, also for real input.
 
 int64_t col_ptr[]   = {0, 2, 3};                       /* lower triangle, CSC */
 int64_t row_index[] = {0, 1, 1};
-sparta_complex values[] = {{4, 0}, {1, 0}, {3, 0}};
-sparta_complex b[] = {{1, 0}, {2, 0}}, x[2];
+float values[] = {4, 1, 3};                            /* a real matrix */
+float b[] = {1, 2}, x[2];
 
 sparta_analysis *plan = NULL;
 sparta_solver *solver = NULL;
 sparta_analyze(2, col_ptr, row_index, SPARTA_SYMMETRIC, NULL, &plan);   /* 1. analyze */
 sparta_solver_create(&plan, &solver);
-sparta_factor(solver, values);                                          /* 2. factor  */
-sparta_solve(solver, b, x);                                             /* 3. solve   */
+sparta_factor_real(solver, values);                                     /* 2. factor  */
+sparta_solve_real(solver, b, x);                                        /* 3. solve   */
 sparta_solver_free(solver);                                             /* 4. free    */
 ```
 
+For a complex matrix, use `sparta_complex` arrays with `sparta_factor` and
+`sparta_solve` instead:
+
+```c
+sparta_complex values[] = {{4, 0.5f}, {1, 0}, {3, 0.5f}};
+sparta_complex b[] = {{1, 0}, {2, 0}}, x[2];
+sparta_factor(solver, values);
+sparta_solve(solver, b, x);
+```
+
+`sparta_solve` also accepts a complex b against real factors.
+
 Every call returns a `sparta_status`, and `sparta_last_error()` explains a
 failure in a sentence. The C++ header `sparta.hpp` wraps all of this in a
-`sparta::Solver` class. Worked examples are in `crates/sparta-capi/examples`.
+`sparta::Solver` class, whose `factor`, `solve` and `solve_many` take either
+`std::vector<float>` (real) or `std::vector<std::complex<float>>` (complex).
+Worked examples are in `crates/sparta-capi/examples`.
 
 ### MATLAB and Julia
 
@@ -414,6 +444,10 @@ close(F)                                  # free the GPU memory
 
 For a sweep, `factorize(S, A2)` in MATLAB and `factorize!(F, A2)` in Julia
 factor new values of the same pattern without analyzing again.
+
+Julia picks the arithmetic from the element type: a `Float64` matrix is
+factored as real and returns `Float64` answers, a `ComplexF64` one as complex.
+MATLAB factors every matrix as complex for now.
 
 # Using SPARTA in detail
 
@@ -502,11 +536,14 @@ are reused.
 
 ```rust
 let mut solver = Solver::new(Analysis::ldlt(n, &col_ptr, &row_idx, &Config::default())?)?;
-solver.factor(&values1)?;
-let x1 = solver.solve(&b1)?;
-solver.factor(&values2)?;       // same pattern, new values
-let x2 = solver.solve(&b2)?;
+solver.factor_values(&values1)?;
+let x1 = solver.solve_values(&b1, 1)?;
+solver.factor_values(&values2)?;       // same pattern, new values
+let x2 = solver.solve_values(&b2, 1)?;
 ```
+
+The values may change type between factorizations, for example from a real
+matrix to a complex one; the arithmetic follows.
 
 **Python**
 
@@ -520,7 +557,7 @@ x2 = F.solve(b2)
 **C**
 
 ```c
-sparta_factor(solver, values1);
+sparta_factor(solver, values1);   /* complex; sparta_factor_real for a real matrix */
 sparta_solve(solver, b1, x1);
 sparta_factor(solver, values2);   /* same pattern, new values */
 sparta_solve(solver, b2, x2);
@@ -545,7 +582,7 @@ eight-column block 4× to 6× faster than eight separate solves.
 
 ```rust
 // The columns are stored end to end: column j is b[j*n .. (j+1)*n].
-let x = solver.solve_many(&b, nrhs)?;
+let x = solver.solve_values(&b, nrhs)?;
 ```
 
 **Python**
@@ -557,7 +594,8 @@ X = F.solve_many(B)       # B.shape == (n, nrhs), one right-hand side per column
 **C**
 
 ```c
-sparta_solve_many(solver, b, x, nrhs);   /* columns end to end, as in Rust */
+sparta_solve_many(solver, b, x, nrhs);        /* complex b, columns end to end as in Rust */
+sparta_solve_many_real(solver, b, x, nrhs);   /* real b against real factors */
 ```
 
 ## Configuration
@@ -591,7 +629,7 @@ config = sparta.Config.preset("sweep").with_(nemin=32)
 F = sparta.analyze(A, config=config)    # keyword arguments still override the config
 ```
 
-The solve-behaviour settings and `force_cpu` can also be passed to
+The solve-behaviour settings, `force_cpu` and `hybrid` can also be passed to
 `factorize`, to change them for an existing solver. Everything else is fixed
 when the matrix is analyzed.
 
@@ -627,6 +665,7 @@ double, and `enum` is one of the named choices.
 | `max_front` | uint64, optional | unlimited | Largest dense block allowed, in rows. |
 | **Numerics** | | | |
 | `force_cpu` | bool | `False` | Double precision on the CPU instead of the GPU. Python and Rust only. |
+| `hybrid_cpu` | float64 | `0.0` | Share of the work the CPU does alongside the GPU; `hybrid=True` in Python. Metal only. |
 | `lu_diag_threshold` | float64 | `0.0` | LU only. How strongly to prefer the diagonal as pivot. |
 | **CPU backend** (Python and Rust) | | | |
 | `cpu_panel` | uint64 | `32` | Pivots per panel before an update. |
@@ -722,6 +761,7 @@ measure both.
 | Setting | Type | Values | What it does |
 |---|---|---|---|
 | `force_cpu` | bool | | Factor and solve on the CPU in double precision instead of on the GPU. Python and Rust only. See [Precision and accuracy](#precision-and-accuracy). |
+| `hybrid_cpu` | float64 | 0 to below 1 | Share of the factorization work the CPU does at the same time as the GPU does the rest. `0` is the GPU alone. It is a starting point: the share adapts after every factorization. Python also takes `hybrid=True` (30%). Ignored except on Metal. See [CPU and GPU together](#cpu-and-gpu-together-hybrid). |
 | `lu_diag_threshold` | float64 | 0 to 1 | LU only. `0` is strict partial pivoting. Above 0 the factorization accepts the diagonal entry as pivot if it is within this fraction of the column's best candidate. That is faster, but less stable, and **it changes results**, not just speed. |
 
 ### CPU backend tuning (Python and Rust)
@@ -763,10 +803,11 @@ from the environment, for quick experiments.
 
 ### Single versus double precision
 
-The GPU computes in **single precision** (complex64), which holds about seven
-significant digits. On the kinds of systems SPARTA targets, a bare GPU solve
-lands at a relative residual of about 1e-5. The **CPU backend** computes in
-**double precision** (complex128), about sixteen digits, and is much slower.
+The GPU computes in **single precision** (float32 for a real matrix,
+complex64 for a complex one), which holds about seven significant digits. On
+the kinds of systems SPARTA targets, a bare GPU solve lands at a relative
+residual of about 1e-5. The **CPU backend** computes in **double precision**
+(float64 or complex128), about sixteen digits, and is much slower.
 
 Between the two sits **iterative refinement**. The CPU measures how far the GPU
 answer is off, in double precision, and asks the GPU for corrections. This
@@ -791,12 +832,15 @@ returns the bare single-precision answer. `examples/refine.rs` shows how to
 refine from Rust yourself.
 
 **Python.** Refinement is on by default and stops at a relative residual of
-`1e-6`. Keep A and b in double precision (float64 or complex128), since that
-is what the residual is measured against:
+`1e-6`. Keep A and b in double precision, since that is what the residual
+is measured against: float64 for a real matrix, complex128 for a complex one.
 
 ```python
-F = sparta.analyze(A.astype(np.complex128)).factorize()
-x = F.solve(b.astype(np.complex128))
+F = sparta.analyze(A.astype(np.float64)).factorize()      # a real matrix
+x = F.solve(b.astype(np.float64))                         # x is float64
+
+F = sparta.analyze(A.astype(np.complex128)).factorize()   # a complex matrix
+x = F.solve(b.astype(np.complex128))                      # x is complex128
 
 sparta.analyze(A, refinement_rtol=1e-10)   # tighter, at the cost of more corrections
 sparta.analyze(A, refinement_steps=2)      # at most two corrections, whatever they reach
@@ -804,8 +848,9 @@ sparta.analyze(A, refinement_steps=0)      # off: the bare single-precision solv
 ```
 
 The factors stay single precision. Only the residuals and the running answer
-are kept in double precision, so a refined solve returns complex128 whatever
-you passed in. Refinement stops as soon as it reaches the target. If it stops
+are kept in double precision, so a refined solve returns double precision
+whatever precision you passed in: float64 when A and b are both real,
+complex128 otherwise. Refinement stops as soon as it reaches the target. If it stops
 improving first, it returns the best answer it found and says so in its report
 (see [Checking a solve](#checking-a-solve)). If refinement struggles, try
 `equilibrate=True`, the `careful` preset, or the CPU backend.
@@ -821,13 +866,16 @@ library the build linked elsewhere (see
 SPARTA never switches to the CPU on its own. If the GPU fails, you get an
 error, not a slow answer.
 
-**Rust:** set `force_cpu: true` in the `Config`, and use `factor_c128`,
-`solve_c128` or `solve_many_c128` to keep your values in double precision.
+**Rust:** set `force_cpu: true` in the `Config`, and pass double-precision
+values to `factor_values` and `solve_values`: `f64` for a real matrix,
+`Complex64` for a complex one. The CPU computes in the type you pass, so `f32`
+and `Complex32` work too, in single precision.
 
 **Python:**
 
 ```python
 F = sparta.analyze(A, force_cpu=True, refinement_steps=0).factorize()
+F.compute_dtype     # float64 for a real A, complex128 for a complex one
 
 # Or switch an existing solver, reusing its analysis:
 F.factorize(force_cpu=True)     # force_cpu=False switches back to the GPU
@@ -840,6 +888,50 @@ Switching releases the old factors and builds new ones on the chosen backend.
 
 [CPU architecture and tuning](src/cpu/README.md) covers how the CPU backend
 executes and what memory it uses.
+
+### CPU and GPU together (hybrid)
+
+On a Mac the CPU and the GPU share one memory, so they can factor one matrix
+together. With `hybrid` on, the CPU takes whole branches of the elimination
+tree while the GPU factors the rest, and the GPU finishes from where the two
+meet. The CPU computes in the GPU's precision, so the answers match a GPU-only
+factorization to single-precision rounding. It works for LDLᵀ and LU, real and
+complex.
+
+**Python:**
+
+```python
+F = sparta.analyze(A, hybrid=True).factorize()   # the CPU starts at 30% of the work
+F.factorize(A2, hybrid=0.2)                      # or start it at 20%
+F.factorize(A3, hybrid=False)                    # the GPU alone again
+F.hybrid_timing                                  # how the last factorization split
+```
+
+**Rust:** set `hybrid_cpu: 0.3` in the `Config`. **C:** set
+`config.hybrid_cpu` before `sparta_analyze`. **Julia:** `Solver(A; hybrid = true)`.
+**MATLAB:** the `'hybrid_cpu'` setting.
+
+The first factorization already runs split. After that the split adapts to the
+measured speed of each device, so a sweep settles from the third
+factorization on. Changing `hybrid` in `factorize` rebuilds the GPU factors.
+
+Where it does not apply, it is ignored rather than refused: with `force_cpu`,
+on Vulkan, and without a GPU.
+
+Measured on an Apple M4 Pro (10 performance cores, 20-core GPU), settled sweep
+steps, with `RAYON_NUM_THREADS=10` (the performance cores, which beat the
+default of all cores):
+
+| System | GPU alone | Hybrid | Speed-up |
+|---|---:|---:|---:|
+| 887k unknowns, LDLᵀ | 1.49 s | 1.10 s | 1.37× |
+| 457k unknowns, LDLᵀ | 271 ms | 217 ms | 1.25× |
+| 109k unknowns, LDLᵀ | 94 ms | 86 ms | 1.10× |
+| 887k unknowns, LU | 2.07 s | 1.94 s | 1.07× |
+| 86k unknowns, LU | 329 ms | 309 ms | 1.06× |
+
+It pays most on large symmetric systems. The CPU half of LU is slower
+relative to the GPU, so LU gains less.
 
 ### Checking a solve
 
@@ -979,7 +1071,8 @@ backend a binary carries.
 ### Vulkan
 
 The Vulkan backend runs the same factorizations and solves as Metal, in
-complex64, on AMD and NVIDIA GPUs under Windows and Linux.
+float32 for real matrices and complex64 for complex ones, on AMD and NVIDIA
+GPUs under Windows and Linux.
 
 - **Building** needs nothing extra: a plain `pip install` or `cargo build` on
   Windows or Linux includes it. The kernels ship compiled to SPIR-V in
@@ -1005,6 +1098,21 @@ maturin develop --release --manifest-path python/Cargo.toml --features vulkan
 `SPARTA_PROFILE=2` lists every dispatch. The Khronos validation layer
 (`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`) runs without messages.
 Tested on an NVIDIA RTX 3080 and an AMD Radeon integrated GPU (Windows 11).
+
+**Testing the Vulkan path on a Mac.** MoltenVK translates Vulkan to Metal,
+so the Vulkan kernels can be checked on Apple Silicon. It is for testing, not
+for speed: on an M4 Pro it is 1.0 to 1.7 times slower than the Metal backend,
+with the same residuals.
+
+```sh
+brew install molten-vk vulkan-loader
+export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib   # where the loader lives
+cargo test --release --no-default-features --features vulkan
+maturin develop --release --manifest-path python/Cargo.toml --features vulkan
+```
+
+The variable is needed because macOS does not search `/opt/homebrew/lib` for
+libraries by default. The Metal-only hybrid tests skip themselves.
 
 ### CPU dense kernels (BLAS and LAPACK)
 

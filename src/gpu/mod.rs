@@ -38,6 +38,8 @@ use crate::{Analysis, Complex32, Error, PivotFailure, Result};
 mod metal;
 #[cfg(sparta_metal)]
 use metal as backend;
+#[cfg(sparta_metal)]
+mod hybrid;
 
 #[cfg(sparta_vulkan)]
 mod vulkan;
@@ -61,6 +63,9 @@ pub struct Solver {
     /// Supernode count, kept because `plan.nodes` is gone.
     nodes: usize,
     context: backend::Context,
+    /// CPU subtrees factored alongside the GPU, when `Config::hybrid_cpu` asks.
+    #[cfg(sparta_metal)]
+    hybrid: Option<hybrid::Hybrid>,
     valid: bool,
     device_seconds: f64,
     perturbed: u64,
@@ -84,7 +89,11 @@ impl Solver {
     /// arrays in RAM a third time, alongside the host original and the device
     /// copy, and on a 457k EMerge system each copy is 91 MiB.
     pub fn analyzed(plan: &Analysis) -> Result<Self> {
-        let context = backend::Context::new(plan)?;
+        #[allow(unused_mut)]
+        let mut context = backend::Context::new(plan)?;
+        // Only Metal has a hybrid path; other backends ignore `hybrid_cpu`.
+        #[cfg(sparta_metal)]
+        let hybrid = hybrid::Hybrid::new(plan, &mut context)?;
         let mut runtime = plan.runtime_only();
         // This solver is on the GPU whatever the analysis was last asked to
         // report for, so its copy of the config says so.
@@ -93,6 +102,8 @@ impl Solver {
             nodes: plan.nodes.len(),
             plan: runtime,
             context,
+            #[cfg(sparta_metal)]
+            hybrid,
             valid: false,
             device_seconds: 0.0,
             perturbed: 0,
@@ -113,9 +124,15 @@ impl Solver {
         }
         let mut status = vec![0u32; self.nodes];
         let mut perturbed = 0u64;
-        self.device_seconds = self
-            .context
-            .run(values, None, 1, &mut status, &mut perturbed)?;
+        #[cfg(sparta_metal)]
+        let hybrid = self.hybrid.as_mut();
+        #[cfg(not(sparta_metal))]
+        let hybrid: Option<&mut ()> = None;
+        self.device_seconds = match hybrid {
+            #[cfg(sparta_metal)]
+            Some(h) => h.factor(&mut self.context, values, &mut status, &mut perturbed)?,
+            _ => self.context.run(values, None, 1, &mut status, &mut perturbed)?,
+        };
         self.perturbed = perturbed;
         if let Some((node, &code)) = status.iter().enumerate().find(|(_, v)| **v != 0) {
             // Mirrors the status encoding in kernels.metal.
@@ -139,9 +156,6 @@ impl Solver {
         }
         self.valid = true;
         Ok(())
-    }
-    pub fn solve(&mut self, b: &[Complex32]) -> Result<Vec<Complex32>> {
-        self.solve_many(b, 1)
     }
     /// Solve for `nrhs` right-hand sides at once.
     ///
@@ -198,6 +212,21 @@ impl Solver {
         self.valid = false;
         self.device_seconds = 0.0;
         self.perturbed = 0;
+    }
+    /// How the latest hybrid factorization divided its time, or `None` when the
+    /// whole factorization ran on the GPU.
+    pub fn hybrid_timing(&self) -> Option<crate::HybridTiming> {
+        #[cfg(sparta_metal)]
+        return self.hybrid.as_ref().map(|h| crate::HybridTiming {
+            share: h.share,
+            cpu_seconds: h.cpu_seconds,
+            wait_seconds: h.wait_seconds,
+            copy_seconds: h.copy_seconds,
+            gpu_below: h.gpu_below,
+            gpu_above: h.gpu_above,
+        });
+        #[cfg(not(sparta_metal))]
+        None
     }
     /// Summed GPU duration of the latest factorization's commands; excludes host preparation and queue waits.
     pub fn factor_device_seconds(&self) -> f64 {

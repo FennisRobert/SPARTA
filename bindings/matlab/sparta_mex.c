@@ -254,6 +254,7 @@ static const field fields[] = {
     FIELD(panel, U32),            FIELD(schur_block, U32),
     FIELD(strip_block, U32),      FIELD(narrow_cols, U32),
     FIELD(pivot_threads, U32),    FIELD(schur_chunk, U32),
+    FIELD(hybrid_cpu, F64),
 };
 #undef FIELD
 

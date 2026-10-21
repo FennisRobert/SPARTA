@@ -10,7 +10,7 @@ EPS: float = 1e-10
 
 from ._sparta import gpu_available, __version__
 from ._types import Ordering, MatrixType, Path, Backend
-from ._options import _Options
+from ._options import _Options, _hybrid_share
 from ._config import Config, presets, profiles
 from ._optimize import optimize, Optimization, Progress
 from ._solver import Solver
@@ -40,7 +40,8 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
             strip_block: int | None = None, narrow_cols: int | None = None,
             pivot_threads: int | None = None,
             schur_chunk: int | None = None,
-            force_cpu: bool | None = None, cpu_panel: int | None = None,
+            force_cpu: bool | None = None, hybrid: bool | float | None = None,
+            cpu_panel: int | None = None,
             cpu_block_rows: int | None = None, cpu_blas_min_rows: int | None = None) -> Solver:
     """Analyze a matrix pattern on CPU and return an unfactorized Solver.
 
@@ -51,6 +52,16 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
         Accelerate for large updates. False uses Metal complex64. None uses the
         config setting, or False without a config. factorize(force_cpu=...) can
         override this later without repeating symbolic analysis.
+    hybrid : bool, float or None, default None
+        Factor with the CPU and the GPU together. The CPU takes whole branches
+        of the elimination tree while the GPU factors the rest, then the GPU
+        finishes from where they meet. True starts the CPU at 30% of the work;
+        a number from 0 to below 1 starts it there instead; False is the GPU
+        alone. The share then adapts to the measured speed of each device from
+        the third factorization on. Works for LDLT and LU. Only Metal has a
+        hybrid path: with force_cpu, on Vulkan, or without a GPU the setting is
+        ignored. None uses the config's hybrid_cpu, or False without a config.
+        factorize(hybrid=...) can change it later.
     cpu_panel : int or None, default None
         CPU panel width in pivots; 2x2 pivots may extend it by one column.
     cpu_block_rows : int or None, default None
@@ -179,7 +190,7 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
         threadgroup memory.
 
     Tuning arguments from nemin onward are fixed for the life of the analysis,
-    except force_cpu, which can also be selected by factorize().
+    except force_cpu and hybrid, which can also be selected by factorize().
     The six from panel onward are compiled into the Metal kernels when the
     first factorization creates them, so a combination this process has not
     used before costs roughly 300 ms of shader compilation once. Leave them
@@ -202,6 +213,7 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
                   schur_block=schur_block, strip_block=strip_block,
                   narrow_cols=narrow_cols, pivot_threads=pivot_threads,
                   schur_chunk=schur_chunk, force_cpu=force_cpu,
+                  hybrid_cpu=None if hybrid is None else _hybrid_share(hybrid),
                   cpu_panel=cpu_panel, cpu_block_rows=cpu_block_rows,
                   cpu_blas_min_rows=cpu_blas_min_rows)
     if config is not None:
@@ -216,6 +228,8 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
         ordering = Ordering(Config.defaults().ordering)
     if tuning["force_cpu"] is None:
         tuning["force_cpu"] = False
+    if tuning["hybrid_cpu"] is None:
+        tuning["hybrid_cpu"] = 0.0
     options = _Options(**tuning, verbose=verbose, safe_mode=safe_mode, ordering=ordering, mtype=mtype, triangle=triangle,
                       max_front=max_front, equilibrate=equilibrate,
                       refinement_steps=refinement_steps, refinement_rtol=refinement_rtol,

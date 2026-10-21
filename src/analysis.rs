@@ -962,6 +962,22 @@ impl Analysis {
             .map(|d| (d.nr as usize, d.nc as usize))
             .collect()
     }
+    /// `(nr, nc)` of every front, grouped by factorization level from the
+    /// leaves (level 0) to the root.
+    pub fn level_fronts(&self) -> Vec<Vec<(usize, usize)>> {
+        self.levels
+            .iter()
+            .map(|level| {
+                level
+                    .iter()
+                    .map(|&id| {
+                        let d = &self.nodes[id as usize];
+                        (d.nr as usize, d.nc as usize)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
     pub fn max_front_size(&self) -> usize {
         self.nodes.iter().map(|n| n.nr as usize).max().unwrap_or(0)
     }
@@ -975,6 +991,11 @@ impl Analysis {
     /// The symbolic layout is unchanged; solvers already created keep their backend.
     pub fn set_force_cpu(&mut self, force_cpu: bool) {
         self.config.force_cpu = force_cpu;
+    }
+    /// Select the hybrid CPU share, `Config::hybrid_cpu`, for solvers created
+    /// from this analysis from now on. Solvers already created keep theirs.
+    pub fn set_hybrid_cpu(&mut self, share: f64) {
+        self.config.hybrid_cpu = share;
     }
     /// Bytes per numerical scalar for the selected backend.
     fn scalar_bytes(&self) -> usize {
@@ -1285,12 +1306,28 @@ impl Analysis {
     }
     #[cfg(any(test, sparta_metal, sparta_vulkan))]
     pub(crate) fn dispatch_plan(&self) -> DispatchPlan {
+        self.dispatch_plan_for(None)
+    }
+    /// The dispatch tables for the nodes `keep` marks, or for every node when
+    /// `keep` is `None`.
+    ///
+    /// Levels keep their positions, so a level whose nodes are all dropped is
+    /// still present, with nothing to dispatch. That is what lets a hybrid
+    /// factorization hand the GPU its share of the fronts under the same level
+    /// numbers the full plan uses.
+    #[cfg(any(test, sparta_metal, sparta_vulkan))]
+    pub(crate) fn dispatch_plan_for(&self, keep: Option<&[bool]>) -> DispatchPlan {
         let mut ids = Vec::new();
         let mut levels = Vec::new();
         let mut tiles = Vec::new();
         let mut schur = Vec::new();
         let mut steps_table = Vec::new();
-        for level in &self.levels {
+        for full in &self.levels {
+            let level: Vec<u32> = full
+                .iter()
+                .copied()
+                .filter(|&s| keep.is_none_or(|k| k[s as usize]))
+                .collect();
             let small_start = ids.len() as u32;
             ids.extend(
                 level

@@ -1,4 +1,5 @@
 //! Level-ordered solves sharing Metal's global and local pivot mappings.
+use super::Scalar;
 use super::{block, div, finite, Solver, C};
 use crate::{Error, Kind, Result};
 use rayon::prelude::*;
@@ -17,7 +18,7 @@ impl Solver {
                 "finite RHS columns of analyzed dimension required".into(),
             ));
         }
-        let mut out = vec![C::new(0.0, 0.0); b.len()];
+        let mut out = vec![C::from_re(0.0); b.len()];
         out.par_chunks_mut(n)
             .zip(b.par_chunks(n))
             .for_each(|(out, rhs)| self.solve_column(rhs, out));
@@ -47,7 +48,7 @@ impl Solver {
                     }
                 }
                 for i in n..m {
-                    let mut acc = C::new(0.0, 0.0);
+                    let mut acc = C::from_re(0.0);
                     for k in 0..n {
                         acc += l[k * m + i] * y[k];
                     }

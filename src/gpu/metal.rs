@@ -26,6 +26,38 @@ extern "C" {
         cap: usize,
     ) -> *mut c_void;
     fn sparta_v1_destroy(context: *mut c_void);
+    fn sparta_v1_set_factor_plan(
+        context: *mut c_void,
+        ids: *const c_void,
+        ids_bytes: usize,
+        tiles: *const c_void,
+        tiles_bytes: usize,
+        schur: *const c_void,
+        schur_bytes: usize,
+        levels: *const u32,
+        level_count: u32,
+        steps: *const u32,
+        step_count: u32,
+        error: *mut u8,
+        cap: usize,
+    ) -> i32;
+    fn sparta_v1_buffer(context: *mut c_void, index: u32, length: *mut usize) -> *mut c_void;
+    fn sparta_v1_factor_start(
+        context: *mut c_void,
+        input: *const c_void,
+        first: u32,
+        last: u32,
+        error: *mut u8,
+        cap: usize,
+    ) -> i32;
+    fn sparta_v1_factor_finish(
+        context: *mut c_void,
+        status: *mut u32,
+        perturbed: *mut u64,
+        seconds: *mut f64,
+        error: *mut u8,
+        cap: usize,
+    ) -> i32;
     fn sparta_v1_pivot_range(context: *mut c_void, lo: *mut f64, hi: *mut f64) -> i32;
     fn sparta_v1_run(
         context: *mut c_void,
@@ -160,6 +192,85 @@ impl Context {
         } else {
             Ok(seconds)
         }
+    }
+}
+/// The hybrid factorization's side of the bridge: see `hybrid.rs`.
+impl Context {
+    fn handle(&self) -> Result<NonNull<c_void>> {
+        self.0
+            .ok_or_else(|| Error::Invalid("this solver's GPU storage was released".into()))
+    }
+    /// Install the dispatch tables of the GPU's share of a hybrid factorization.
+    pub(super) fn set_factor_plan(&mut self, plan: &crate::analysis::DispatchPlan) -> Result<()> {
+        let handle = self.handle()?;
+        let mut error = [0u8; 4096];
+        // SAFETY: the slices outlive the call, which copies them.
+        let ok = unsafe {
+            sparta_v1_set_factor_plan(
+                handle.as_ptr(),
+                plan.ids.as_ptr().cast(),
+                std::mem::size_of_val(plan.ids.as_slice()),
+                plan.tiles.as_ptr().cast(),
+                std::mem::size_of_val(plan.tiles.as_slice()),
+                plan.schur.as_ptr().cast(),
+                std::mem::size_of_val(plan.schur.as_slice()),
+                plan.levels.as_ptr().cast(),
+                plan.levels.len() as u32,
+                plan.steps.as_ptr().cast(),
+                plan.steps.len() as u32,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if ok == 0 { Err(message(&error)) } else { Ok(()) }
+    }
+    /// Host view of device buffer `index` as elements of `T`.
+    ///
+    /// Distinct indices are distinct allocations, so views of different
+    /// buffers may be held at once.
+    ///
+    /// # Safety
+    /// No command in flight may touch the elements the caller writes, `T`
+    /// must match the buffer's element type, and no two live views may be of
+    /// the same buffer.
+    #[allow(clippy::mut_from_ref)]
+    pub(super) unsafe fn buffer<T>(&self, index: u32) -> Result<&mut [T]> {
+        let handle = self.handle()?;
+        let mut length = 0usize;
+        let data = sparta_v1_buffer(handle.as_ptr(), index, &mut length);
+        if data.is_null() {
+            return Err(Error::Invalid(format!("no device buffer {index}")));
+        }
+        Ok(std::slice::from_raw_parts_mut(data.cast(), length / std::mem::size_of::<T>()))
+    }
+    /// Commit levels `[first, last)` of the GPU's share without waiting;
+    /// `values` starts a new factorization.
+    pub(super) fn factor_start(&mut self, values: Option<&[Complex32]>, first: u32, last: u32) -> Result<()> {
+        let handle = self.handle()?;
+        let mut error = [0u8; 4096];
+        let input = values.map_or(std::ptr::null(), |v| v.as_ptr().cast());
+        // SAFETY: `values` is copied before the call returns.
+        let ok = unsafe {
+            sparta_v1_factor_start(handle.as_ptr(), input, first, last, error.as_mut_ptr(), error.len())
+        };
+        if ok == 0 { Err(message(&error)) } else { Ok(()) }
+    }
+    /// Wait for the levels started so far; returns their device seconds.
+    pub(super) fn factor_finish(&mut self, status: &mut [u32], perturbed: &mut u64) -> Result<f64> {
+        let handle = self.handle()?;
+        let (mut error, mut seconds) = ([0u8; 4096], 0.0);
+        // SAFETY: `status` holds one word per node, as the context requires.
+        let ok = unsafe {
+            sparta_v1_factor_finish(
+                handle.as_ptr(),
+                status.as_mut_ptr(),
+                perturbed,
+                &mut seconds,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if ok == 0 { Err(message(&error)) } else { Ok(seconds) }
     }
 }
 impl Context {

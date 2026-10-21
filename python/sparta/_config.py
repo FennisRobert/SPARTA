@@ -29,7 +29,12 @@ class Config:
     Attributes
     ----------
     force_cpu : bool
-        Use Rust complex128 numerics with Apple Accelerate instead of Metal.
+        Use the Rust CPU numerics in double precision instead of the GPU.
+    hybrid_cpu : float
+        Share of the factorization work, from 0 to below 1, that the CPU does
+        at the same time as the GPU does the rest. 0 is the GPU alone. The
+        share is rebalanced after every factorization, so this sets the first
+        one. Only the Metal backend has a hybrid path; elsewhere it is ignored.
     cpu_panel : int
         Pivots per CPU panel; a 2x2 pivot can extend it by one column. Used by
         the LU path and by fronts LAPACK cannot factor, not by ordinary LDLT.
@@ -88,6 +93,7 @@ class Config:
     pivot_threads: int
     schur_chunk: int
     force_cpu: bool
+    hybrid_cpu: float
     cpu_panel: int
     cpu_block_rows: int
     cpu_blas_min_rows: int

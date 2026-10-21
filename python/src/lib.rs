@@ -1,16 +1,16 @@
 // PyO3 0.22 generated wrappers trigger this lint on newer Rust.
 #![allow(clippy::useless_conversion)]
 mod cpu;
+mod residual;
 mod tuning;
+mod values;
 use cpu::PyCpuFactor;
-use num_complex::Complex64;
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+use numpy::PyReadonlyArray1;
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
     prelude::*,
 };
-use rayon::prelude::*;
-use sparta::{scalpel, Analysis, Complex32, Config, OrderingMethod, Preset, Solver};
+use sparta::{scalpel, Analysis, Config, OrderingMethod, Preset, Solver};
 fn error(e: sparta::Error) -> PyErr {
     match e {
         sparta::Error::Invalid(_) => PyValueError::new_err(e.to_string()),
@@ -97,6 +97,8 @@ impl PyAnalysis {
             cpu_panel: cpu_panel.unwrap_or(base.cpu_panel),
             cpu_block_rows: cpu_block_rows.unwrap_or(base.cpu_block_rows),
             cpu_blas_min_rows: cpu_blas_min_rows.unwrap_or(base.cpu_blas_min_rows),
+            // Not a Python argument yet: the default, or SPARTA_HYBRID_CPU.
+            hybrid_cpu: base.hybrid_cpu,
         };
         config.check().map_err(PyValueError::new_err)?;
         let (ptr, rows) = (ptr.as_slice()?, rows.as_slice()?);
@@ -162,21 +164,30 @@ impl PyAnalysis {
     fn set_force_cpu(&mut self, force_cpu: bool) {
         self.analysis.set_force_cpu(force_cpu);
     }
-    /// Factor complex128 CSC values using CPU numerics and this symbolic layout.
-    fn factor_cpu(&self, values: PyReadonlyArray1<'_, Complex64>) -> PyResult<PyCpuFactor> {
+    /// Factor CSC `values` with CPU numerics and this symbolic layout, in the
+    /// values' own dtype.
+    fn factor_cpu(&self, values: &Bound<'_, PyAny>) -> PyResult<PyCpuFactor> {
         let mut plan = self.analysis.clone();
         plan.set_force_cpu(true);
         let mut solver = Solver::new(plan).map_err(error)?;
-        solver.factor_c128(values.as_slice()?).map_err(error)?;
+        values::factor(&mut solver, values)?;
         Ok(PyCpuFactor { solver })
     }
-    fn factor(&self, values: PyReadonlyArray1<'_, Complex32>) -> PyResult<PyFactor> {
+    /// Factor float32 or complex64 CSC `values` on the GPU, with `hybrid_cpu`
+    /// of the work on the CPU alongside it (0 for none; ignored where the
+    /// backend has no hybrid path).
+    #[pyo3(signature = (values, hybrid_cpu=0.0))]
+    fn factor(&mut self, values: &Bound<'_, PyAny>, hybrid_cpu: f64) -> PyResult<PyFactor> {
+        if !(0.0..1.0).contains(&hybrid_cpu) {
+            return Err(PyValueError::new_err("hybrid_cpu must be at least 0 and below 1"));
+        }
+        self.analysis.set_hybrid_cpu(hybrid_cpu);
         // Borrowed, not cloned: this analysis stays alive for the next
         // factorization, and the GPU backend keeps its own device copy of every
         // symbolic array. Cloning put them in RAM a third time -- 91 MiB of
         // them on a 457k EMerge system -- for the life of the factors.
         let mut solver = Solver::analyzed(&self.analysis).map_err(error)?;
-        solver.factor(values.as_slice()?).map_err(error)?;
+        values::factor(&mut solver, values)?;
         Ok(PyFactor { solver })
     }
 }
@@ -186,42 +197,24 @@ struct PyFactor {
 }
 #[pymethods]
 impl PyFactor {
-    fn refactor(&mut self, values: PyReadonlyArray1<'_, Complex32>) -> PyResult<()> {
-        self.solver.factor(values.as_slice()?).map_err(error)
+    /// Replace the GPU factors with float32 or complex64 CSC `values`.
+    fn refactor(&mut self, values: &Bound<'_, PyAny>) -> PyResult<()> {
+        values::factor(&mut self.solver, values)
     }
     /// Release the Metal buffers and the analysis copy this factor owns.
     fn destroy(&mut self) {
         self.solver.destroy();
     }
-    fn solve<'py>(
-        &mut self,
-        py: Python<'py>,
-        rhs: PyReadonlyArray1<'_, Complex32>,
-    ) -> PyResult<Bound<'py, PyArray1<Complex32>>> {
-        Ok(self
-            .solver
-            .solve(rhs.as_slice()?)
-            .map_err(error)?
-            .into_pyarray_bound(py))
+    /// Solve vector `rhs` and return a NumPy vector of its dtype.
+    fn solve<'py>(&mut self, py: Python<'py>, rhs: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        values::solve(py, &mut self.solver, rhs)
     }
     /// Solve every column of a (nrhs, n) C-contiguous block in one pass.
     ///
     /// The block is taken as rows rather than columns so the caller's array is
     /// contiguous per right-hand side, which is the layout the bridge copies.
-    fn solve_many<'py>(
-        &mut self,
-        py: Python<'py>,
-        rhs: PyReadonlyArray2<'_, Complex32>,
-    ) -> PyResult<Bound<'py, PyArray2<Complex32>>> {
-        let dims = rhs.as_array().raw_dim();
-        let (nrhs, n) = (dims[0], dims[1]);
-        let out = self
-            .solver
-            .solve_many(rhs.as_slice()?, nrhs)
-            .map_err(error)?;
-        let block = numpy::ndarray::Array2::from_shape_vec((nrhs, n), out)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(block.into_pyarray_bound(py))
+    fn solve_many<'py>(&mut self, py: Python<'py>, rhs: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        values::solve_many(py, &mut self.solver, rhs)
     }
     /// Numerical factorization duration in seconds (CPU wall time or GPU commands).
     #[getter]
@@ -240,6 +233,16 @@ impl PyFactor {
     #[getter]
     fn pivot_range(&self) -> Option<(f64, f64)> {
         self.solver.pivot_range()
+    }
+    /// How the latest hybrid factorization divided its time: (CPU share of
+    /// the work, CPU seconds, wait seconds, hand-over seconds, GPU seconds
+    /// below the cut, GPU seconds above it), or None when it ran on the GPU
+    /// alone.
+    #[getter]
+    fn hybrid_timing(&self) -> Option<(f64, f64, f64, f64, f64, f64)> {
+        self.solver.hybrid_timing().map(|h| {
+            (h.share, h.cpu_seconds, h.wait_seconds, h.copy_seconds, h.gpu_below, h.gpu_above)
+        })
     }
 }
 #[pyfunction]
@@ -273,80 +276,6 @@ fn _settings(py: Python<'_>, preset: &str) -> PyResult<Py<pyo3::types::PyDict>> 
     tuning::settings(py, &config)
 }
 
-/// Rows one worker takes at a time in the residual product. Large enough that
-/// the per-task overhead disappears against a row's own work, small enough that
-/// the last worker to finish is not holding up the rest.
-const RESIDUAL_ROW_BLOCK: usize = 512;
-
-/// Multiplies a complex128 CSR matrix by a dense block of right-hand sides.
-///
-/// Iterative refinement measures its residual against the original matrix in
-/// complex128, and that product is the only part of a solve that is not on the
-/// GPU. It stops being negligible as soon as there are several right-hand
-/// sides: the GPU batches them into one triangular solve, while SciPy's product
-/// is one thread and scales linearly with their number, so past about eight
-/// ports it is the larger half of the solve.
-///
-/// Rows are split into blocks and each worker owns its block's output rows
-/// outright, so nothing is shared and no accumulation is atomic. Within a row
-/// every right-hand side is advanced together, so the row's values and column
-/// indices are read once for all of them rather than once each.
-///
-/// `indptr` and `indices` describe the CSR pattern, `values` its entries, and
-/// `block` is (rows, columns) in C order. The accumulation order matches a
-/// row-wise serial product, so the result does not depend on the worker count.
-#[pyfunction]
-fn _residual_product<'py>(
-    py: Python<'py>,
-    indptr: PyReadonlyArray1<'py, i64>,
-    indices: PyReadonlyArray1<'py, i64>,
-    values: PyReadonlyArray1<'py, Complex64>,
-    block: PyReadonlyArray2<'py, Complex64>,
-) -> PyResult<Bound<'py, PyArray2<Complex64>>> {
-    let indptr = indptr.as_slice()?;
-    let indices = indices.as_slice()?;
-    let values = values.as_slice()?;
-    let block = block.as_array();
-    let (n, k) = (block.shape()[0], block.shape()[1]);
-    if indptr.len() != n + 1 {
-        return Err(PyValueError::new_err(
-            "row pointer length must be one more than the block's row count",
-        ));
-    }
-    let x = block
-        .as_slice()
-        .ok_or_else(|| PyValueError::new_err("the right-hand side block must be C-contiguous"))?;
-    let nnz = *indptr.last().unwrap_or(&0);
-    if nnz < 0 || nnz as usize > values.len() || nnz as usize > indices.len() {
-        return Err(PyValueError::new_err(
-            "row pointers overrun the stored entries",
-        ));
-    }
-    let mut out = vec![Complex64::new(0.0, 0.0); n * k];
-    // The GIL is not needed by any of this, and holding it would serialise the
-    // workers against anything else the interpreter wants to do.
-    py.allow_threads(|| {
-        out.par_chunks_mut(RESIDUAL_ROW_BLOCK * k)
-            .enumerate()
-            .for_each(|(chunk, dst)| {
-                let first = chunk * RESIDUAL_ROW_BLOCK;
-                for (offset, row) in dst.chunks_mut(k).enumerate() {
-                    let i = first + offset;
-                    for slot in indptr[i] as usize..indptr[i + 1] as usize {
-                        let value = values[slot];
-                        let column = indices[slot] as usize * k;
-                        for c in 0..k {
-                            row[c] += value * x[column + c];
-                        }
-                    }
-                }
-            });
-    });
-    let shaped = numpy::ndarray::Array2::from_shape_vec((n, k), out)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(shaped.into_pyarray_bound(py))
-}
-
 /// Returns the names and one-line summaries of every built-in preset.
 #[pyfunction]
 fn _presets() -> Vec<(String, String)> {
@@ -365,7 +294,7 @@ fn _sparta(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(device, m)?)?;
     m.add_function(wrap_pyfunction!(_settings, m)?)?;
     m.add_function(wrap_pyfunction!(_presets, m)?)?;
-    m.add_function(wrap_pyfunction!(_residual_product, m)?)?;
+    m.add_function(wrap_pyfunction!(residual::_residual_product, m)?)?;
     m.add_class::<tuning::PyOutcome>()?;
     m.add_function(wrap_pyfunction!(tuning::_optimize, m)?)?;
     m.add_function(wrap_pyfunction!(tuning::_profile_save, m)?)?;

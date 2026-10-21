@@ -9,6 +9,7 @@ use super::blocked::Scratch;
 use super::dense::{self, Threading};
 use rayon::prelude::*;
 use super::profile::{Phase, Report};
+use super::Scalar;
 use super::{factor::Front, C};
 use crate::{Analysis, Error, Kind, Result};
 
@@ -88,11 +89,25 @@ impl Shared {
         );
         let clock = Report::clock();
         let a = std::slice::from_raw_parts_mut(self.fronts.add(off), m * m);
-        let zero = C::new(0.0, 0.0);
+        let zero = C::from_re(0.0);
+        // LDL^T assembles, factors and hands on the lower triangle only, so
+        // only that half is cleared; the routes that want the full square
+        // reflect it first (`Front::symmetrize`), and `node` zeroes the part
+        // of each stored factor column above the diagonal.
+        let lower = plan.kind == Kind::Ldlt;
+        let clear = |first: usize, chunk: &mut [C]| {
+            for (r, row) in chunk.chunks_mut(m).enumerate() {
+                let end = if lower { first + r + 1 } else { m };
+                row[..end].fill(zero);
+            }
+        };
         if parallel {
-            a.par_chunks_mut(BLANK).for_each(|chunk| chunk.fill(zero));
+            let rows = (BLANK / m).max(1);
+            a.par_chunks_mut(rows * m)
+                .enumerate()
+                .for_each(|(b, chunk)| clear(b * rows, chunk));
         } else {
-            a.fill(zero);
+            clear(0, a);
         }
         report.stop(Phase::Blank, clock);
         let clock = Report::clock();
@@ -174,29 +189,58 @@ impl Shared {
         let clock = Report::clock();
         let a = std::slice::from_raw_parts(self.fronts.add(off), m * m);
         let l = std::slice::from_raw_parts_mut(self.factors.add(node.loffset as usize), n * m);
-        // Transposed into column-major L, one contiguous output column at a time.
-        let transpose = |j: usize, column: &mut [C]| {
-            for (i, slot) in column.iter_mut().enumerate() {
-                *slot = a[i * m + j];
+        // Transposed into column-major L a tile of columns at a time, so each
+        // front row is read as one contiguous run rather than once per column.
+        // Above the diagonal, which no solve reads, LDL^T holds whatever the
+        // route left there, or nothing it assembled; it is stored as zero.
+        //
+        // The stored columns are also where non-finite values are caught. A
+        // front's trailing block needs no check of its own: every entry of it
+        // reaches the factor columns of some ancestor, on the CPU here or on
+        // the GPU, whose pivot search checks the same, and checking the whole
+        // front instead cost 6% of the complex64 factorization.
+        let store = |tile: usize, columns: &mut [C]| -> bool {
+            let (j0, width) = (tile * STORE_TILE, columns.len() / m);
+            for i in 0..m {
+                for (c, &v) in a[i * m + j0..i * m + j0 + width].iter().enumerate() {
+                    columns[c * m + i] = v;
+                }
             }
+            if lower {
+                for c in 0..width {
+                    columns[c * m..c * m + j0 + c].fill(zero);
+                }
+            }
+            columns.iter().all(|v| v.finite())
         };
-        if parallel {
-            l.par_chunks_mut(m)
+        let finite = if parallel {
+            l.par_chunks_mut(STORE_TILE * m)
                 .enumerate()
-                .for_each(|(j, column)| transpose(j, column));
+                .map(|(t, columns)| store(t, columns))
+                .reduce(|| true, |x, y| x && y)
         } else {
-            l.chunks_mut(m)
+            l.chunks_mut(STORE_TILE * m)
                 .enumerate()
-                .for_each(|(j, column)| transpose(j, column));
-        }
+                .fold(true, |ok, (t, columns)| store(t, columns) && ok)
+        };
+        let mut finite = finite;
         if plan.kind == Kind::Lu {
             let u =
                 std::slice::from_raw_parts_mut(self.upper.add(node.uoffset as usize), n * (m - n));
             if m > n {
                 for (j, row) in u.chunks_mut(m - n).enumerate() {
                     row.copy_from_slice(&a[j * m + n..(j + 1) * m]);
+                    finite &= row.iter().all(|v| v.finite());
                 }
             }
+        }
+        report.stop(Phase::Store, clock);
+        if !finite {
+            return Err(Error::Pivot {
+                node: id as usize,
+                pivot: n as u32,
+                reason: crate::PivotFailure::NonFinite,
+            });
         }
         report.stop(Phase::Store, clock);
         Ok(bumped)
@@ -240,6 +284,10 @@ impl Shared {
 /// Elements per task when clearing a front slot: enough that the parallel
 /// region costs less than the memset it replaces.
 const BLANK: usize = 1 << 16;
+
+/// Factor columns one task stores: eight complex64 values are one 64-byte
+/// cache line of a front row.
+const STORE_TILE: usize = 8;
 
 /// One level's nodes, widest first, and whether to spread them across threads.
 pub(super) struct Level {

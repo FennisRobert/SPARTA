@@ -1,5 +1,10 @@
-//! Complex128 multifrontal numerics using the same symbolic layout as Metal.
+//! CPU multifrontal numerics using the same symbolic layout as the GPU.
+//!
+//! Compiled four times, once per value type: `cpu_z` (complex128), `cpu_c`
+//! (complex64), `cpu_d` (float64) and `cpu_s` (float32). Each copy reads its
+//! types from the `cpu_types!` defined just before it in `lib.rs`.
 mod blocked;
+mod blocked_lu;
 mod dense;
 mod factor;
 mod level;
@@ -8,7 +13,11 @@ mod profile;
 mod solve;
 mod update;
 
-use crate::{Analysis, Complex64 as C, Error, Kind, Result};
+use crate::{Analysis, Error, Kind, Result};
+
+// `C`, the value type of this copy, and `R`, the real type of its precision.
+cpu_types!();
+pub(crate) use crate::scalar::Scalar;
 use blocked::Scratch;
 use dense::Threading;
 use level::{Level, Shared};
@@ -26,6 +35,21 @@ struct Worker {
 }
 
 /// CPU allocation; front slots are reused only after their factors are stored.
+/// Read access to a CPU solver's plan and factor storage; see [`Solver::storage`].
+// Used by the hybrid factorization through the complex64 copy only.
+#[allow(dead_code)]
+pub(crate) struct Storage<'a> {
+    pub plan: &'a Analysis,
+    pub fronts: &'a [C],
+    pub factors: &'a [C],
+    /// LU only: U12 per node, row-major at `uoffset`.
+    pub upper: &'a [C],
+    pub diagonal: &'a [C],
+    pub subdiag: &'a [C],
+    pub perms: &'a [usize],
+    pub two: &'a [bool],
+}
+
 pub(crate) struct Solver {
     plan: Analysis,
     fronts: Vec<C>,
@@ -44,7 +68,7 @@ pub(crate) struct Solver {
 }
 
 impl Solver {
-    /// Allocate complex128 buffers for the immutable symbolic `plan`.
+    /// Allocate buffers of this copy's value type for the immutable symbolic `plan`.
     pub(crate) fn new(plan: Analysis) -> Result<Self> {
         plan.config.check().map_err(Error::Invalid)?;
         if plan.n == 0 {
@@ -70,13 +94,71 @@ impl Solver {
     }
 
     /// Factor finite complex128 `values` in the analyzed CSC entry order.
+    // `new_lazy`, `restrict` and `storage` serve the hybrid factorization,
+    // which uses the complex64 copy of this module only.
+    #[allow(dead_code)]
+    /// A solver whose storage is reserved but not touched until a front writes
+    /// it, for factoring only part of the tree: the pages of nodes it never
+    /// factors are never committed.
+    pub(crate) fn new_lazy(plan: Analysis) -> Result<Self> {
+        plan.config.check().map_err(Error::Invalid)?;
+        let threads = rayon::current_num_threads().max(1);
+        Ok(Self {
+            workers: (0..threads).map(|_| Mutex::new(Worker::default())).collect(),
+            schedule: level::schedule(&plan, threads),
+            fronts: allocate_lazy(plan.elements)?,
+            factors: allocate_lazy(plan.factor_elements)?,
+            upper: allocate_lazy(plan.upper_elements)?,
+            diagonal: allocate_lazy(plan.n)?,
+            subdiag: allocate_lazy(plan.n)?,
+            perms: vec![0; plan.n],
+            two: vec![false; plan.n],
+            plan,
+            valid: false,
+            destroyed: false,
+            seconds: 0.0,
+            perturbed: 0,
+        })
+    }
+
+    #[allow(dead_code)]
+    /// Factor only the nodes `keep` marks from now on, replacing any earlier
+    /// restriction. They must be closed under taking children, so that no
+    /// kept front waits on one left out.
+    pub(crate) fn restrict(&mut self, keep: &[bool]) {
+        let threads = rayon::current_num_threads().max(1);
+        self.schedule = level::schedule(&self.plan, threads);
+        for level in &mut self.schedule {
+            level.nodes.retain(|&id| keep[id as usize]);
+            level.spread &= level.nodes.len() >= threads;
+        }
+        self.schedule.retain(|level| !level.nodes.is_empty());
+    }
+
+    #[allow(dead_code)]
+    /// The plan and the numerical storage of the latest factorization: fronts,
+    /// factor columns, `D`'s diagonal and subdiagonal, pivot permutations and
+    /// the 2x2 flags, laid out exactly as the GPU buffers are.
+    pub(crate) fn storage(&self) -> Storage<'_> {
+        Storage {
+            plan: &self.plan,
+            fronts: &self.fronts,
+            factors: &self.factors,
+            upper: &self.upper,
+            diagonal: &self.diagonal,
+            subdiag: &self.subdiag,
+            perms: &self.perms,
+            two: &self.two,
+        }
+    }
+
     pub(crate) fn factor(&mut self, values: &[C]) -> Result<()> {
         self.valid = false;
         self.seconds = 0.0;
         self.perturbed = 0;
         if self.destroyed || values.len() != self.plan.nnz || values.iter().any(|&v| !finite(v)) {
             return Err(Error::Invalid(
-                "finite complex128 values must match a live analyzed CSC pattern".into(),
+                "finite values must match a live analyzed CSC pattern".into(),
             ));
         }
         let started = Instant::now();
@@ -151,7 +233,7 @@ impl Solver {
                     let work: f64 = level.nodes.iter().map(|&i| {
                         let nd = plan.nodes[i as usize];
                         let (t, n) = ((nd.nr - nd.nc) as f64, nd.nc as f64);
-                        8.0 * (t * t * n + t * n * n / 2.0 + n * n * n / 3.0)
+                        FLOPS * (t * t * n + t * n * n / 2.0 + n * n * n / 3.0)
                     }).sum();
                     eprintln!("LEVEL {depth} seq {} {:.4} {:.2} {}", level.nodes.len(),
                         t0.elapsed().as_secs_f64(), work / 1e9,
@@ -183,7 +265,7 @@ impl Solver {
                 let work: f64 = level.nodes.iter().map(|&i| {
                     let nd = plan.nodes[i as usize];
                     let (t, n) = ((nd.nr - nd.nc) as f64, nd.nc as f64);
-                    8.0 * (t * t * n + t * n * n / 2.0 + n * n * n / 3.0)
+                    FLOPS * (t * t * n + t * n * n / 2.0 + n * n * n / 3.0)
                 }).sum();
                 eprintln!("LEVEL {depth} par {} {:.4} {:.2} {}", level.nodes.len(),
                     t0.elapsed().as_secs_f64(), work / 1e9,
@@ -202,6 +284,12 @@ impl Solver {
             report.merge(&worker.get_mut().unwrap().report);
         }
         result
+    }
+
+    /// Drop the numerical storage and give back the plan, for a solver of
+    /// another value type to take over.
+    pub(crate) fn into_plan(self) -> Analysis {
+        self.plan
     }
 
     /// Release factors and symbolic storage; later numerical calls return errors.
@@ -227,12 +315,14 @@ impl Solver {
     /// LDLᵀ scales each 2x2 block pivot by its determinant. LU reads U's
     /// diagonal, which each front keeps inside its factor columns: pivot `k`
     /// of a node is `factors[loffset + k * nr + k]`.
+    // `f64::from` is the identity in the double precision copies.
+    #[allow(clippy::useless_conversion)]
     pub(crate) fn pivot_range(&self) -> Option<(f64, f64)> {
         if !self.valid {
             return None;
         }
         if self.plan.kind == Kind::Lu {
-            let (mut lo, mut hi) = (f64::INFINITY, 0.0_f64);
+            let (mut lo, mut hi) = (R::INFINITY, 0.0 as R);
             for node in &self.plan.nodes {
                 let (m, base) = (node.nr as usize, node.loffset as usize);
                 for k in 0..node.nc as usize {
@@ -241,9 +331,9 @@ impl Solver {
                     hi = hi.max(v);
                 }
             }
-            return (lo.is_finite() && hi > 0.0).then_some((lo, hi));
+            return (lo.is_finite() && hi > 0.0).then_some((f64::from(lo), f64::from(hi)));
         }
-        let (mut lo, mut hi, mut k) = (f64::INFINITY, 0.0_f64, 0);
+        let (mut lo, mut hi, mut k) = (R::INFINITY, 0.0 as R, 0);
         while k < self.plan.n {
             let v = if self.two[k] {
                 let (_, _, _, s, det) =
@@ -257,39 +347,55 @@ impl Solver {
             lo = lo.min(v);
             hi = hi.max(v);
         }
-        Some((lo, hi))
+        Some((f64::from(lo), f64::from(hi)))
     }
 }
 
-/// Allocate `count` complex128 elements, reporting capacity failures as solver errors.
+/// Real flops per multiply-add of this copy's value type.
+pub(crate) const FLOPS: f64 = if <C as Scalar>::KIND.is_complex() { 8.0 } else { 2.0 };
+
+/// Allocate `count` elements, reporting capacity failures as solver errors.
 fn allocate(count: usize) -> Result<Vec<C>> {
     let mut data = Vec::new();
     data.try_reserve_exact(count)
         .map_err(|e| Error::Unsupported(format!("CPU allocation: {e}")))?;
-    data.resize(count, C::new(0.0, 0.0));
+    data.resize(count, C::from_re(0.0));
     Ok(data)
 }
 
-/// Test both floating-point components of complex128 `v`.
-fn finite(v: C) -> bool {
-    v.re.is_finite() && v.im.is_finite()
-}
-
-/// Divide complex128 `a` by `b` using the Metal kernel's scaled component formula.
-fn div(a: C, b: C) -> C {
-    if b.re.abs() >= b.im.abs() {
-        let r = b.im / b.re;
-        let d = b.re + b.im * r;
-        C::new((a.re + a.im * r) / d, (a.im - a.re * r) / d)
-    } else {
-        let r = b.re / b.im;
-        let d = b.im + b.re * r;
-        C::new((a.re * r + a.im) / d, (a.im * r - a.re) / d)
+#[allow(dead_code)]
+/// `count` zeros from the allocator's zeroed path. Large zeroed allocations
+/// come back as fresh pages, which the kernel commits only when first written,
+/// unlike [`allocate`], which writes every element.
+fn allocate_lazy(count: usize) -> Result<Vec<C>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let layout = std::alloc::Layout::array::<C>(count)
+        .map_err(|e| Error::Unsupported(format!("CPU allocation: {e}")))?;
+    // SAFETY: the layout is nonzero and valid for `count` elements, and an
+    // all-zero bit pattern is the number zero in each value type.
+    unsafe {
+        let data = std::alloc::alloc_zeroed(layout) as *mut C;
+        if data.is_null() {
+            return Err(Error::Unsupported("CPU allocation failed".into()));
+        }
+        Ok(Vec::from_raw_parts(data, count, count))
     }
 }
 
+/// Test every floating-point component of `v`.
+fn finite(v: C) -> bool {
+    v.finite()
+}
+
+/// Divide `a` by `b` using the GPU kernels' scaled component formula.
+fn div(a: C, b: C) -> C {
+    a.scaled_div(b)
+}
+
 /// Scale symmetric block entries `a`, `b`, `c` and return their determinant.
-fn block(a: C, b: C, c: C) -> (C, C, C, f64, C) {
+fn block(a: C, b: C, c: C) -> (C, C, C, R, C) {
     let scale = a.norm().max(b.norm()).max(c.norm());
     let (aa, bb, cc) = (a / scale, b / scale, c / scale);
     (aa, bb, cc, scale, aa * cc - bb * bb)

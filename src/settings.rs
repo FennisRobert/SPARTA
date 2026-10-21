@@ -57,7 +57,7 @@ impl From<bool> for Value {
 }
 
 /// Every setting name, in the order the Python `Config` lists them.
-pub const NAMES: [&str; 22] = [
+pub const NAMES: [&str; 23] = [
     "ordering",
     "max_front",
     "nemin",
@@ -80,6 +80,7 @@ pub const NAMES: [&str; 22] = [
     "cpu_panel",
     "cpu_block_rows",
     "cpu_blas_min_rows",
+    "hybrid_cpu",
 ];
 
 impl Config {
@@ -109,6 +110,7 @@ impl Config {
             "cpu_panel" => int(self.cpu_panel as u64),
             "cpu_block_rows" => int(self.cpu_block_rows as u64),
             "cpu_blas_min_rows" => int(self.cpu_blas_min_rows as u64),
+            "hybrid_cpu" => Some(Value::Float(self.hybrid_cpu)),
             _ => None,
         }
     }
@@ -167,6 +169,7 @@ impl Config {
             "cpu_panel" => self.cpu_panel = size()?,
             "cpu_block_rows" => self.cpu_block_rows = size()?,
             "cpu_blas_min_rows" => self.cpu_blas_min_rows = size()?,
+            "hybrid_cpu" => self.hybrid_cpu = float()?,
             _ => return Err(format!("unknown setting {name}")),
         }
         Ok(())

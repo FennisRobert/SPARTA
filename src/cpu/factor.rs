@@ -1,6 +1,7 @@
 //! Restricted pivoting and tiled trailing updates, without conjugation.
 use super::profile::{Phase, Report};
-use super::{block, blocked::Scratch, dense, div, finite, C};
+use super::Scalar;
+use super::{block, blocked::Scratch, dense, div, finite, C, R};
 use crate::{Config, Kind, PivotFailure};
 
 type Failure = (usize, PivotFailure);
@@ -23,8 +24,9 @@ pub(super) struct Front<'a> {
 impl Front<'_> {
     /// Eliminate fully summed columns, then finish the deferred Schur complement.
     ///
-    /// Wide fronts go to Accelerate through `blocked.rs`, which hands them back
-    /// untouched when LAPACK meets an exactly singular pivot block; `panel.rs`
+    /// Wide fronts go to Accelerate through `blocked.rs` (LDL^T) or
+    /// `blocked_lu.rs` (LU), which hand them back untouched when LAPACK meets
+    /// an exactly singular pivot block; `panel.rs`
     /// then factors them with its rescue floor. Narrow fronts stay on the
     /// serial kernel, whose complete pivot search matches Metal's short-front
     /// path and whose fronts are too small to pay a BLAS call.
@@ -33,11 +35,18 @@ impl Front<'_> {
             *p = i;
         }
         self.two.fill(false);
-        self.sub.fill(C::new(0.0, 0.0));
+        self.sub.fill(C::from_re(0.0));
         let small = self.m <= self.config.small_front_rows as usize;
         if !small {
-            if self.kind == Kind::Ldlt && dense::available() && self.factor_blocked(scratch, report)? {
-                return Ok(());
+            if dense::available() {
+                let done = if self.kind == Kind::Ldlt {
+                    self.factor_blocked(scratch, report)?
+                } else {
+                    self.factor_blocked_lu(scratch, report)?
+                };
+                if done {
+                    return Ok(());
+                }
             }
             let clock = Report::clock();
             if self.kind == Kind::Ldlt {
@@ -93,20 +102,20 @@ impl Front<'_> {
         &self,
         k: usize,
         small: bool,
-        cached: &mut Option<f64>,
+        cached: &mut Option<R>,
         reason: PivotFailure,
     ) -> Result<C, Failure> {
         let floor = if small {
             *cached.get_or_insert_with(|| {
-                self.a.iter().map(|v| v.norm()).fold(0.0, f64::max) * f64::EPSILON.sqrt()
+                self.a.iter().map(|v| v.norm()).fold(0.0, R::max) * R::EPSILON.sqrt()
             })
         } else {
             self.a
                 .chunks(self.m)
                 .flat_map(|row| &row[..self.n])
                 .map(|v| v.norm())
-                .fold(0.0, f64::max)
-                * f64::EPSILON.sqrt()
+                .fold(0.0, R::max)
+                * R::EPSILON.sqrt()
         };
         if !floor.is_finite() {
             return Err((k, PivotFailure::NonFinite));
@@ -114,7 +123,7 @@ impl Front<'_> {
         if floor <= 0.0 {
             return Err((k, reason));
         }
-        Ok(C::new(floor, 0.0))
+        Ok(C::from_re(floor))
     }
 
     /// Partial row pivoting at column `k`, confined to fully summed rows.
@@ -122,7 +131,7 @@ impl Front<'_> {
         &mut self,
         k: usize,
         small: bool,
-        floor: &mut Option<f64>,
+        floor: &mut Option<R>,
     ) -> Result<usize, Failure> {
         let (mut best, mut pick) = (0.0, k);
         for i in k..self.n {
@@ -136,7 +145,7 @@ impl Front<'_> {
             }
         }
         let d = self.a[k * self.m + k].norm();
-        let threshold = self.config.lu_diag_threshold;
+        let threshold = self.config.lu_diag_threshold as R;
         if threshold > 0.0 && d > 0.0 && d >= threshold * best {
             pick = k;
         }
@@ -158,7 +167,7 @@ impl Front<'_> {
         let m = self.m;
         // Metal's short-front kernel uses a complete diagonal/off-diagonal
         // search; its cooperative kernels use the Bunch–Kaufman column/row test.
-        let alpha = (1.0 + 17.0_f64.sqrt()) / 8.0;
+        let alpha = (1.0 + (17.0 as R).sqrt()) / 8.0;
         let checked = |z: C| {
             if finite(z) {
                 Ok(z.norm())
@@ -201,7 +210,7 @@ impl Front<'_> {
         if akk >= alpha * cm {
             return Ok((1, k, k));
         }
-        let mut rm = 0.0_f64;
+        let mut rm = 0.0 as R;
         for j in k..self.n {
             if j != imax {
                 rm = rm.max(checked(self.a[imax * m + j])?);
@@ -222,7 +231,7 @@ impl Front<'_> {
         &mut self,
         k: usize,
         small: bool,
-        floor: &mut Option<f64>,
+        floor: &mut Option<R>,
     ) -> Result<usize, Failure> {
         let (mut step, p, q) = self.choice(k, small)?;
         self.swap(k, p);
@@ -240,7 +249,7 @@ impl Front<'_> {
             if !finite(det) {
                 return Err((k, PivotFailure::NonFinite));
             }
-            if det.norm() <= f64::EPSILON {
+            if det.norm() <= R::EPSILON {
                 step = 1;
                 if da.norm() == 0.0 {
                     self.a[k * m + k] = self.rescue(k, small, floor, PivotFailure::TinyTwoByTwo)?;
@@ -256,7 +265,7 @@ impl Front<'_> {
                     self.a[i * m + k] = div(x * cc - y * bb, det);
                     self.a[i * m + k + 1] = div(y * aa - x * bb, det);
                 }
-                self.a[(k + 1) * m + k] = C::new(0.0, 0.0);
+                self.a[(k + 1) * m + k] = C::from_re(0.0);
             }
         }
         if step == 1 {
@@ -293,7 +302,7 @@ impl Front<'_> {
                 if step == 2 {
                     self.a[i * m + k + 1]
                 } else {
-                    C::new(0.0, 0.0)
+                    C::from_re(0.0)
                 }
             })
             .collect();
@@ -303,7 +312,7 @@ impl Front<'_> {
             if step == 2 {
                 self.d[k + 1]
             } else {
-                C::new(0.0, 0.0)
+                C::from_re(0.0)
             },
         );
         let run = |base: usize, chunk: &mut [C]| {

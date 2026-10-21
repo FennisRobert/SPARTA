@@ -43,6 +43,8 @@ struct Candidate {
     properties: vk::PhysicalDeviceProperties,
     queue_family: u32,
     atomic_float: bool,
+    /// Whether this is a portability driver offering `VK_KHR_portability_subset`.
+    portability: bool,
     min_subgroup: u32,
     max_buffer: u64,
 }
@@ -72,13 +74,7 @@ impl Gpu {
         let app = vk::ApplicationInfo::default()
             .application_name(c"sparta")
             .api_version(vk::API_VERSION_1_3);
-        // SAFETY: the create info outlives the call.
-        let instance = unsafe {
-            entry.create_instance(
-                &vk::InstanceCreateInfo::default().application_info(&app),
-                None,
-            )
-        }
+        let instance = create_instance(&entry, &app)
         .map_err(|e| Error::Device(format!("creating a Vulkan instance: {e}")))?;
         match Self::open(entry.clone(), instance.clone()) {
             Ok(gpu) => Ok(gpu),
@@ -100,7 +96,15 @@ impl Gpu {
             .queue_priorities(&priorities)];
         let mut atomic = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default()
             .shader_buffer_float32_atomic_add(chosen.atomic_float);
-        let extensions = [ash::ext::shader_atomic_float::NAME.as_ptr()];
+        let mut extensions = Vec::new();
+        if chosen.atomic_float {
+            extensions.push(ash::ext::shader_atomic_float::NAME.as_ptr());
+        }
+        // A portability driver (MoltenVK) requires its subset extension
+        // enabled whenever it offers it.
+        if chosen.portability {
+            extensions.push(ash::khr::portability_subset::NAME.as_ptr());
+        }
         // maintenance4 (core in 1.3) is what lets a workgroup size come from a
         // specialization constant (LocalSizeId), which every kernel uses.
         let mut core = vk::PhysicalDeviceVulkan13Features::default().maintenance4(true);
@@ -111,12 +115,11 @@ impl Gpu {
             .vulkan_memory_model_device_scope(true);
         let mut info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
+            .enabled_extension_names(&extensions)
             .push_next(&mut core)
             .push_next(&mut model);
         if chosen.atomic_float {
-            info = info
-                .enabled_extension_names(&extensions)
-                .push_next(&mut atomic);
+            info = info.push_next(&mut atomic);
         }
         // SAFETY: the physical device came from this instance; the create info
         // and everything it points to outlive the call.
@@ -254,6 +257,21 @@ pub(super) const GIB: f64 = 1073741824.0;
 ///
 /// Suitable means Vulkan 1.3, a queue family with compute, and basic and
 /// arithmetic subgroup operations in compute shaders.
+/// Create an instance for `app`. On Apple the only Vulkan driver is MoltenVK,
+/// a portability driver the loader lists only to an instance that enables
+/// `VK_KHR_portability_enumeration`; elsewhere no extension is requested.
+fn create_instance(entry: &ash::Entry, app: &vk::ApplicationInfo) -> ash::prelude::VkResult<ash::Instance> {
+    let portability = [ash::khr::portability_enumeration::NAME.as_ptr()];
+    let mut info = vk::InstanceCreateInfo::default().application_info(app);
+    if cfg!(target_vendor = "apple") {
+        info = info
+            .enabled_extension_names(&portability)
+            .flags(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR);
+    }
+    // SAFETY: the create info and everything it points to outlive the call.
+    unsafe { entry.create_instance(&info, None) }
+}
+
 fn candidates(instance: &ash::Instance) -> Result<Vec<Candidate>> {
     // SAFETY: plain queries on a live instance.
     let physicals = unsafe { instance.enumerate_physical_devices() }
@@ -296,11 +314,17 @@ fn candidates(instance: &ash::Instance) -> Result<Vec<Candidate>> {
             let max_buffer = maintenance
                 .max_buffer_size
                 .min(u64::from(properties.limits.max_storage_buffer_range));
+            let portability = instance
+                .enumerate_device_extension_properties(physical)
+                .unwrap_or_default()
+                .iter()
+                .any(|e| e.extension_name_as_c_str() == Ok(ash::khr::portability_subset::NAME));
             out.push(Candidate {
                 physical,
                 properties,
                 queue_family: queue_family as u32,
                 atomic_float: atomic.shader_buffer_float32_atomic_add == vk::TRUE,
+                portability,
                 min_subgroup: subgroup_size.min_subgroup_size.max(1),
                 max_buffer,
             });
@@ -360,10 +384,7 @@ pub(super) fn any_device() -> bool {
     // SAFETY: the create info outlives the call; the instance is destroyed
     // before returning.
     unsafe {
-        let Ok(instance) = entry.create_instance(
-            &vk::InstanceCreateInfo::default().application_info(&app),
-            None,
-        ) else {
+        let Ok(instance) = create_instance(&entry, &app) else {
             return false;
         };
         let found = candidates(&instance)

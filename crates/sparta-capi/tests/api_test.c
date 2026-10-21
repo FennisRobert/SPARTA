@@ -188,6 +188,12 @@ static void check_analyze_rejects(void) {
     expect("the message names the setting", strstr(sparta_last_error(), "schur_block") != NULL);
 
     sparta_config_default(&config);
+    config.hybrid_cpu = 1.5;
+    expect_status("a hybrid share of 1 or more",
+                  sparta_analyze(SMALL, a.col_ptr, a.row_index, SPARTA_SYMMETRIC, &config, &plan),
+                  SPARTA_ERROR_INVALID);
+
+    sparta_config_default(&config);
     config.struct_size = sizeof config + 8;
     expect_status("a config from a newer header than this library",
                   sparta_analyze(SMALL, a.col_ptr, a.row_index, SPARTA_SYMMETRIC, &config, &plan),
@@ -287,6 +293,72 @@ static void check_solve(void) {
     expect("in place gives the same answer", error_against_ones(in_place, SMALL) < 1.0e-4);
 
     sparta_solver_free(solver);
+
+    /* The same system with the CPU taking part of the work. */
+    sparta_config config;
+    sparta_config_default(&config);
+    config.hybrid_cpu = 0.3;
+    sparta_analyze(SMALL, a.col_ptr, a.row_index, SPARTA_SYMMETRIC, &config, &plan);
+    expect_status("a hybrid solver is created", sparta_solver_create(&plan, &solver), SPARTA_OK);
+    expect_status("it factors", sparta_factor(solver, (const sparta_complex *)a.values), SPARTA_OK);
+    expect_status("it solves", sparta_solve(solver, (const sparta_complex *)b, (sparta_complex *)x),
+                  SPARTA_OK);
+    expect("its answer is a vector of ones", error_against_ones(x, SMALL) < 1.0e-4);
+    sparta_solver_free(solver);
+}
+
+/** A real matrix factored with real arithmetic, and which right-hand sides
+ *  each kind of factors accepts. */
+static void check_real(void) {
+    section("a real matrix");
+
+    /* The tridiagonal with 4 + i/10 on the diagonal, made real: 4 - 1.5 on the
+       diagonal, which is indefinite, and -1 below it. */
+    tridiagonal a;
+    build_tridiagonal(&a);
+    float values[2 * SMALL - 1];
+    for (int k = 0; k < 2 * SMALL - 1; ++k) {
+        values[k] = crealf(a.values[k]) == 4.0f ? 2.5f : crealf(a.values[k]);
+    }
+    /* Row sums of the real matrix: A times a vector of ones. */
+    float b[SMALL];
+    float x[SMALL];
+    for (int64_t i = 0; i < SMALL; ++i) {
+        b[i] = 2.5f - (i > 0) - (i + 1 < SMALL);
+    }
+
+    sparta_analysis *plan = NULL;
+    sparta_solver *solver = NULL;
+    sparta_analyze(SMALL, a.col_ptr, a.row_index, SPARTA_SYMMETRIC, NULL, &plan);
+    sparta_solver_create(&plan, &solver);
+
+    expect_status("the real matrix factors", sparta_factor_real(solver, values), SPARTA_OK);
+    expect_status("a real right-hand side solves", sparta_solve_real(solver, b, x), SPARTA_OK);
+    float worst = 0.0f;
+    for (int64_t i = 0; i < SMALL; ++i) {
+        worst = fmaxf(worst, fabsf(x[i] - 1.0f));
+    }
+    expect("the answer is a vector of ones", worst < 1.0e-4f);
+
+    /* A complex right-hand side against real factors: ones times (1 + 2i). */
+    float complex z[SMALL];
+    float complex y[SMALL];
+    for (int64_t i = 0; i < SMALL; ++i) {
+        z[i] = b[i] * (1.0f + 2.0f * I);
+    }
+    expect_status("a complex right-hand side solves too",
+                  sparta_solve(solver, (const sparta_complex *)z, (sparta_complex *)y), SPARTA_OK);
+    float far = 0.0f;
+    for (int64_t i = 0; i < SMALL; ++i) {
+        far = fmaxf(far, cabsf(y[i] - (1.0f + 2.0f * I)));
+    }
+    expect("its answer is ones times 1 + 2i", far < 1.0e-4f);
+
+    expect_status("complex factors refuse a real right-hand side",
+                  (sparta_factor(solver, (const sparta_complex *)a.values),
+                   sparta_solve_real(solver, b, x)),
+                  SPARTA_ERROR_INVALID);
+    sparta_solver_free(solver);
 }
 
 /** A matrix that cannot be factored, and what the caller is told about it. */
@@ -378,6 +450,7 @@ int main(void) {
     check_analyze_rejects();
     check_handles();
     check_solve();
+    check_real();
     check_singular();
     check_general();
 

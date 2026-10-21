@@ -1,4 +1,7 @@
-"""Input pipeline: sparse matrix → validated CSC storage → complex64 GPU values.
+"""Input pipeline: sparse matrix → validated CSC storage → single precision GPU values.
+
+Real matrices stay real throughout and are factored with real arithmetic;
+complex ones stay complex.
 
 Solver calls _prepare_matrix during analysis and on replacement matrices.
 Solver.factorize calls _gpu_values only after optional scaling; original precision
@@ -10,26 +13,32 @@ from scipy import sparse
 from ._symmetry import _is_symmetric
 from ._types import MatrixType, Path
 
-def _gpu_values(values: np.ndarray, name: str, safe: bool = True) -> np.ndarray:
-    """Convert array values to complex64 for the GPU; name labels validation errors.
+VALUE_TYPES = (np.dtype(np.float32), np.dtype(np.float64),
+               np.dtype(np.complex64), np.dtype(np.complex128))
 
-    safe=True rejects non-complex input, non-finite values and values that
-    overflow complex64. safe=False performs only the conversion: an infinity or
-    a NaN then reaches the factorization, where it propagates into the factors
-    rather than raising here.
+
+def _gpu_values(values: np.ndarray, name: str, safe: bool = True) -> np.ndarray:
+    """Convert array values to the GPU's precision; name labels validation errors.
+
+    Real values become float32 and complex values complex64. safe=True rejects
+    other dtypes, non-finite values and values that overflow single precision.
+    safe=False performs only the conversion: an infinity or a NaN then reaches
+    the factorization, where it propagates into the factors rather than
+    raising here.
     """
     values = np.asarray(values)
+    target = np.complex64 if np.iscomplexobj(values) else np.float32
     if not safe:
         with np.errstate(over="ignore", invalid="ignore"):
-            return np.ascontiguousarray(values, dtype=np.complex64)
-    if values.dtype not in (np.dtype(np.complex64), np.dtype(np.complex128)):
-        raise TypeError(f"{name} must be complex64 or complex128")
+            return np.ascontiguousarray(values, dtype=target)
+    if values.dtype not in VALUE_TYPES:
+        raise TypeError(f"{name} must be float32, float64, complex64 or complex128")
     if not np.isfinite(values).all():
         raise ValueError(f"{name} must contain finite values")
     with np.errstate(over="ignore", invalid="ignore"):
-        converted = np.ascontiguousarray(values, dtype=np.complex64)
+        converted = np.ascontiguousarray(values, dtype=target)
     if not np.isfinite(converted).all():
-        raise ValueError(f"{name} overflows complex64 GPU precision")
+        raise ValueError(f"{name} overflows single GPU precision")
     return converted
 
 
@@ -72,12 +81,12 @@ def _value_gather(original: sparse.spmatrix, canonical: sparse.csc_matrix,
             or g.min(initial=1.0) < 1.0
             or g.max(initial=1.0) > stored):
         return None
-    return g.astype(np.intp) - 1
+    return (g - 1).astype(np.int32 if stored < 2**31 else np.intp)
 
 def _canonical_matrix(a: sparse.spmatrix, triangle: str, path: Path) -> sparse.csc_matrix:
     """Copy sparse a into the exact CSC layout consumed by Rust's symbolic plan.
 
-    a contains complex64/complex128 values, promoted by _prepare_matrix if real.
+    a contains float32, float64, complex64 or complex128 values.
     triangle specifies full or lower input; path is a resolved LU or LDLT enum.
     Returns sorted, duplicate-free CSC: all entries for LU, lower triangle for
     LDLT. Keeps explicit zeros because their positions belong to the pattern.
@@ -90,8 +99,8 @@ def _canonical_matrix(a: sparse.spmatrix, triangle: str, path: Path) -> sparse.c
     a.check_format(full_check=True)
     if a.shape[0] != a.shape[1] or not a.shape[0]:
         raise ValueError("A must be nonempty and square")
-    if a.dtype not in (np.dtype(np.complex64), np.dtype(np.complex128)):
-        raise TypeError("A must be complex64 or complex128")
+    if a.dtype not in VALUE_TYPES:
+        raise TypeError("A must be float32, float64, complex64 or complex128")
     if not np.isfinite(a.data).all():
         raise ValueError("A must contain finite values")
     # Rust requires sorted, unique row indices within each column.
@@ -128,17 +137,19 @@ def _prepare_matrix(a: sparse.spmatrix, mtype: MatrixType, path: Path, triangle:
     """Validate sparse matrix a against its declared type and select a GPU path.
 
     triangle specifies full or lower storage; path may explicitly override AUTO.
-    Real float inputs are promoted to matching-width complex storage. Returns
-    canonical CSC values and the selected Path, ready for symbolic analysis.
+    Real and complex floating-point inputs keep their dtype; integer and boolean
+    ones become float64. Returns canonical CSC values and the selected Path,
+    ready for symbolic analysis.
     """
     _validate_choices(mtype, path)
     if not sparse.issparse(a):
         raise TypeError('A must be a SciPy sparse matrix')
     if mtype.value.startswith('real_') and np.iscomplexobj(a.data) and np.any(a.data.imag):
         raise ValueError('Declared real matrix contains imaginary values')
-    # Promotion preserves the input precision; GPU conversion happens later.
-    if a.dtype in (np.dtype('float32'), np.dtype('float64')):
-        a = a.astype(np.complex64 if a.dtype == np.float32 else np.complex128)
+    # The dtype is kept, so a real matrix is factored as a real one; GPU
+    # conversion happens later.
+    if a.dtype.kind in 'biu':
+        a = a.astype(np.float64)
     if mtype == MatrixType.AUTO:
         selected = _resolve_path(a, path, triangle)
         return _canonical_matrix(a, triangle, selected), selected

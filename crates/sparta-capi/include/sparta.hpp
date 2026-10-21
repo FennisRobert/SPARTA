@@ -74,7 +74,7 @@ struct Config : sparta_config {
 /** Returns true when a usable GPU is visible to this process. */
 inline bool gpu_available() { return sparta_gpu_available() != 0; }
 
-/** Returns the library version, for example "0.1.1". */
+/** Returns the library version, for example "0.2.0". */
 inline std::string version() { return sparta_version(); }
 
 namespace detail {
@@ -133,8 +133,25 @@ class Solver {
             sparta_factor(solver_, reinterpret_cast<const sparta_complex *>(values.data())));
     }
 
+    /** Factors a real matrix with the analyzed pattern, with real arithmetic. */
+    void factor(const std::vector<float> &values) {
+        expect(values.size(), nonzeros(), "values");
+        detail::check(sparta_factor_real(solver_, values.data()));
+    }
+
     /** Solves A x = b for one right-hand side. */
     std::vector<complex> solve(const std::vector<complex> &b) { return solve_many(b, 1); }
+
+    /** Solves A x = b for one real right-hand side against real factors. */
+    std::vector<float> solve(const std::vector<float> &b) { return solve_many(b, 1); }
+
+    /** Solves for `count` real right-hand sides against real factors. */
+    std::vector<float> solve_many(const std::vector<float> &b, std::int64_t count) {
+        expect(b.size(), rows() * count, "b");
+        std::vector<float> x(b.size());
+        detail::check(sparta_solve_many_real(solver_, b.data(), x.data(), count));
+        return x;
+    }
 
     /** Solves for `count` right-hand sides held end to end, column j at b[j * rows]. */
     std::vector<complex> solve_many(const std::vector<complex> &b, std::int64_t count) {

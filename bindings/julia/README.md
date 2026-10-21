@@ -74,8 +74,11 @@ solver. A solver also reports the following:
 - **Pass the whole matrix**, both triangles, even for `:symmetric`.
   Refinement multiplies by it.
 - **Precision.**
-  - The GPU computes in single precision (`ComplexF32`).
-  - Answers are refined and returned in `ComplexF64`.
+  - The GPU computes in single precision: `Float32` for a real matrix,
+    `ComplexF32` for a complex one. Real matrices run through the complex
+    kernels for now, so they are no faster than complex ones yet.
+  - Answers are refined and returned in double precision: `Float64` when the
+    matrix and the right-hand side are both real, `ComplexF64` otherwise.
   - On an ill-conditioned system a small residual does not mean a small
     error. Lower `refinement_rtol` when the error matters.
 - **Changing pattern.**
