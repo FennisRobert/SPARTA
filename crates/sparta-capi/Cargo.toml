@@ -1,6 +1,6 @@
 [package]
 name = "sparta-capi"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Robert Fennis", "Milan Rother"]
 license = "AGPL-3.0-or-later"
@@ -11,5 +11,10 @@ description = "C and C++ binding for the SPARTA sparse direct solver"
 name = "sparta"
 crate-type = ["cdylib", "staticlib"]
 
+[features]
+## The target's GPU backend; `--no-default-features` builds the CPU backend only.
+default = ["gpu"]
+gpu = ["sparta-solver/gpu"]
+
 [dependencies]
-sparta-solver = { path = "../.." }
+sparta-solver = { path = "../..", default-features = false }

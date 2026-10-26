@@ -514,7 +514,7 @@ Rust and no compiler. One wheel works for every Python from 3.9 up, on Apple
 Silicon only:
 
 #code(```sh
-pip install sparta_solver-0.2.0-cp39-abi3-macosx_11_0_arm64.whl
+pip install sparta_solver-0.2.1-cp39-abi3-macosx_11_0_arm64.whl
 ```)
 
 == Checking the installation

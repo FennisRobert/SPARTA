@@ -347,6 +347,7 @@ class Solver:
                 self._residual_matrix, b[:, None], self._solve_scaled_block,
                 self._options.refinement_steps, self._options.refinement_rtol,
                 self._options.refinement_minimize,
+                single=not self._options.force_cpu,
             )
             self._refinement_reports = reports
             return result[:, 0]
@@ -383,6 +384,7 @@ class Solver:
                 self._residual_matrix, b, self._solve_scaled_block,
                 self._options.refinement_steps, self._options.refinement_rtol,
                 self._options.refinement_minimize,
+                single=not self._options.force_cpu,
             )
             self._refinement_reports = reports
         if self._options.verbose:

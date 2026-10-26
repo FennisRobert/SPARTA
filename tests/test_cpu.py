@@ -31,6 +31,24 @@ class CpuTests(unittest.TestCase):
                     self.assertEqual(f.factor_device_seconds, 0)
                     f.destroy()
 
+    def test_default_refinement_keeps_double_precision(self) -> None:
+        """Refinement, on by default, must hand the double factors unrounded
+        right-hand sides; narrowing them to single precision left a residual
+        near 1e-8 that refinement then accepted as converged."""
+        rng = np.random.default_rng(631)
+        n = 200
+        for complex_ in (True, False):
+            raw = rng.normal(size=(n, n)) + (1j*rng.normal(size=(n, n)) if complex_ else 0)
+            a = sparse.csc_matrix(raw + raw.T + n*np.eye(n))
+            b = rng.normal(size=(n, 2)) + (1j*rng.normal(size=(n, 2)) if complex_ else 0)
+            for path in (sparta.Path.LDLT, sparta.Path.LU):
+                with self.subTest(complex_=complex_, path=path):
+                    f = sparta.analyze(a, path=path, force_cpu=True).factorize()
+                    for x, rhs in ((f.solve(b[:, 0]), b[:, 0]), (f.solve_many(b), b)):
+                        residual = np.linalg.norm(a @ x - rhs)/np.linalg.norm(rhs)
+                        self.assertLess(residual, 1e-13)
+                    f.destroy()
+
     def test_ill_conditioned_original_values(self) -> None:
         """A difference lost by complex64 must survive factorization without refinement."""
         a = np.array([[1., 1.], [1., 1.+1e-10]], dtype=np.complex128)

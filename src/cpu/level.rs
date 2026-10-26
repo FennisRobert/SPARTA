@@ -31,6 +31,8 @@ pub(super) struct Shared {
     subdiag: *mut C,
     perms: *mut usize,
     two: *mut bool,
+    /// The factor layout; see `Solver::rowmajor`.
+    rowmajor: bool,
 }
 
 // SAFETY: `Shared` is only ever used through `node`, which addresses one node's
@@ -51,6 +53,7 @@ impl Shared {
         subdiag: &mut [C],
         perms: &mut [usize],
         two: &mut [bool],
+        rowmajor: bool,
     ) -> Self {
         Self {
             fronts: fronts.as_mut_ptr(),
@@ -60,6 +63,7 @@ impl Shared {
             subdiag: subdiag.as_mut_ptr(),
             perms: perms.as_mut_ptr(),
             two: two.as_mut_ptr(),
+            rowmajor,
         }
     }
 
@@ -71,12 +75,14 @@ impl Shared {
     /// No other thread may run `node` for a node outside `id`'s own level, and
     /// `id` must appear once per level. Both hold for a level-ordered walk that
     /// joins between levels.
+    #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn node(
         &self,
         plan: &Analysis,
         id: u32,
         values: &[C],
         parallel: bool,
+        alone: bool,
         scratch: &mut Scratch,
         report: &mut Report,
     ) -> Result<u64> {
@@ -175,6 +181,12 @@ impl Shared {
             kind: plan.kind,
             bumped: 0,
             parallel,
+            alone,
+            l: (self.rowmajor && n > 0).then(|| {
+                std::slice::from_raw_parts_mut(self.factors.add(node.loffset as usize), n * m)
+            }),
+            stored: false,
+            finite: true,
         };
         let result = front
             .factor(scratch, report)
@@ -183,7 +195,7 @@ impl Shared {
                 pivot: pivot as u32 + 1,
                 reason,
             });
-        let bumped = front.bumped;
+        let (bumped, stored, written) = (front.bumped, front.stored, front.finite);
         result?;
 
         let clock = Report::clock();
@@ -213,7 +225,32 @@ impl Shared {
             }
             columns.iter().all(|v| v.finite())
         };
-        let finite = if parallel {
+        // Row-major, each front row's first `nc` values are one contiguous
+        // copy; above the diagonal LDL^T is cleared as above.
+        let rows = |i0: usize, out: &mut [C]| -> bool {
+            for (i, row) in out.chunks_exact_mut(n).enumerate() {
+                let i = i0 + i;
+                row.copy_from_slice(&a[i * m..i * m + n]);
+                if lower && i + 1 < n {
+                    row[i + 1..].fill(zero);
+                }
+            }
+            out.iter().all(|v| v.finite())
+        };
+        let finite = if stored {
+            // The route wrote its factor rows in place; see `Front::l`.
+            written
+        } else if self.rowmajor && n > 0 {
+            if parallel {
+                let step = (BLANK / n.max(1)).max(1);
+                l.par_chunks_mut(step * n)
+                    .enumerate()
+                    .map(|(b, out)| rows(b * step, out))
+                    .reduce(|| true, |x, y| x && y)
+            } else {
+                rows(0, l)
+            }
+        } else if parallel {
             l.par_chunks_mut(STORE_TILE * m)
                 .enumerate()
                 .map(|(t, columns)| store(t, columns))
@@ -297,16 +334,21 @@ pub(super) struct Level {
 
 /// Plan how each level runs, once per solver.
 ///
-/// A level is spread across the pool only when it holds at least one front per
-/// thread. Below that, each front in turn gets the whole machine through
-/// Accelerate's own threading, which beats handing one front per thread and
-/// leaving most of the pool idle. Widest first, so Rayon's stealing does not
-/// end a level waiting on one late large front.
+/// Every level of two or more fronts is spread across the pool, however few
+/// fronts that is per thread: a front with more than a thread's share of the
+/// level's work splits its own work into tasks, which the threads done with
+/// the smaller fronts steal (`Solver::factor_all`). Overlapping the fronts
+/// beats giving each the machine in turn, because the leading `?sytrf` and
+/// `?getrf` run on one thread either way: on the 887k EMerge system it took
+/// the complex64 LDL^T from 1.52 to 1.41 s and the 86k LU from 1.10 to 0.93
+/// s (complex128, M4 Pro). A lone front, the root's level, still gets the
+/// whole machine. Widest first, so Rayon's stealing does not end a level
+/// waiting on one late large front.
 ///
 /// Without `BLASSetThreading` -- macOS 13 and 14 -- a spread level would have
 /// every front threading against every other, so only levels whose fronts are
 /// too narrow to reach Accelerate at all are spread there.
-pub(super) fn schedule(plan: &Analysis, threads: usize) -> Vec<Level> {
+pub(super) fn schedule(plan: &Analysis) -> Vec<Level> {
     let controllable = dense::set_threading(Threading::Machine);
     plan.levels
         .iter()
@@ -314,7 +356,7 @@ pub(super) fn schedule(plan: &Analysis, threads: usize) -> Vec<Level> {
             let mut nodes = level.clone();
             nodes.sort_unstable_by_key(|&id| std::cmp::Reverse(plan.nodes[id as usize].nr));
             let widest = nodes.first().map_or(0, |&id| plan.nodes[id as usize].nr) as usize;
-            let spread = nodes.len() >= threads
+            let spread = nodes.len() >= 2
                 && (controllable || widest <= plan.config.small_front_rows as usize);
             Level { nodes, spread }
         })

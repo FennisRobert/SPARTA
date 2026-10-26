@@ -1,6 +1,6 @@
 [package]
 name = "sparta-python"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Robert Fennis", "Milan Rother"]
 license = "AGPL-3.0-or-later"
@@ -10,11 +10,14 @@ publish = false
 name = "_sparta"
 crate-type = ["cdylib"]
 [features]
+## The target's GPU backend; `--no-default-features` builds the CPU backend only.
+default = ["gpu"]
+gpu = ["sparta-solver/gpu"]
 ## The Vulkan backend for AMD and NVIDIA; see "Vulkan" in the README.
 vulkan = ["sparta-solver/vulkan"]
 
 [dependencies]
-sparta-solver = { path = ".." }
+sparta-solver = { path = "..", default-features = false }
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
 numpy = "0.22"
 rayon = "1"

@@ -31,6 +31,7 @@ fn main() {
     let mut force_cpu = false;
     let mut lu = false;
     let mut single = false;
+    let mut nrhs = 1usize;
     let mut paths = Vec::new();
     let mut generate = Vec::new();
     let mut args = std::env::args().skip(1);
@@ -48,6 +49,8 @@ fn main() {
             // With --force-cpu: factor in complex64, the hybrid's CPU precision.
             "--single" => single = true,
             "--skip-solve" => skip_solve = true,
+            // Solve K copies of port 0 in one call; the solve column times all K.
+            "--nrhs" => nrhs = args.next().expect("--nrhs needs a count").parse().unwrap(),
             "--curl-curl" => generate.push(
                 args.next()
                     .expect("--curl-curl needs a grid size")
@@ -58,7 +61,7 @@ fn main() {
         }
     }
     if paths.is_empty() && generate.is_empty() {
-        eprintln!("usage: bench [--max-front N] [--skip-solve] [--force-cpu [--single]] [--lu] [--curl-curl K] FILE...");
+        eprintln!("usage: bench [--max-front N] [--skip-solve] [--nrhs K] [--force-cpu [--single]] [--lu] [--curl-curl K] FILE...");
         std::process::exit(2);
     }
 
@@ -227,16 +230,18 @@ fn main() {
             continue;
         }
         let clock = Instant::now();
+        let block = |rhs: &[common::C64]| rhs.repeat(nrhs);
+        let first = |x: Vec<common::C64>| x[..system.rhs_port(0).len()].to_vec();
         let wide = if force_cpu && single {
             solver
-                .solve_values(&to_single(system.rhs_port(0)), 1)
+                .solve_values(&to_single(&block(system.rhs_port(0))), nrhs)
                 .unwrap_or_else(|e| panic!("solve: {e}"))
                 .iter()
                 .map(|v| common::C64::new(v.re as f64, v.im as f64))
-                .collect()
+                .collect::<Vec<_>>()
         } else if force_cpu {
             solver
-                .solve_c128(system.rhs_port(0))
+                .solve_values(&block(system.rhs_port(0)), nrhs)
                 .unwrap_or_else(|e| panic!("solve: {e}"))
         } else {
             solver
@@ -247,6 +252,7 @@ fn main() {
                 .collect()
         };
         let solve_seconds = clock.elapsed().as_secs_f64();
+        let wide = first(wide);
         solve_total += solve_seconds;
 
         // Port 0 only: `reference` spans every port, and comparing a

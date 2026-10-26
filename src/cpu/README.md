@@ -96,9 +96,10 @@ place — the serial narrow-front kernel and the `panel.rs` fallback — restore
 full square first.
 
 Fronts in one level are independent and their workspace slots are disjoint, so
-`level.rs` runs a level across a Rayon pool when it holds at least one front per
-thread, and otherwise runs one front at a time with that front's own rows and
-row blocks spread instead. Rayon owns the parallelism and Accelerate is set
+`level.rs` runs every level of two or more fronts across a Rayon pool. A front
+holding more than a thread's share of its level's work also splits its own rows
+and row blocks into tasks, which threads done with the smaller fronts steal; a
+level of one front, the root's, runs that front alone. Rayon owns the parallelism and Accelerate is set
 single-threaded per worker, except inside `zsytrf`, whose serial diagonal chain
 it splits better from the inside. That needs a per-thread BLAS thread count,
 which Accelerate (`BLASSetThreading`) and MKL (`MKL_Set_Num_Threads_Local`)
@@ -106,10 +107,17 @@ have and OpenBLAS does not: `openblas_set_num_threads` is process-wide, so
 `dense::set_threading` refuses it and `level::schedule` keeps wide fronts off
 the spread path instead. An x86 build against MKL should therefore beat the
 same build against OpenBLAS for reasons unrelated to their GEMM kernels;
-measure both before concluding anything about either. Multiple RHS columns solve in parallel with
-Rayon. Forward contributions are accumulated without GPU atomics. This preserves
-sparse storage and the numerical algorithm, not bitwise arithmetic order or GPU
-scheduling.
+measure both before concluding anything about either.
+
+Factor columns are stored row-major per node (`nr` rows of `nc` values), the
+layout a front's rows copy into without a transpose; wide LDLᵀ fronts write
+them there directly. The hybrid keeps them column-major, the layout the GPU
+reads. The solve is multifrontal like the factorization: each node hands its
+trailing update to its parent rather than scattering it into rows another node
+owns, so the nodes of a level solve concurrently, and every right-hand side of
+a block is carried through one pass over the factors (through GEMM from four
+right-hand sides). This preserves sparse storage and the numerical algorithm,
+not bitwise arithmetic order or GPU scheduling.
 
 ## Precision and settings
 

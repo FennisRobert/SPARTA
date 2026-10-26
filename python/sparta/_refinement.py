@@ -186,11 +186,15 @@ def _apply(a: _Operator | csc_matrix | csr_matrix, x: np.ndarray) -> np.ndarray:
 
 def _refine_block(a: csc_matrix | csr_matrix, b: np.ndarray,
                   solve: Callable[[np.ndarray], np.ndarray], steps: int, rtol: float,
-                  minimize: bool = False) -> tuple[np.ndarray, tuple[RefinementReport, ...]]:
+                  minimize: bool = False, single: bool = True,
+                  ) -> tuple[np.ndarray, tuple[RefinementReport, ...]]:
     """Refine every column of b together, one batched solve per correction.
 
     a is the original matrix, b an (n, k) right-hand-side block, and solve
-    applies the single precision factors to a whole block. The work is float64
+    applies the factors to a whole block. single says the factors are single
+    precision (the GPU's), so each right-hand side is narrowed to float32 or
+    complex64 before solve; double precision factors (the CPU's) get it
+    unrounded. The work is float64
     when a and b are both real, complex128 otherwise. steps is the
     maximum correction count or -1 for as many as rtol needs; minimize selects an
     optimal complex step length per column. Columns stop independently: once one
@@ -200,7 +204,7 @@ def _refine_block(a: csc_matrix | csr_matrix, b: np.ndarray,
     """
     real = not np.iscomplexobj(b) and getattr(a, 'real', False) is True
     b = np.asarray(b, dtype=np.float64 if real else np.complex128)
-    narrow = np.float32 if real else np.complex64
+    narrow = (np.float32 if real else np.complex64) if single else b.dtype
     n, k = b.shape
     scale = _column_scale(b)
     # A zero column has no scale to divide by and is measured absolutely.
@@ -209,7 +213,7 @@ def _refine_block(a: csc_matrix | csr_matrix, b: np.ndarray,
     divisor = np.where(scale > 0, np.where(divisor > 0, divisor, 1.0), 1.0)
 
     def _correction(rhs: np.ndarray) -> np.ndarray:
-        """Narrow a block to single precision column by column and solve it."""
+        """Scale a block column by column, narrow it to the factors' precision and solve it."""
         size = _column_scale(rhs)
         by = np.where(size > 0, size, 1.0)
         out = np.asarray(solve(np.ascontiguousarray(rhs/by, dtype=narrow)), dtype=b.dtype)

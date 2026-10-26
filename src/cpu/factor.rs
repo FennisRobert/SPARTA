@@ -18,8 +18,22 @@ pub(super) struct Front<'a> {
     pub config: &'a Config,
     pub kind: Kind,
     pub bumped: u64,
-    /// Whether this front is alone enough on the machine to split its own work.
+    /// Whether this front splits its own work into Rayon tasks: when it is
+    /// alone on the machine, or when it outweighs its level's other fronts and
+    /// the threads that finish those steal from it.
     pub parallel: bool,
+    /// Whether no other front runs alongside, so the library may thread a
+    /// product across the whole machine.
+    pub alone: bool,
+    /// The node's permanent factor block, when it is row-major
+    /// (`Solver::rowmajor`): `nr` rows of `nc` values. A route that writes its
+    /// factor rows there directly sets `stored`, and the copy out of the
+    /// front is skipped.
+    pub l: Option<&'a mut [C]>,
+    /// Set by a route that wrote every factor row to `l`; `finite` then says
+    /// whether all of them were finite.
+    pub stored: bool,
+    pub finite: bool,
 }
 impl Front<'_> {
     /// Eliminate fully summed columns, then finish the deferred Schur complement.

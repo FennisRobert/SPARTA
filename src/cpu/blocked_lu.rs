@@ -84,13 +84,17 @@ impl Front<'_> {
             solve(Side::Right, Tri::Upper, tail, n, self.a, 0, n * m, m);
             report.stop(Phase::Offdiag, clock);
             let clock = Report::clock();
-            // The product, unlike the solves, Accelerate threads well.
-            if self.parallel {
+            // The product, unlike the solves, Accelerate threads well -- when
+            // the front has the machine to itself. One sharing its level with
+            // others splits the product into row blocks for the pool instead.
+            if self.alone {
                 dense::set_threading(Threading::Machine);
-            }
-            dense::gemm_nn_front(tail, tail, n, self.a, n * m, n, n * m + n, m);
-            if self.parallel {
+                dense::gemm_nn_front(tail, tail, n, self.a, n * m, n, n * m + n, m);
                 dense::set_threading(Threading::Caller);
+            } else if self.parallel {
+                dense::gemm_nn_front_spread(tail, tail, n, self.a, n * m, n, n * m + n, m);
+            } else {
+                dense::gemm_nn_front(tail, tail, n, self.a, n * m, n, n * m + n, m);
             }
             report.stop(Phase::Schur, clock);
         }

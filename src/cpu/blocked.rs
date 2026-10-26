@@ -132,7 +132,7 @@ impl Front<'_> {
         }
         self.adopt(leading, ipiv, &mut s.twos);
         self.reciprocals(leading, &mut s.inv[..n], &mut s.off[..n])?;
-        self.store_leading(leading);
+        let mut finite = self.store_leading(leading);
         report.stop(Phase::Leading, clock);
         report.front(Phase::Leading, m, n);
         let tail = m - n;
@@ -151,7 +151,7 @@ impl Front<'_> {
             } else {
                 dense::trsm(Side::Right, Tri::UnitUpper, tail, n, tri, n, packed, n);
             }
-            self.store_trailing(packed, &s.inv[..n], &s.off[..n], &s.twos);
+            finite &= self.store_trailing(packed, &s.inv[..n], &s.off[..n], &s.twos);
             report.stop(Phase::Offdiag, clock);
             let clock = Report::clock();
             // SAFETY-adjacent invariant checked by `gemm_nt_front`: the left
@@ -160,8 +160,12 @@ impl Front<'_> {
             self.schur(packed);
             report.stop(Phase::Schur, clock);
         }
-        // Non-finite values are caught when the factor columns are stored;
-        // see `Shared::node`.
+        // Non-finite values are caught when the factor rows are stored, here
+        // when they went straight to `l` and in `Shared::node` otherwise.
+        if self.l.is_some() {
+            self.stored = true;
+            self.finite = finite;
+        }
         Ok(true)
     }
 
@@ -244,15 +248,29 @@ impl Front<'_> {
 
     /// Copy `L11` and the pivots back into the front's lower triangle, matching
     /// the layout `panel.rs` writes: pivots on the diagonal, a zero in the
-    /// subdiagonal slot of a 2x2 block, unit multipliers below.
-    fn store_leading(&mut self, leading: &[C]) {
+    /// subdiagonal slot of a 2x2 block, unit multipliers below. With a
+    /// row-major factor block they go there instead, zero above the diagonal,
+    /// and the return value says whether all of them are finite.
+    fn store_leading(&mut self, leading: &[C]) -> bool {
         let (m, n) = (self.m, self.n);
+        if let Some(l) = self.l.as_deref_mut() {
+            let zero = C::from_re(0.0);
+            for (i, row) in l[..n * n].chunks_exact_mut(n).enumerate() {
+                for (j, slot) in row[..i].iter_mut().enumerate() {
+                    *slot = leading[j * n + i];
+                }
+                row[i] = self.d[i];
+                row[i + 1..].fill(zero);
+            }
+            return l[..n * n].iter().all(|v| v.finite());
+        }
         for j in 0..n {
             self.a[j * m + j] = self.d[j];
             for i in j + 1..n {
                 self.a[i * m + j] = leading[j * n + i];
             }
         }
+        true
     }
 
     /// Pack `A21` into row-major `packed`, permuting its columns to the pivot order.
@@ -298,10 +316,17 @@ impl Front<'_> {
     fn schur(&mut self, packed: &[C]) {
         let (m, n, rows) = (self.m, self.n, self.stripe());
         let tail = m - n;
+        // `L21` is read where `store_trailing` put it: in the front, or in the
+        // row-major factor block.
+        let l = self.l.as_deref();
         let run = |i0: usize, chunk: &mut [C]| {
             let r = chunk.len() / m;
             let i1 = (i0 + r).min(tail);
-            dense::gemm_nt_front(r, i1, n, chunk, 0, n, m, &packed[..i1 * n], n);
+            if let Some(l) = l {
+                dense::gemm_nt(r, i1, n, &l[(n + i0) * n..], n, &packed[..i1 * n], n, &mut chunk[n..], m);
+            } else {
+                dense::gemm_nt_front(r, i1, n, chunk, 0, n, m, &packed[..i1 * n], n);
+            }
         };
         let trailing = &mut self.a[n * m..];
         if self.parallel {
@@ -361,12 +386,14 @@ impl Front<'_> {
         }
     }
 
-    /// Write `L21 = packed * D^-1` into the front, leaving `packed` as `L21 * D`.
+    /// Write `L21 = packed * D^-1` into the front, or into the row-major
+    /// factor block when there is one, leaving `packed` as `L21 * D`. Returns
+    /// whether every value written to the factor block is finite.
     ///
     /// The scaling runs as one contiguous multiply per row, then a short fixup
     /// over the 2x2 columns only, so the common all-1x1 front never branches
     /// inside the row loop.
-    fn store_trailing(&mut self, packed: &[C], inv: &[C], off: &[C], twos: &[u32]) {
+    fn store_trailing(&mut self, packed: &[C], inv: &[C], off: &[C], twos: &[u32]) -> bool {
         let (m, n, rows) = (self.m, self.n, self.stripe());
         let scale = |out: &mut [C], row: &[C]| {
             for (slot, (&v, &r)) in out.iter_mut().zip(row.iter().zip(inv.iter())) {
@@ -378,6 +405,23 @@ impl Front<'_> {
                 out[k + 1] -= row[k] * off[k];
             }
         };
+        if let Some(l) = self.l.as_deref_mut() {
+            let out = &mut l[n * n..];
+            let block = |out: &mut [C], source: &[C]| {
+                for (o, row) in out.chunks_exact_mut(n).zip(source.chunks_exact(n)) {
+                    scale(o, row);
+                }
+                out.iter().all(|v| v.finite())
+            };
+            return if self.parallel {
+                out.par_chunks_mut(rows * n)
+                    .zip(packed.par_chunks(rows * n))
+                    .map(|(o, source)| block(o, source))
+                    .reduce(|| true, |x, y| x && y)
+            } else {
+                block(out, packed)
+            };
+        }
         let trailing = &mut self.a[n * m..];
         if self.parallel {
             trailing
@@ -393,5 +437,6 @@ impl Front<'_> {
                 scale(&mut out[..n], row);
             }
         }
+        true
     }
 }

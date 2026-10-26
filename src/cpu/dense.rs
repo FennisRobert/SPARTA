@@ -443,6 +443,37 @@ pub(super) fn gemm_nt(
     }
 }
 
+/// `c[m][n] -= a[m][k] * b[k][n]`, all row-major with the given row strides.
+///
+/// `lda`, `ldb` and `ldc` are element strides between rows and must be at
+/// least `k`, `n` and `n`. The three operands must be distinct.
+#[cfg(any(sparta_accelerate, sparta_blas))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn gemm_nn(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[C],
+    lda: usize,
+    b: &[C],
+    ldb: usize,
+    c: &mut [C],
+    ldc: usize,
+) {
+    if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+    assert!(lda >= k && ldb >= n && ldc >= n, "row strides too short");
+    assert!(a.len() >= (m - 1) * lda + k, "left operand out of bounds");
+    assert!(b.len() >= (k - 1) * ldb + n, "right operand out of bounds");
+    assert!(c.len() >= (m - 1) * ldc + n, "target out of bounds");
+    let (minus, one) = (C::from_re(-1.0), C::from_re(1.0));
+    // SAFETY: as for `gemm_nt`.
+    unsafe {
+        gemm(ffi::NO_TRANS, (m, n, k), minus, a.as_ptr(), lda, b.as_ptr(), ldb, one, c.as_mut_ptr(), ldc);
+    }
+}
+
 /// `c[m][n] -= a[m][k] * b[n][k]^T` with the left operand and the target inside
 /// one row-major buffer: `a_at` and `c_at` are element offsets with row stride
 /// `ld`. The left operand spans columns `0..k` of its rows and the target
@@ -608,6 +639,46 @@ pub(super) fn gemm_nn_front(m: usize, n: usize, k: usize, front: &mut [C], a_at:
     }
 }
 
+/// [`gemm_nn_front`] spread over the Rayon pool in blocks of target rows,
+/// each one single-threaded product. The calling thread must have
+/// [`Threading::Caller`] set, as every pool thread does.
+#[cfg(any(sparta_accelerate, sparta_blas))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn gemm_nn_front_spread(m: usize, n: usize, k: usize, front: &mut [C], a_at: usize, b_at: usize, c_at: usize, ld: usize) {
+    use rayon::prelude::*;
+    if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+    assert!(a_at + (m - 1) * ld + k <= front.len(), "left operand out of bounds");
+    assert!(b_at + (k - 1) * ld + n <= front.len(), "right operand out of bounds");
+    assert!(c_at + (m - 1) * ld + n <= front.len(), "target out of bounds");
+    let step = m.div_ceil(2 * rayon::current_num_threads()).max(64);
+    /// The front as a pointer the tasks can share; see the SAFETY note below.
+    #[derive(Clone, Copy)]
+    struct Base(*mut C);
+    // SAFETY: carries no rights of its own; the tasks write disjoint rows.
+    unsafe impl Send for Base {}
+    unsafe impl Sync for Base {}
+    impl Base {
+        /// Element `at` of the front, by method so tasks capture the wrapper.
+        fn at(self, at: usize) -> *mut C {
+            // SAFETY: every caller's offset lies inside `front`, asserted above.
+            unsafe { self.0.add(at) }
+        }
+    }
+    let base = Base(front.as_mut_ptr());
+    let (minus, one) = (C::from_re(-1.0), C::from_re(1.0));
+    (0..m.div_ceil(step)).into_par_iter().for_each(|block| {
+        let (first, rows) = (block * step, step.min(m - block * step));
+        // SAFETY: inside `front` as asserted above. The blocks partition the
+        // target rows, and the target overlaps neither operand, as for
+        // `gemm_nn_front`.
+        unsafe {
+            gemm(ffi::NO_TRANS, (rows, n, k), minus, base.at(a_at + first * ld), ld, base.at(b_at), ld, one, base.at(c_at + first * ld), ld);
+        }
+    });
+}
+
 /// LU with partial pivoting of the column-major `n` by `n` block `a`, leading
 /// dimension `lda`. Returns LAPACK's `info`: zero on success, `k > 0` when
 /// `U(k,k)` is exactly zero. `ipiv` receives `n` one-based interchanges.
@@ -760,6 +831,20 @@ mod unavailable {
         unreachable!("{NO}")
     }
     #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn gemm_nn(
+        _: usize,
+        _: usize,
+        _: usize,
+        _: &[C],
+        _: usize,
+        _: &[C],
+        _: usize,
+        _: &mut [C],
+        _: usize,
+    ) {
+        unreachable!("{NO}")
+    }
+    #[allow(clippy::too_many_arguments)]
     pub(in super::super) fn gemm_nt_front(
         _: usize,
         _: usize,
@@ -805,12 +890,16 @@ mod unavailable {
     pub(in super::super) fn gemm_nn_front(_: usize, _: usize, _: usize, _: &mut [C], _: usize, _: usize, _: usize, _: usize) {
         unreachable!("{NO}")
     }
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn gemm_nn_front_spread(_: usize, _: usize, _: usize, _: &mut [C], _: usize, _: usize, _: usize, _: usize) {
+        unreachable!("{NO}")
+    }
     pub(in super::super) fn getrf(_: usize, _: &mut [C], _: usize, _: &mut [i32]) -> i32 {
         unreachable!("{NO}")
     }
 }
 #[cfg(not(any(sparta_accelerate, sparta_blas)))]
 pub(super) use unavailable::{
-    gemm_nn_front, gemm_nt, gemm_nt_front, getrf, sytrf, sytrf_workspace, trsm,
+    gemm_nn, gemm_nn_front, gemm_nn_front_spread, gemm_nt, gemm_nt_front, getrf, sytrf, sytrf_workspace, trsm,
     trsm_front, trsm_front_spread,
 };

@@ -4,8 +4,9 @@
 //! Two decisions, both made here so nothing downstream repeats them:
 //!
 //! - **GPU backend.** `--features metal` or `--features vulkan` pick one
-//!   explicitly; with neither, the target decides: Metal on Apple Silicon,
-//!   Vulkan on Windows and Linux, nothing elsewhere. The choice is published
+//!   explicitly; with neither, the default `gpu` feature lets the target
+//!   decide: Metal on Apple Silicon, Vulkan on Windows and Linux, nothing
+//!   elsewhere. Without `gpu` either, no backend is compiled. The choice is published
 //!   as `cfg(sparta_metal)` / `cfg(sparta_vulkan)`, which `src/gpu/mod.rs`
 //!   reads, and mirrored by `Device::COMPILED`. A build for a target that
 //!   supports nothing compiles the symbolic analysis and the CPU backend, and
@@ -85,14 +86,16 @@ enum Backend {
     None,
 }
 
-/// Picks the GPU backend from the features, or from the target when none is given.
+/// Picks the GPU backend from the features, or from the target when only the
+/// default `gpu` feature is given.
 ///
 /// Asking for both is a configuration mistake rather than a merge of the two,
 /// because exactly one set of kernels is compiled in.
 fn backend(os: &str, arch: &str) -> Backend {
-    let (metal, vulkan) = (
+    let (metal, vulkan, gpu) = (
         env::var_os("CARGO_FEATURE_METAL").is_some(),
         env::var_os("CARGO_FEATURE_VULKAN").is_some(),
+        env::var_os("CARGO_FEATURE_GPU").is_some(),
     );
     match (metal, vulkan) {
         (true, true) => panic!(
@@ -105,6 +108,8 @@ fn backend(os: &str, arch: &str) -> Backend {
         // Apple Silicon is the only target Metal runs on. Windows and Linux
         // get Vulkan: the loader is opened at run time, not linked, so a
         // machine without a Vulkan driver still runs and reports no device.
+        // `default-features = false`: the CPU backend only, on any target.
+        (false, false) if !gpu => Backend::None,
         (false, false) if os == "macos" && arch == "aarch64" => Backend::Metal,
         (false, false) if os == "windows" || os == "linux" => Backend::Vulkan,
         (false, false) => Backend::None,

@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-/// One Rayon thread's reusable state for the length of a factorization.
+/// Reusable state for one front at a time; see `Solver::workers`.
 #[derive(Default)]
 struct Worker {
     scratch: Scratch,
@@ -59,8 +59,16 @@ pub(crate) struct Solver {
     subdiag: Vec<C>,
     perms: Vec<usize>,
     two: Vec<bool>,
-    workers: Vec<Mutex<Worker>>,
+    /// Reusable per-front state, taken by whichever thread starts a front and
+    /// returned when it finishes. Not one per thread: a thread waiting inside
+    /// a front that splits its work may start another front of the level.
+    workers: Mutex<Vec<Worker>>,
     schedule: Vec<Level>,
+    /// Whether each node's `nc` L columns are stored row-major, `nr` rows of
+    /// `nc` values, rather than column-major. Row-major is what the CPU solve
+    /// reads and what a front's rows copy into without a transpose; the hybrid
+    /// hands its factors to the GPU, which reads them column-major.
+    rowmajor: bool,
     valid: bool,
     destroyed: bool,
     pub(super) seconds: f64,
@@ -76,13 +84,14 @@ impl Solver {
         }
         let threads = rayon::current_num_threads().max(1);
         Ok(Self {
-            workers: (0..threads).map(|_| Mutex::new(Worker::default())).collect(),
-            schedule: level::schedule(&plan, threads),
-            fronts: allocate(plan.elements)?,
-            factors: allocate(plan.factor_elements)?,
-            upper: allocate(plan.upper_elements)?,
-            diagonal: allocate(plan.n)?,
-            subdiag: allocate(plan.n)?,
+            workers: Mutex::new((0..threads).map(|_| Worker::default()).collect()),
+            schedule: level::schedule(&plan),
+            rowmajor: true,
+            fronts: allocate_lazy(plan.elements)?,
+            factors: allocate_lazy(plan.factor_elements)?,
+            upper: allocate_lazy(plan.upper_elements)?,
+            diagonal: allocate_lazy(plan.n)?,
+            subdiag: allocate_lazy(plan.n)?,
             perms: vec![0; plan.n],
             two: vec![false; plan.n],
             plan,
@@ -104,8 +113,9 @@ impl Solver {
         plan.config.check().map_err(Error::Invalid)?;
         let threads = rayon::current_num_threads().max(1);
         Ok(Self {
-            workers: (0..threads).map(|_| Mutex::new(Worker::default())).collect(),
-            schedule: level::schedule(&plan, threads),
+            workers: Mutex::new((0..threads).map(|_| Worker::default()).collect()),
+            schedule: level::schedule(&plan),
+            rowmajor: false,
             fronts: allocate_lazy(plan.elements)?,
             factors: allocate_lazy(plan.factor_elements)?,
             upper: allocate_lazy(plan.upper_elements)?,
@@ -126,11 +136,10 @@ impl Solver {
     /// restriction. They must be closed under taking children, so that no
     /// kept front waits on one left out.
     pub(crate) fn restrict(&mut self, keep: &[bool]) {
-        let threads = rayon::current_num_threads().max(1);
-        self.schedule = level::schedule(&self.plan, threads);
+        self.schedule = level::schedule(&self.plan);
         for level in &mut self.schedule {
             level.nodes.retain(|&id| keep[id as usize]);
-            level.spread &= level.nodes.len() >= threads;
+            level.spread &= level.nodes.len() >= 2;
         }
         self.schedule.retain(|level| !level.nodes.is_empty());
     }
@@ -187,9 +196,10 @@ impl Solver {
             workers,
             schedule,
             perturbed,
+            rowmajor,
             ..
         } = self;
-        let shared = Shared::new(fronts, factors, upper, diagonal, subdiag, perms, two);
+        let shared = Shared::new(fronts, factors, upper, diagonal, subdiag, perms, two, *rowmajor);
         // Rayon owns the parallelism: fronts across threads in wide levels, and
         // row blocks within one front in narrow ones. Accelerate threads only
         // inside `zsytrf`, which sets and clears this itself. The setting is
@@ -198,30 +208,32 @@ impl Solver {
         rayon::broadcast(|_| {
             dense::set_threading(Threading::Caller);
         });
-        for worker in workers.iter_mut() {
-            worker.get_mut().unwrap().report = Report::default();
+        let workers: &Mutex<Vec<Worker>> = workers;
+        for worker in workers.lock().unwrap().iter_mut() {
+            worker.report = Report::default();
         }
+        let take = || workers.lock().unwrap().pop().unwrap_or_default();
+        let give = |worker: Worker| workers.lock().unwrap().push(worker);
         let bumped = AtomicU64::new(0);
         let dump = std::env::var_os("SPARTA_CPU_DUMP").is_some();
         let result = schedule.iter().enumerate().try_for_each(|(depth, level)| {
             let t0 = std::time::Instant::now();
             let clock = Report::clock();
             if !level.spread {
-                let worker = workers[0].get_mut().unwrap();
+                let mut worker = take();
                 for &id in &level.nodes {
                     // SAFETY: the loop is the only thing touching the storage,
                     // and every node appears once.
-                    let count =
-                        unsafe {
-                            shared.node(
-                                plan,
-                                id,
-                                values,
-                                true,
-                                &mut worker.scratch,
-                                &mut worker.report,
-                            )
-                        }?;
+                    let count = unsafe {
+                        shared.node(plan, id, values, true, true, &mut worker.scratch, &mut worker.report)
+                    };
+                    let count = match count {
+                        Ok(count) => count,
+                        Err(e) => {
+                            give(worker);
+                            return Err(e);
+                        }
+                    };
                     bumped.fetch_add(count, Ordering::Relaxed);
                 }
                 // SAFETY: every node of this level has returned above.
@@ -229,6 +241,7 @@ impl Solver {
                     unsafe { shared.compact(plan, id) };
                 }
                 worker.report.level(false, clock);
+                give(worker);
                 if dump {
                     let work: f64 = level.nodes.iter().map(|&i| {
                         let nd = plan.nodes[i as usize];
@@ -241,16 +254,21 @@ impl Solver {
                 }
                 return Ok(());
             }
+            // A front with more than a thread's share of the level's work
+            // would otherwise be the level's long pole on one thread; it splits
+            // its own work instead, which the threads done with the small
+            // fronts steal.
+            let share = level.nodes.iter().map(|&id| work(plan, id)).sum::<f64>()
+                / rayon::current_num_threads() as f64;
             level.nodes.par_iter().try_for_each(|&id| {
-                // Uncontended by construction: one worker per pool thread.
-                let mut worker = workers[rayon::current_thread_index().unwrap_or(0)]
-                    .lock()
-                    .unwrap();
-                let Worker { scratch, report } = &mut *worker;
+                let mut worker = take();
+                let Worker { scratch, report } = &mut worker;
+                let split = work(plan, id) > share;
                 // SAFETY: every node in `level` is distinct and the iterator
                 // joins before the next level starts, which is exactly the
                 // contract `Shared::node` documents.
-                let count = unsafe { shared.node(plan, id, values, false, scratch, report) };
+                let count = unsafe { shared.node(plan, id, values, split, false, scratch, report) };
+                give(worker);
                 bumped.fetch_add(count?, Ordering::Relaxed);
                 Ok(())
             })?;
@@ -260,7 +278,12 @@ impl Solver {
                 .nodes
                 .par_iter()
                 .for_each(|&id| unsafe { shared.compact(plan, id) });
-            workers[0].lock().unwrap().report.level(true, clock);
+            let mut pool = workers.lock().unwrap();
+            if pool.is_empty() {
+                pool.push(Worker::default());
+            }
+            pool[0].report.level(true, clock);
+            drop(pool);
             if dump {
                 let work: f64 = level.nodes.iter().map(|&i| {
                     let nd = plan.nodes[i as usize];
@@ -280,8 +303,8 @@ impl Solver {
             dense::set_threading(Threading::Machine);
         });
         *perturbed = bumped.load(Ordering::Relaxed);
-        for worker in workers.iter_mut() {
-            report.merge(&worker.get_mut().unwrap().report);
+        for worker in workers.lock().unwrap().iter() {
+            report.merge(&worker.report);
         }
         result
     }
@@ -301,7 +324,7 @@ impl Solver {
         self.subdiag = Vec::new();
         self.perms = Vec::new();
         self.two = Vec::new();
-        self.workers = Vec::new();
+        self.workers = Mutex::new(Vec::new());
         self.schedule = Vec::new();
         self.plan.release();
         self.valid = false;
@@ -355,18 +378,22 @@ impl Solver {
 pub(crate) const FLOPS: f64 = if <C as Scalar>::KIND.is_complex() { 8.0 } else { 2.0 };
 
 /// Allocate `count` elements, reporting capacity failures as solver errors.
-fn allocate(count: usize) -> Result<Vec<C>> {
-    let mut data = Vec::new();
-    data.try_reserve_exact(count)
-        .map_err(|e| Error::Unsupported(format!("CPU allocation: {e}")))?;
-    data.resize(count, C::from_re(0.0));
-    Ok(data)
+/// Relative arithmetic of node `id`: its leading block, off-diagonal solve and
+/// Schur product, in multiply-adds.
+fn work(plan: &Analysis, id: u32) -> f64 {
+    let node = plan.nodes[id as usize];
+    let (t, n) = ((node.nr - node.nc) as f64, node.nc as f64);
+    t * t * n + t * n * n / 2.0 + n * n * n / 3.0
 }
 
-#[allow(dead_code)]
 /// `count` zeros from the allocator's zeroed path. Large zeroed allocations
-/// come back as fresh pages, which the kernel commits only when first written,
-/// unlike [`allocate`], which writes every element.
+/// come back as fresh pages, which the kernel commits only when first written.
+///
+/// Every solver allocates this way. Nothing reads a zero it did not write --
+/// each front clears the part of its slot it uses, and every factor element
+/// is stored before a solve reads it -- so writing the zeros up front was
+/// pure cost: several GiB on one thread, inside the first factorization,
+/// where the pages are now committed by the parallel fronts that touch them.
 fn allocate_lazy(count: usize) -> Result<Vec<C>> {
     if count == 0 {
         return Ok(Vec::new());

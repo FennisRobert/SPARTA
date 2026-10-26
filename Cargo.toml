@@ -1,6 +1,6 @@
 [package]
 name = "sparta-solver"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Robert Fennis", "Milan Rother"]
 license = "AGPL-3.0-or-later"
@@ -11,10 +11,13 @@ members = ["devtools/matgen", "crates/scalpel", "crates/sparta-capi"]
 exclude = ["python"]
 
 [features]
-# One GPU backend per build. With neither, `build.rs` picks from the target:
-# Apple Silicon gets Metal, Windows and Linux get Vulkan, anything else gets no
-# device and the CPU backend.
-default = []
+# One GPU backend per build. With neither `metal` nor `vulkan`, `gpu` lets
+# `build.rs` pick from the target: Apple Silicon gets Metal, Windows and Linux
+# get Vulkan, anything else gets no device. `default-features = false` without
+# either backend builds the analysis and the CPU backend only.
+default = ["gpu"]
+## Compile the target's GPU backend, if it has one.
+gpu = []
 ## Apple Metal on Apple Silicon.
 metal = []
 ## Vulkan compute for AMD and NVIDIA, the default on Windows and Linux. Needs a

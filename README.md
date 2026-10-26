@@ -243,7 +243,7 @@ pip downloads its build helper (maturin), NumPy and SciPy from PyPI.
 no compiler, no source code needed.
 
 ```sh
-pip install sparta_solver-0.2.0-cp39-abi3-macosx_11_0_arm64.whl
+pip install sparta_solver-0.2.1-cp39-abi3-macosx_11_0_arm64.whl
 ```
 
 One wheel works for every Python from 3.9 up, on Apple Silicon only. To make a
@@ -1059,11 +1059,23 @@ decides:
 | `metal` | Apple Metal, Apple Silicon | Implemented. The default on Apple Silicon |
 | `vulkan` | Vulkan compute, AMD and NVIDIA | Alpha. The default on Windows and Linux. See [Vulkan](#vulkan) below |
 | neither, on any other target (Intel Mac) | none | Analysis and the CPU backend only |
+| `--no-default-features`, neither named | none | Analysis and the CPU backend only, on any target |
 
 ```sh
-cargo build --release                     # the target decides
-cargo build --release --features vulkan   # name one explicitly
+cargo build --release                         # the target decides
+cargo build --release --features vulkan       # name one explicitly
+cargo build --release --no-default-features   # CPU backend only
 ```
+
+The target's choice comes from the default `gpu` feature. Turning default
+features off without naming a backend leaves out the GPU code, its kernels
+and the Metal framework links; a Rust crate that uses only the CPU path
+depends on `sparta-solver` with `default-features = false`. The Python
+extension and the C library pass the same switch on:
+`maturin build --release --manifest-path python/Cargo.toml --no-default-features`
+builds a CPU-only wheel. Such a build has no device, so every solver needs
+`force_cpu` (`Config::force_cpu` in Rust, `force_cpu=True` in Python,
+`config.force_cpu` in C).
 
 `F.diagnostics()["backend"]` in Python and `sparta_device()` in C report which
 backend a binary carries.
