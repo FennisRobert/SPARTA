@@ -6,7 +6,7 @@
 #   make package    assemble a redistributable SDK under dist/
 #   make clean      remove the build output
 
-VERSION  := 0.2.1
+VERSION  := 0.2.2
 # DIST, TARGET and CARGO_FLAGS may be overridden.
 DIST     ?= dist/sparta-$(VERSION)-macos-arm64
 TARGET   ?= $(abspath ../../target/release)

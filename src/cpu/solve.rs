@@ -128,6 +128,7 @@ impl Solver {
         // one per task, on the calling thread.
         let blas = gemm(r, usize::MAX);
         if blas {
+            dense::set_global_threading(Threading::Caller);
             rayon::broadcast(|_| dense::set_threading(Threading::Caller));
         }
         // SAFETY: each sweep keeps to the per-level discipline `Rows` states.
@@ -139,6 +140,7 @@ impl Solver {
             self.backward(rows, r);
         }
         if blas {
+            dense::set_global_threading(Threading::Machine);
             rayon::broadcast(|_| dense::set_threading(Threading::Machine));
         }
         let mut out = vec![C::from_re(0.0); b.len()];

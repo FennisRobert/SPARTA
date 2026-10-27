@@ -128,7 +128,7 @@ classdef SpartaSolver < handle
 
     methods (Static)
         function v = version()
-            %VERSION  The SPARTA library version, such as '0.2.1'.
+            %VERSION  The SPARTA library version, such as '0.2.2'.
             v = sparta_mex('version');
         end
 

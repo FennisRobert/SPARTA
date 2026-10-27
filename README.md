@@ -243,7 +243,7 @@ pip downloads its build helper (maturin), NumPy and SciPy from PyPI.
 no compiler, no source code needed.
 
 ```sh
-pip install sparta_solver-0.2.1-cp39-abi3-macosx_11_0_arm64.whl
+pip install sparta_solver-0.2.2-cp39-abi3-macosx_11_0_arm64.whl
 ```
 
 One wheel works for every Python from 3.9 up, on Apple Silicon only. To make a

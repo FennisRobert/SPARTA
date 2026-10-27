@@ -16,7 +16,7 @@ mod status;
 
 use std::ffi::{c_char, CStr};
 
-/// Returns the library version as text, for example "0.2.1".
+/// Returns the library version as text, for example "0.2.2".
 #[no_mangle]
 pub extern "C" fn sparta_version() -> *const c_char {
     const VERSION: &CStr = match CStr::from_bytes_with_nul(concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes()) {

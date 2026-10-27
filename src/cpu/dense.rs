@@ -40,6 +40,40 @@ pub(super) enum Threading {
     Caller,
 }
 
+/// A BLAS vendor whose thread control SPARTA knows how to call.
+#[cfg(any(sparta_accelerate, sparta_blas))]
+#[derive(Clone, Copy)]
+enum Vendor {
+    Accelerate,
+    Mkl,
+    OpenBlas,
+}
+
+/// Whether SPARTA's own BLAS calls can go to `vendor`, judged from the library
+/// name `build.rs` linked.
+///
+/// The thread controls are looked up across every module in the process, and
+/// another one may carry a different vendor's: a Python process that loaded
+/// MKL for PARDISO exports `MKL_Set_Num_Threads_Local` while SPARTA calls
+/// OpenBLAS. Trusting it would spread levels across Rayon while OpenBLAS still
+/// threads every call. A library whose name names none of the three may be any
+/// of them, so every control is tried for it.
+///
+/// - `vendor`: the library whose control is about to be looked up.
+#[cfg(any(sparta_accelerate, sparta_blas))]
+fn linked(vendor: Vendor) -> bool {
+    let name = env!("SPARTA_DENSE_LIBRARY").to_ascii_lowercase();
+    let named = |part: &str| name.contains(part);
+    if !(named("accelerate") || named("mkl") || named("openblas")) {
+        return true;
+    }
+    match vendor {
+        Vendor::Accelerate => named("accelerate"),
+        Vendor::Mkl => named("mkl"),
+        Vendor::OpenBlas => named("openblas"),
+    }
+}
+
 /// Choose the BLAS threading model for this thread, reporting whether a
 /// per-thread control exists at all.
 ///
@@ -54,9 +88,10 @@ pub(super) enum Threading {
 ///
 /// OpenBLAS deliberately is not: `openblas_set_num_threads` is process-wide,
 /// so calling it from a Rayon worker would change the setting under every
-/// other worker. When this returns false -- OpenBLAS, or macOS 13 and 14 --
-/// `level::schedule` keeps wide fronts off the spread path instead, which
-/// costs parallelism but never correctness.
+/// other worker. It is set between levels instead, by [`set_global_threading`].
+/// When neither control exists -- macOS 13 and 14, or a BLAS that is neither --
+/// `level::schedule` keeps wide fronts off the spread path, which costs
+/// parallelism but never correctness.
 #[cfg(any(sparta_accelerate, sparta_blas))]
 pub(super) fn set_threading(threading: Threading) -> bool {
     use std::sync::OnceLock;
@@ -83,15 +118,17 @@ pub(super) fn set_threading(threading: Threading) -> bool {
         trsm(Side::Right, Tri::UnitUpper, 1, 1, &[C::from_re(1.0)], 1, &mut unit, 1);
         let mut work = vec![C::from_re(0.0); sytrf_workspace(1).max(1)];
         sytrf(1, &mut unit, 1, &mut [0], &mut work);
-        let find = ffi::loaded_symbol;
-        let accelerate = find(b"BLASSetThreading\0");
+        let find = |vendor: Vendor, name: &[u8]| {
+            if linked(vendor) { ffi::loaded_symbol(name) } else { std::ptr::null_mut() }
+        };
+        let accelerate = find(Vendor::Accelerate, b"BLASSetThreading\0");
         if !accelerate.is_null() {
             // SAFETY: the resolved symbol has Accelerate's documented signature.
             return Some(Control::Accelerate(unsafe {
                 std::mem::transmute::<*mut (), unsafe extern "C" fn(u32) -> i32>(accelerate)
             }));
         }
-        let mkl = find(b"MKL_Set_Num_Threads_Local\0");
+        let mkl = find(Vendor::Mkl, b"MKL_Set_Num_Threads_Local\0");
         (!mkl.is_null()).then(|| {
             // SAFETY: the resolved symbol has MKL's documented signature.
             Control::Mkl(unsafe {
@@ -123,6 +160,69 @@ pub(super) fn set_threading(threading: Threading) -> bool {
 
 #[cfg(not(any(sparta_accelerate, sparta_blas)))]
 pub(super) fn set_threading(_: Threading) -> bool {
+    false
+}
+
+/// Choose the BLAS threading model for the whole process, for a library whose
+/// only control is global, reporting whether it has one.
+///
+/// This is OpenBLAS's `openblas_set_num_threads`. `Machine` is the size of
+/// SPARTA's Rayon pool, so `RAYON_NUM_THREADS` bounds BLAS as well, and an
+/// `OPENBLAS_NUM_THREADS` set for some other library in the process (EMerge
+/// sets it to 1 for numpy) does not leave the root front on one thread;
+/// `Caller` is one thread. Because it changes the setting under every thread
+/// at once, it may only be called while no other thread is inside BLAS:
+/// `Solver::factor_all` calls it between levels, after
+/// the previous level has joined, and the solve calls it before and after its
+/// sweeps. A library that has a per-thread control ([`set_threading`]) is left
+/// alone, and this reports false for it.
+///
+/// - `threading`: `Machine` for one front that should own every core, `Caller`
+///   for a level of fronts that Rayon spreads across the cores itself.
+#[cfg(any(sparta_accelerate, sparta_blas))]
+pub(super) fn set_global_threading(threading: Threading) -> bool {
+    use std::sync::OnceLock;
+
+    /// `openblas_set_num_threads` and the size of the Rayon pool.
+    #[derive(Clone, Copy)]
+    struct Control {
+        set: unsafe extern "C" fn(i32),
+        machine: i32,
+    }
+
+    static ENTRY: OnceLock<Option<Control>> = OnceLock::new();
+    let entry = ENTRY.get_or_init(|| {
+        // `set_threading` also resolves the per-thread controls and makes the
+        // first call of each routine on one thread; a library with a per-thread
+        // control does not need this one.
+        if set_threading(Threading::Machine) || !linked(Vendor::OpenBlas) {
+            return None;
+        }
+        let set = ffi::loaded_symbol(b"openblas_set_num_threads\0");
+        if set.is_null() {
+            return None;
+        }
+        // SAFETY: the symbol has OpenBLAS's documented signature.
+        Some(Control {
+            set: unsafe { std::mem::transmute::<*mut (), unsafe extern "C" fn(i32)>(set) },
+            machine: rayon::current_num_threads().max(1) as i32,
+        })
+    });
+    match entry {
+        // SAFETY: the symbol resolved above, called with a positive count.
+        Some(control) => unsafe {
+            (control.set)(match threading {
+                Threading::Machine => control.machine,
+                Threading::Caller => 1,
+            });
+            true
+        },
+        None => false,
+    }
+}
+
+#[cfg(not(any(sparta_accelerate, sparta_blas)))]
+pub(super) fn set_global_threading(_: Threading) -> bool {
     false
 }
 

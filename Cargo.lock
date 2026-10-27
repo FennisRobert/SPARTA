@@ -183,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "sparta-capi"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "sparta-solver",
 ]
@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "sparta-solver"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ash",
  "num-complex",

@@ -217,6 +217,9 @@ impl Solver {
         let bumped = AtomicU64::new(0);
         let dump = std::env::var_os("SPARTA_CPU_DUMP").is_some();
         let result = schedule.iter().enumerate().try_for_each(|(depth, level)| {
+            // OpenBLAS's control is process-wide, so it is set here, where the
+            // previous level has joined and no thread is inside BLAS.
+            dense::set_global_threading(if level.spread { Threading::Caller } else { Threading::Machine });
             let t0 = std::time::Instant::now();
             let clock = Report::clock();
             if !level.spread {
@@ -298,6 +301,7 @@ impl Solver {
         });
         // Leave the pool as it was found, for whatever else in the process
         // calls Accelerate.
+        dense::set_global_threading(Threading::Machine);
         dense::set_threading(Threading::Machine);
         rayon::broadcast(|_| {
             dense::set_threading(Threading::Machine);

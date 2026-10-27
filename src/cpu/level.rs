@@ -345,11 +345,14 @@ pub(super) struct Level {
 /// whole machine. Widest first, so Rayon's stealing does not end a level
 /// waiting on one late large front.
 ///
-/// Without `BLASSetThreading` -- macOS 13 and 14 -- a spread level would have
-/// every front threading against every other, so only levels whose fronts are
-/// too narrow to reach Accelerate at all are spread there.
+/// OpenBLAS has only a process-wide control, which `Solver::factor_all` sets
+/// between levels: one thread for a spread level, the machine for a lone
+/// front. Without either control -- macOS 13 and 14 -- a spread level would
+/// have every front threading against every other, so only levels whose
+/// fronts are too narrow to reach Accelerate at all are spread there.
 pub(super) fn schedule(plan: &Analysis) -> Vec<Level> {
-    let controllable = dense::set_threading(Threading::Machine);
+    let controllable =
+        dense::set_threading(Threading::Machine) || dense::set_global_threading(Threading::Machine);
     plan.levels
         .iter()
         .map(|level| {

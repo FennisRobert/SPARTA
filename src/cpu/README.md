@@ -103,11 +103,22 @@ level of one front, the root's, runs that front alone. Rayon owns the parallelis
 single-threaded per worker, except inside `zsytrf`, whose serial diagonal chain
 it splits better from the inside. That needs a per-thread BLAS thread count,
 which Accelerate (`BLASSetThreading`) and MKL (`MKL_Set_Num_Threads_Local`)
-have and OpenBLAS does not: `openblas_set_num_threads` is process-wide, so
-`dense::set_threading` refuses it and `level::schedule` keeps wide fronts off
-the spread path instead. An x86 build against MKL should therefore beat the
-same build against OpenBLAS for reasons unrelated to their GEMM kernels;
-measure both before concluding anything about either.
+have and OpenBLAS does not. OpenBLAS's `openblas_set_num_threads` is
+process-wide, so `dense::set_global_threading` sets it between levels instead,
+when no thread is inside BLAS: one thread for a spread level, the size of the
+Rayon pool for a lone front, so `RAYON_NUM_THREADS` bounds OpenBLAS too and an
+`OPENBLAS_NUM_THREADS` meant for another library in the process is overridden.
+Its `?sytrf` therefore runs on one thread inside a spread level. The per-thread
+controls are only taken from the vendor `SPARTA_BLAS_LIB` names, so an MKL
+loaded by something else in the process (PARDISO, say) is not mistaken for the
+library SPARTA calls.
+
+On a Ryzen 5 3600XT (Zen 2, 6 cores, Windows) with an 84k complex-symmetric
+EMerge patch antenna system, complex128 LDLᵀ took 1.52 s with every level run
+one front at a time, 0.55 s with levels spread under OpenBLAS (conda), and
+0.65–0.76 s against MKL (conda `mkl_rt`). Compiling for `x86-64-v3` (AVX2,
+FMA) and using 6 rather than 12 Rayon threads each made no measurable
+difference.
 
 Factor columns are stored row-major per node (`nr` rows of `nc` values), the
 layout a front's rows copy into without a transpose; wide LDLᵀ fronts write

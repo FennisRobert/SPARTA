@@ -121,7 +121,7 @@ end
 """
     version() -> String
 
-The SPARTA library version, such as `"0.2.1"`.
+The SPARTA library version, such as `"0.2.2"`.
 """
 version() = unsafe_string(ccall(sym(:sparta_version), Cstring, ()))
 
