@@ -122,9 +122,15 @@ impl Front<'_> {
         // library. Accelerate (macOS 26) runs `?sytrf` and `?getrf` on one
         // thread either way, legacy and `$NEWLAPACK` alike; the setting is
         // for libraries that do thread them.
-        dense::set_threading(Threading::Machine);
+        // Only a front alone on an unbounded solver: one sharing its level would
+        // have the library thread against the other fronts' workers.
+        if self.alone {
+            dense::set_threading(Threading::Machine);
+        }
         let info = dense::sytrf(n, leading, n, ipiv, &mut s.work);
-        dense::set_threading(Threading::Caller);
+        if self.alone {
+            dense::set_threading(Threading::Caller);
+        }
         // Nothing outside `leading` and `ipiv` has been written yet, so a
         // refusal here leaves the front exactly as it was assembled.
         if info != 0 {

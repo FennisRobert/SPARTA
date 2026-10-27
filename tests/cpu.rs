@@ -96,6 +96,44 @@ fn dense_pivoting_and_multiple_rhs() {
 }
 
 #[test]
+/// A solver on a pool of its own, of one thread or several, solves exactly as
+/// one on the global pool does, and an impossible count is refused.
+fn thread_counts_agree() {
+    let side = 16;
+    let n = side * side;
+    for kind in [Kind::Ldlt, Kind::Lu] {
+        let mut a = vec![C::new(0.0, 0.0); n * n];
+        for i in 0..n {
+            a[i * n + i] = C::new(5.0, 0.5);
+            for j in [i + 1, i + side] {
+                if j < n && (j != i + 1 || i / side == j / side) {
+                    a[i * n + j] = C::new(-0.8, 0.1);
+                    a[j * n + i] = if kind == Kind::Lu { C::new(-0.3, 0.2) } else { a[i * n + j] };
+                }
+            }
+        }
+        let expected: Vec<_> = (0..2 * n).map(|i| C::new((i as f64).sin(), 0.3)).collect();
+        let b = product(&a, n, &expected);
+        for threads in [0, 1, 3] {
+            let config = Config {
+                force_cpu: true,
+                threads,
+                nemin: 2,
+                small_front_rows: 1,
+                cpu_blas_min_rows: 1,
+                ..Config::default()
+            };
+            let (p, values) = plan(&a, n, kind, &config, false);
+            let mut s = Solver::new(p).unwrap();
+            s.factor_c128(&values).unwrap();
+            close(&s.solve_many_c128(&b, 2).unwrap(), &expected, 1e-12);
+        }
+    }
+    let config = Config { force_cpu: true, threads: 5000, ..Config::default() };
+    assert!(Analysis::ldlt(1, &[0, 1], &[0], &config).is_err());
+}
+
+#[test]
 /// Child Schur assembly, workspace reuse and local/global permutations agree on sparse grids.
 fn sparse_multilevel_refactor() {
     let side = 12;

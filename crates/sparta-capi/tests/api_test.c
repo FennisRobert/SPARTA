@@ -194,6 +194,13 @@ static void check_analyze_rejects(void) {
                   SPARTA_ERROR_INVALID);
 
     sparta_config_default(&config);
+    config.threads = 5000;
+    expect_status("more threads than any machine has",
+                  sparta_analyze(SMALL, a.col_ptr, a.row_index, SPARTA_SYMMETRIC, &config, &plan),
+                  SPARTA_ERROR_INVALID);
+    expect("the message names the setting", strstr(sparta_last_error(), "threads") != NULL);
+
+    sparta_config_default(&config);
     config.struct_size = sizeof config + 8;
     expect_status("a config from a newer header than this library",
                   sparta_analyze(SMALL, a.col_ptr, a.row_index, SPARTA_SYMMETRIC, &config, &plan),
@@ -294,10 +301,11 @@ static void check_solve(void) {
 
     sparta_solver_free(solver);
 
-    /* The same system with the CPU taking part of the work. */
+    /* The same system with the CPU taking part of the work, on two threads. */
     sparta_config config;
     sparta_config_default(&config);
     config.hybrid_cpu = 0.3;
+    config.threads = 2;
     sparta_analyze(SMALL, a.col_ptr, a.row_index, SPARTA_SYMMETRIC, &config, &plan);
     expect_status("a hybrid solver is created", sparta_solver_create(&plan, &solver), SPARTA_OK);
     expect_status("it factors", sparta_factor(solver, (const sparta_complex *)a.values), SPARTA_OK);

@@ -43,6 +43,13 @@ class Config:
         single front is spread across threads.
     cpu_blas_min_rows : int
         Minimum trailing rows before CPU updates use Accelerate.
+    threads : int
+        CPU threads for SPARTA's own work: the analysis, CPU factorization and
+        solves, and the hybrid's CPU share. 0 uses the process-wide pool, which
+        RAYON_NUM_THREADS sizes; a positive count, up to 4096, gives the solver
+        a pool of its own and keeps Accelerate from threading past it. The
+        SPARTA_NUM_THREADS environment variable, when set to a positive count,
+        overrides this.
     ordering : str
         Nested-dissection backend; 'scalpel' is the only one.
     max_front : int or None
@@ -97,6 +104,7 @@ class Config:
     cpu_panel: int
     cpu_block_rows: int
     cpu_blas_min_rows: int
+    threads: int
 
     @classmethod
     def defaults(cls) -> Config:

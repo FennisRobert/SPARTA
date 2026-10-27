@@ -45,10 +45,15 @@ impl Front<'_> {
                 leading[j * n + i] = self.a[i * m + j];
             }
         }
-        // As for `sytrf` in `blocked.rs`: left to the library to thread.
-        dense::set_threading(Threading::Machine);
+        // As for `sytrf` in `blocked.rs`: left to the library to thread, when
+        // the front is alone on an unbounded solver.
+        if self.alone {
+            dense::set_threading(Threading::Machine);
+        }
         let info = dense::getrf(n, leading, n, ipiv);
-        dense::set_threading(Threading::Caller);
+        if self.alone {
+            dense::set_threading(Threading::Caller);
+        }
         // Nothing outside `leading` and `ipiv` has been written yet.
         if info != 0 {
             return Ok(false);

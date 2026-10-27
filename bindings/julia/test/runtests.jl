@@ -49,6 +49,13 @@ residual(A, x, b) = norm(b - A * x) / norm(b)
         @test_throws ArgumentError SPARTA.Solver(A; hybrid = 1.5)
     end
 
+    @testset "threads" begin
+        T = SPARTA.Solver(A; hybrid = true, threads = 2)
+        @test residual(A, T \ (A * want), A * want) < 1e-6
+        close(T)
+        @test_throws SPARTA.SpartaError SPARTA.Solver(A; threads = 5000)
+    end
+
     @testset "real matrix" begin
         R = L - 0.3 * Id
         G = SPARTA.Solver(R)

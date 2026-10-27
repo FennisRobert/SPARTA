@@ -514,7 +514,7 @@ Rust and no compiler. One wheel works for every Python from 3.9 up, on Apple
 Silicon only:
 
 #code(```sh
-pip install sparta_solver-0.2.2-cp39-abi3-macosx_11_0_arm64.whl
+pip install sparta_solver-0.3.0-cp39-abi3-macosx_11_0_arm64.whl
 ```)
 
 == Checking the installation
@@ -1254,8 +1254,7 @@ faster factorization.
   [`separator_trials`], [1 or more], [Starting separators tried per split; the best is kept. More trials help on irregular meshes.],
 )
 
-`RAYON_NUM_THREADS` limits how many CPU threads SCALPEL and the rest of the
-analysis use.
+SCALPEL runs in parallel, on the threads `threads` chooses (below).
 
 *More SCALPEL options, Rust only.* `config.scalpel` has further fields for
 ordering experiments. Leave them at their defaults unless you are researching
@@ -1305,6 +1304,13 @@ These only matter with `force_cpu`.
   [`cpu_blas_min_rows`], [1 or more], [The smallest trailing block handed to BLAS. Raise it to avoid BLAS overhead on small blocks.],
 )
 
+`threads` applies whatever the backend.
+
+#table(columns: (auto, auto, 1fr),
+  head([Setting], [Values], [What it does]),
+  [`threads`], [0 to 4096], [CPU threads for SPARTA's own work: the analysis, the CPU factorization and solves, and the hybrid's CPU share. `0`, the default, uses the process-wide pool that `RAYON_NUM_THREADS` sizes. A positive count gives each analysis and solver a pool of its own, and keeps the dense library from threading past it. `SPARTA_NUM_THREADS` overrides it.],
+)
+
 == GPU settings (advanced)
 
 The defaults are measured on Apple Silicon. Leave these alone unless you are
@@ -1342,7 +1348,8 @@ setting.
   [`SPARTA_PANEL_THREADS`], [Overrides the default of `panel_threads`.],
   [`SPARTA_SOLVE_THREADS`], [Overrides the default of `solve_threads`.],
   [`SPARTA_LU_DIAG_THRESHOLD`], [Overrides the default of `lu_diag_threshold`.],
-  [`RAYON_NUM_THREADS`], [Limits the CPU threads used by the analysis. Set it before the program starts.],
+  [`RAYON_NUM_THREADS`], [Sizes the process-wide thread pool that SPARTA uses when `threads` is `0`. Set it before the program starts.],
+  [`SPARTA_NUM_THREADS`], [A positive count overrides `threads` wherever it was given, in every language.],
   [`SPARTA_PROFILE`], [`1` prints the time of each stage of analysis and factorization; `2` adds GPU dispatch detail.],
 )
 

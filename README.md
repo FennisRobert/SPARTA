@@ -243,7 +243,7 @@ pip downloads its build helper (maturin), NumPy and SciPy from PyPI.
 no compiler, no source code needed.
 
 ```sh
-pip install sparta_solver-0.2.2-cp39-abi3-macosx_11_0_arm64.whl
+pip install sparta_solver-0.3.0-cp39-abi3-macosx_11_0_arm64.whl
 ```
 
 One wheel works for every Python from 3.9 up, on Apple Silicon only. To make a
@@ -744,8 +744,7 @@ equivalent yet.
 | `fm_passes` | uint32 | 0 or more | Fiduccia–Mattheyses refinement passes. `0` is much faster and much worse. |
 | `separator_trials` | uint32 | 1 or more | Starting separators tried per split. The best one is kept. |
 
-SCALPEL runs in parallel. `RAYON_NUM_THREADS` limits how many CPU threads SCALPEL and the rest of the
-analysis use. The ordering decides how much fill-in the factors carry, and so most of
+SCALPEL runs in parallel, on the threads [`threads`](#cpu-threads) chooses. The ordering decides how much fill-in the factors carry, and so most of
 the cost, but a faster ordering does not always mean a faster factorization:
 measure both.
 
@@ -763,6 +762,26 @@ measure both.
 | `force_cpu` | bool | | Factor and solve on the CPU in double precision instead of on the GPU. Python and Rust only. See [Precision and accuracy](#precision-and-accuracy). |
 | `hybrid_cpu` | float64 | 0 to below 1 | Share of the factorization work the CPU does at the same time as the GPU does the rest. `0` is the GPU alone. It is a starting point: the share adapts after every factorization. Python also takes `hybrid=True` (30%). Ignored except on Metal. See [CPU and GPU together](#cpu-and-gpu-together-hybrid). |
 | `lu_diag_threshold` | float64 | 0 to 1 | LU only. `0` is strict partial pivoting. Above 0 the factorization accepts the diagonal entry as pivot if it is within this fraction of the column's best candidate. That is faster, but less stable, and **it changes results**, not just speed. |
+
+### CPU threads
+
+| Setting | Type | Values | What it does |
+|---|---|---|---|
+| `threads` | uint64 (uint32 in C) | 0 to 4096 | CPU threads for SPARTA's own work: the analysis, the CPU factorization and solves, and the hybrid's CPU share. `0`, the default, uses the process-wide Rayon pool, which `RAYON_NUM_THREADS` sizes. A positive count gives each analysis and each solver a pool of its own. |
+
+A count is a hard bound: a solver with its own pool also keeps the dense
+library from threading past it (Accelerate and MKL are kept to the calling
+thread, OpenBLAS to the pool's size). Unlike `RAYON_NUM_THREADS`, which is read
+once when the process first uses Rayon, it can differ per solver and leaves
+anything else in the process that uses Rayon alone.
+
+`SPARTA_NUM_THREADS`, when set to a positive count, overrides `threads` wherever
+it was given, in any language. It is meant for wrappers and job scripts that
+cannot reach the call site.
+
+```python
+solver = sparta.analyze(A, force_cpu=True, threads=6)
+```
 
 ### CPU backend tuning (Python and Rust)
 

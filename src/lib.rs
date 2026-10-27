@@ -64,6 +64,7 @@ mod solver;
 // Public so examples/colcount_bench.rs can time the symbolic internals.
 // Not part of the supported API surface.
 pub mod symbolic;
+mod threads;
 pub use analysis::{Analysis, Kind};
 pub use config::Config;
 pub use device::Device;

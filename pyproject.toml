@@ -11,7 +11,7 @@ build-backend = "maturin"
 
 [project]
 name = "sparta-solver"
-version = "0.2.2"
+version = "0.3.0"
 requires-python = ">=3.9"
 dependencies = ["numpy>=1.21", "scipy>=1.7"]
 description = "Experimental Apple Silicon GPU-resident sparse complex-symmetric solver"

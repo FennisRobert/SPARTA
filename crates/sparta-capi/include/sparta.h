@@ -45,7 +45,7 @@ extern "C" {
 #define SPARTA_VERSION_MINOR 1
 #define SPARTA_VERSION_PATCH 4
 
-/** Returns the library version as text, for example "0.2.2". */
+/** Returns the library version as text, for example "0.3.0". */
 const char *sparta_version(void);
 
 /** Returns the GPU backend this library was built for: "metal" or "vulkan".
@@ -275,6 +275,16 @@ typedef struct {
      *  backend has a hybrid path; elsewhere it is ignored. Default 0, or the
      *  SPARTA_HYBRID_CPU environment variable. */
     double hybrid_cpu;
+
+    /* ---- Threads. ---- */
+
+    /** CPU threads for SPARTA's own parallel work: the analysis and the
+     *  hybrid's CPU share. 0 uses the process-wide pool, which the
+     *  RAYON_NUM_THREADS environment variable sizes; a positive count, up to
+     *  4096, gives each analysis and solver a pool of its own. The
+     *  SPARTA_NUM_THREADS environment variable, when set to a positive count,
+     *  overrides this. Default 0. */
+    uint32_t threads;
 } sparta_config;
 
 /** Fills `config` with the default settings. */

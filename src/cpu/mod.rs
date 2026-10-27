@@ -20,6 +20,7 @@ cpu_types!();
 pub(crate) use crate::scalar::Scalar;
 use blocked::Scratch;
 use dense::Threading;
+use crate::threads::Pool;
 use level::{Level, Shared};
 use profile::Report;
 use rayon::prelude::*;
@@ -64,6 +65,8 @@ pub(crate) struct Solver {
     /// a front that splits its work may start another front of the level.
     workers: Mutex<Vec<Worker>>,
     schedule: Vec<Level>,
+    /// The threads this solver factors and solves on; see `Config::threads`.
+    pool: Pool,
     /// Whether each node's `nc` L columns are stored row-major, `nr` rows of
     /// `nc` values, rather than column-major. Row-major is what the CPU solve
     /// reads and what a front's rows copy into without a transpose; the hybrid
@@ -82,10 +85,12 @@ impl Solver {
         if plan.n == 0 {
             return Err(Error::Invalid("released analysis".into()));
         }
-        let threads = rayon::current_num_threads().max(1);
+        let pool = Pool::new(plan.config.threads)?;
+        let threads = pool.threads();
         Ok(Self {
             workers: Mutex::new((0..threads).map(|_| Worker::default()).collect()),
             schedule: level::schedule(&plan),
+            pool,
             rowmajor: true,
             fronts: allocate_lazy(plan.elements)?,
             factors: allocate_lazy(plan.factor_elements)?,
@@ -111,10 +116,12 @@ impl Solver {
     /// factors are never committed.
     pub(crate) fn new_lazy(plan: Analysis) -> Result<Self> {
         plan.config.check().map_err(Error::Invalid)?;
-        let threads = rayon::current_num_threads().max(1);
+        let pool = Pool::new(plan.config.threads)?;
+        let threads = pool.threads();
         Ok(Self {
             workers: Mutex::new((0..threads).map(|_| Worker::default()).collect()),
             schedule: level::schedule(&plan),
+            pool,
             rowmajor: false,
             fronts: allocate_lazy(plan.elements)?,
             factors: allocate_lazy(plan.factor_elements)?,
@@ -142,6 +149,13 @@ impl Solver {
             level.spread &= level.nodes.len() >= 2;
         }
         self.schedule.retain(|level| !level.nodes.is_empty());
+    }
+
+    /// The threads this solver runs on, for work done on its behalf.
+    // Used by the hybrid factorization through the complex64 copy only.
+    #[allow(dead_code)]
+    pub(crate) fn pool(&self) -> &Pool {
+        &self.pool
     }
 
     #[allow(dead_code)]
@@ -172,7 +186,8 @@ impl Solver {
         }
         let started = Instant::now();
         let mut report = Report::default();
-        let result = self.factor_all(values, &mut report);
+        let pool = self.pool.clone();
+        let result = pool.run(|| self.factor_all(values, &mut report));
         self.seconds = started.elapsed().as_secs_f64();
         report.print(self.seconds);
         self.valid = result.is_ok();
@@ -197,8 +212,13 @@ impl Solver {
             schedule,
             perturbed,
             rowmajor,
+            pool,
             ..
         } = self;
+        // A front alone on the machine may have the library thread its
+        // products -- unless this solver is bounded to fewer threads, which
+        // the library's own threading would not respect.
+        let machine = !pool.bounded();
         let shared = Shared::new(fronts, factors, upper, diagonal, subdiag, perms, two, *rowmajor);
         // Rayon owns the parallelism: fronts across threads in wide levels, and
         // row blocks within one front in narrow ones. Accelerate threads only
@@ -228,7 +248,7 @@ impl Solver {
                     // SAFETY: the loop is the only thing touching the storage,
                     // and every node appears once.
                     let count = unsafe {
-                        shared.node(plan, id, values, true, true, &mut worker.scratch, &mut worker.report)
+                        shared.node(plan, id, values, true, machine, &mut worker.scratch, &mut worker.report)
                     };
                     let count = match count {
                         Ok(count) => count,

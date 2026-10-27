@@ -41,7 +41,8 @@ def _symbolic(a: sparse.csc_matrix, path: Path, options: _Options) -> _Analysis:
                      pivot_threads=options.pivot_threads,
                      schur_chunk=options.schur_chunk, force_cpu=options.force_cpu,
                      cpu_panel=options.cpu_panel, cpu_block_rows=options.cpu_block_rows,
-                     cpu_blas_min_rows=options.cpu_blas_min_rows)
+                     cpu_blas_min_rows=options.cpu_blas_min_rows,
+                     threads=options.threads)
 
 
 def _reader(matrix: sparse.spmatrix, a: sparse.csc_matrix, triangle: str,

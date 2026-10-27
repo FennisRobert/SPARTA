@@ -94,20 +94,60 @@ fn linked(vendor: Vendor) -> bool {
 /// parallelism but never correctness.
 #[cfg(any(sparta_accelerate, sparta_blas))]
 pub(super) fn set_threading(threading: Threading) -> bool {
-    use std::sync::OnceLock;
-
-    /// A resolved per-thread control, and the convention its argument follows.
-    #[derive(Clone, Copy)]
-    enum Control {
-        /// `BLASSetThreading(0 = machine, 1 = caller)`, zero on success.
-        Accelerate(unsafe extern "C" fn(u32) -> i32),
-        /// `MKL_Set_Num_Threads_Local(0 = restore global, 1 = caller)`,
-        /// returning the previous value rather than a status.
-        Mkl(unsafe extern "C" fn(i32) -> i32),
+    match per_thread() {
+        // SAFETY: each arm calls the symbol it resolved, with one of the two
+        // values that library documents.
+        Some(PerThread::Accelerate(set)) => unsafe {
+            set(match threading {
+                Threading::Machine => 0,
+                Threading::Caller => 1,
+            }) == 0
+        },
+        // SAFETY: as above. MKL returns the previous count, not a status, so
+        // the call itself is the success.
+        Some(PerThread::Mkl(set)) => unsafe {
+            set(match threading {
+                Threading::Machine => 0,
+                Threading::Caller => 1,
+            });
+            true
+        },
+        None => false,
     }
+}
 
-    static ENTRY: OnceLock<Option<Control>> = OnceLock::new();
-    let entry = ENTRY.get_or_init(|| {
+/// Whether the linked library has a thread control of either kind, the
+/// per-thread one or OpenBLAS's process-wide one. A query: unlike calling
+/// either setter, it changes no thread's setting.
+#[cfg(any(sparta_accelerate, sparta_blas))]
+pub(super) fn controllable() -> bool {
+    per_thread().is_some() || global().is_some()
+}
+
+#[cfg(not(any(sparta_accelerate, sparta_blas)))]
+pub(super) fn controllable() -> bool {
+    false
+}
+
+/// A resolved per-thread control, and the convention its argument follows.
+#[cfg(any(sparta_accelerate, sparta_blas))]
+#[derive(Clone, Copy)]
+enum PerThread {
+    /// `BLASSetThreading(0 = machine, 1 = caller)`, zero on success.
+    Accelerate(unsafe extern "C" fn(u32) -> i32),
+    /// `MKL_Set_Num_Threads_Local(0 = restore global, 1 = caller)`,
+    /// returning the previous value rather than a status.
+    Mkl(unsafe extern "C" fn(i32) -> i32),
+}
+
+/// The linked library's per-thread control, resolved on first use. Resolving
+/// it sets nothing: a probe that set a thread to `Machine` would leave that
+/// thread threading its BLAS calls inside a level spread across the pool.
+#[cfg(any(sparta_accelerate, sparta_blas))]
+fn per_thread() -> Option<PerThread> {
+    use std::sync::OnceLock;
+    static ENTRY: OnceLock<Option<PerThread>> = OnceLock::new();
+    *ENTRY.get_or_init(|| {
         // MKL's `mkl_rt` binds each routine on its first call, and that binding
         // is not safe to race: Rayon workers making their first calls at once
         // abort with "Error on loading function". Every worker passes through
@@ -124,38 +164,18 @@ pub(super) fn set_threading(threading: Threading) -> bool {
         let accelerate = find(Vendor::Accelerate, b"BLASSetThreading\0");
         if !accelerate.is_null() {
             // SAFETY: the resolved symbol has Accelerate's documented signature.
-            return Some(Control::Accelerate(unsafe {
+            return Some(PerThread::Accelerate(unsafe {
                 std::mem::transmute::<*mut (), unsafe extern "C" fn(u32) -> i32>(accelerate)
             }));
         }
         let mkl = find(Vendor::Mkl, b"MKL_Set_Num_Threads_Local\0");
         (!mkl.is_null()).then(|| {
             // SAFETY: the resolved symbol has MKL's documented signature.
-            Control::Mkl(unsafe {
+            PerThread::Mkl(unsafe {
                 std::mem::transmute::<*mut (), unsafe extern "C" fn(i32) -> i32>(mkl)
             })
         })
-    });
-    match entry {
-        // SAFETY: each arm calls the symbol it resolved, with one of the two
-        // values that library documents.
-        Some(Control::Accelerate(set)) => unsafe {
-            set(match threading {
-                Threading::Machine => 0,
-                Threading::Caller => 1,
-            }) == 0
-        },
-        // SAFETY: as above. MKL returns the previous count, not a status, so
-        // the call itself is the success.
-        Some(Control::Mkl(set)) => unsafe {
-            set(match threading {
-                Threading::Machine => 0,
-                Threading::Caller => 1,
-            });
-            true
-        },
-        None => false,
-    }
+    })
 }
 
 #[cfg(not(any(sparta_accelerate, sparta_blas)))]
@@ -166,8 +186,9 @@ pub(super) fn set_threading(_: Threading) -> bool {
 /// Choose the BLAS threading model for the whole process, for a library whose
 /// only control is global, reporting whether it has one.
 ///
-/// This is OpenBLAS's `openblas_set_num_threads`. `Machine` is the size of
-/// SPARTA's Rayon pool, so `RAYON_NUM_THREADS` bounds BLAS as well, and an
+/// This is OpenBLAS's `openblas_set_num_threads`. `Machine` is the size of the
+/// Rayon pool it is called on, so `RAYON_NUM_THREADS` or `Config::threads`
+/// bounds BLAS as well, and an
 /// `OPENBLAS_NUM_THREADS` set for some other library in the process (EMerge
 /// sets it to 1 for numpy) does not leave the root front on one thread;
 /// `Caller` is one thread. Because it changes the setting under every thread
@@ -181,44 +202,36 @@ pub(super) fn set_threading(_: Threading) -> bool {
 ///   for a level of fronts that Rayon spreads across the cores itself.
 #[cfg(any(sparta_accelerate, sparta_blas))]
 pub(super) fn set_global_threading(threading: Threading) -> bool {
-    use std::sync::OnceLock;
-
-    /// `openblas_set_num_threads` and the size of the Rayon pool.
-    #[derive(Clone, Copy)]
-    struct Control {
-        set: unsafe extern "C" fn(i32),
-        machine: i32,
-    }
-
-    static ENTRY: OnceLock<Option<Control>> = OnceLock::new();
-    let entry = ENTRY.get_or_init(|| {
-        // `set_threading` also resolves the per-thread controls and makes the
-        // first call of each routine on one thread; a library with a per-thread
-        // control does not need this one.
-        if set_threading(Threading::Machine) || !linked(Vendor::OpenBlas) {
-            return None;
-        }
-        let set = ffi::loaded_symbol(b"openblas_set_num_threads\0");
-        if set.is_null() {
-            return None;
-        }
-        // SAFETY: the symbol has OpenBLAS's documented signature.
-        Some(Control {
-            set: unsafe { std::mem::transmute::<*mut (), unsafe extern "C" fn(i32)>(set) },
-            machine: rayon::current_num_threads().max(1) as i32,
-        })
-    });
-    match entry {
-        // SAFETY: the symbol resolved above, called with a positive count.
-        Some(control) => unsafe {
-            (control.set)(match threading {
-                Threading::Machine => control.machine,
+    match global() {
+        // SAFETY: the symbol resolved in `global`, called with a positive count.
+        Some(set) => unsafe {
+            set(match threading {
+                // The pool this runs on, read per call: a solver with its
+                // own pool (`Config::threads`) bounds BLAS to that pool.
+                Threading::Machine => rayon::current_num_threads().max(1) as i32,
                 Threading::Caller => 1,
             });
             true
         },
         None => false,
     }
+}
+
+/// OpenBLAS's `openblas_set_num_threads`, resolved on first use, or `None` for a
+/// library with a per-thread control, which does not need it.
+#[cfg(any(sparta_accelerate, sparta_blas))]
+fn global() -> Option<unsafe extern "C" fn(i32)> {
+    use std::sync::OnceLock;
+    static ENTRY: OnceLock<Option<unsafe extern "C" fn(i32)>> = OnceLock::new();
+    *ENTRY.get_or_init(|| {
+        // `per_thread` also makes the first call of each routine on one thread.
+        if per_thread().is_some() || !linked(Vendor::OpenBlas) {
+            return None;
+        }
+        let set = ffi::loaded_symbol(b"openblas_set_num_threads\0");
+        // SAFETY: the symbol has OpenBLAS's documented signature.
+        (!set.is_null()).then(|| unsafe { std::mem::transmute::<*mut (), unsafe extern "C" fn(i32)>(set) })
+    })
 }
 
 #[cfg(not(any(sparta_accelerate, sparta_blas)))]

@@ -203,8 +203,9 @@ impl Hybrid {
             status[id as usize] = 0;
         }
         // The factor columns are the bulk of the copy, and every node's block
-        // is its own, so the nodes are spread across the pool.
-        self.nodes.par_iter().for_each(|&id| {
+        // is its own, so the nodes are spread across the CPU solver's pool.
+        let pool = self.cpu.pool().clone();
+        pool.run(|| self.nodes.par_iter().for_each(|&id| {
             let node = plan.nodes[id as usize];
             let (start, len) = (node.loffset as usize, node.nr as usize * node.nc as usize);
             // SAFETY: this node's block, which no other task writes.
@@ -218,7 +219,7 @@ impl Hybrid {
                     std::ptr::copy_nonoverlapping(store.upper[start..].as_ptr(), upper.at(start), len);
                 }
             }
-        });
+        }));
         Ok(())
     }
 

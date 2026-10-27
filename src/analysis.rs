@@ -691,6 +691,13 @@ impl Analysis {
     /// Metal kernels it compiles use exactly the settings analyzed with.
     pub fn ldlt(n: usize, ptr: &[usize], rows: &[usize], config: &Config) -> Result<Self> {
         config.check().map_err(Error::Invalid)?;
+        // The whole analysis runs on the configured threads, which also keeps
+        // the profiler's marks, recorded per thread, on one thread.
+        crate::threads::Pool::new(config.threads)?.run(|| Self::ldlt_here(n, ptr, rows, config))
+    }
+
+    /// [`Analysis::ldlt`] on the calling thread's pool.
+    fn ldlt_here(n: usize, ptr: &[usize], rows: &[usize], config: &Config) -> Result<Self> {
         let max_front = config.max_front.unwrap_or(usize::MAX);
         crate::profile::start();
         shape(
@@ -734,6 +741,11 @@ impl Analysis {
     /// [`Solver::perturbed_pivots`](crate::Solver::perturbed_pivots).
     pub fn lu(n: usize, ptr: &[usize], rows: &[usize], config: &Config) -> Result<Self> {
         config.check().map_err(Error::Invalid)?;
+        crate::threads::Pool::new(config.threads)?.run(|| Self::lu_here(n, ptr, rows, config))
+    }
+
+    /// [`Analysis::lu`] on the calling thread's pool.
+    fn lu_here(n: usize, ptr: &[usize], rows: &[usize], config: &Config) -> Result<Self> {
         let max_front = config.max_front.unwrap_or(usize::MAX);
         crate::profile::start();
         shape(n, ptr, rows, max_front, "nonempty square CSC required")?;

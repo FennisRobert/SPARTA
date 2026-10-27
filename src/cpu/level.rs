@@ -6,7 +6,7 @@
 //! calls fill the machine, and the bottom levels are thousands of narrow fronts
 //! that fill it here instead.
 use super::blocked::Scratch;
-use super::dense::{self, Threading};
+use super::dense;
 use rayon::prelude::*;
 use super::profile::{Phase, Report};
 use super::Scalar;
@@ -351,8 +351,7 @@ pub(super) struct Level {
 /// have every front threading against every other, so only levels whose
 /// fronts are too narrow to reach Accelerate at all are spread there.
 pub(super) fn schedule(plan: &Analysis) -> Vec<Level> {
-    let controllable =
-        dense::set_threading(Threading::Machine) || dense::set_global_threading(Threading::Machine);
+    let controllable = dense::controllable();
     plan.levels
         .iter()
         .map(|level| {

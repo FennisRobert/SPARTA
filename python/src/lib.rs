@@ -32,7 +32,8 @@ impl PyAnalysis {
                         panel_threads=None, solve_threads=None, lu_diag_threshold=None,
                         panel=None, schur_block=None, strip_block=None,
                         narrow_cols=None, pivot_threads=None, schur_chunk=None,
-                        force_cpu=false, cpu_panel=None, cpu_block_rows=None, cpu_blas_min_rows=None))]
+                        force_cpu=false, cpu_panel=None, cpu_block_rows=None, cpu_blas_min_rows=None,
+                        threads=None))]
     fn new(
         n: usize,
         ptr: PyReadonlyArray1<'_, usize>,
@@ -60,6 +61,7 @@ impl PyAnalysis {
         cpu_panel: Option<usize>,
         cpu_block_rows: Option<usize>,
         cpu_blas_min_rows: Option<usize>,
+        threads: Option<usize>,
     ) -> PyResult<Self> {
         let ordering = match ordering {
             "scalpel" => OrderingMethod::Scalpel,
@@ -99,6 +101,7 @@ impl PyAnalysis {
             cpu_blas_min_rows: cpu_blas_min_rows.unwrap_or(base.cpu_blas_min_rows),
             // Not a Python argument yet: the default, or SPARTA_HYBRID_CPU.
             hybrid_cpu: base.hybrid_cpu,
+            threads: threads.unwrap_or(base.threads),
         };
         config.check().map_err(PyValueError::new_err)?;
         let (ptr, rows) = (ptr.as_slice()?, rows.as_slice()?);

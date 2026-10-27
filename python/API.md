@@ -330,7 +330,10 @@ x = solver.solve(b)
 Keep original complex128 matrix values and right-hand sides. CPU outputs are
 complex128 even when the inputs are single precision. `refinement_steps=0`
 measures the direct solve; the existing refinement and scaling options also work.
-CPU tuning uses `cpu_panel`, `cpu_block_rows`, and `cpu_blas_min_rows`. The
+CPU tuning uses `cpu_panel`, `cpu_block_rows`, and `cpu_blas_min_rows`.
+`threads=n` runs the solver's analysis, factorization and solves on a pool of
+its own `n` threads instead of the process-wide pool that `RAYON_NUM_THREADS`
+sizes; `SPARTA_NUM_THREADS`, when set, overrides it. The
 `factor_seconds` property reports CPU factorization wall time;
 `factor_device_seconds` is zero on CPU. `diagnostics()` identifies the backend.
 

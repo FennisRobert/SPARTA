@@ -42,7 +42,8 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
             schur_chunk: int | None = None,
             force_cpu: bool | None = None, hybrid: bool | float | None = None,
             cpu_panel: int | None = None,
-            cpu_block_rows: int | None = None, cpu_blas_min_rows: int | None = None) -> Solver:
+            cpu_block_rows: int | None = None, cpu_blas_min_rows: int | None = None,
+            threads: int | None = None) -> Solver:
     """Analyze a matrix pattern on CPU and return an unfactorized Solver.
 
     Parameters
@@ -68,6 +69,13 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
         Rows per tile for small CPU updates below the Accelerate threshold.
     cpu_blas_min_rows : int or None, default None
         Minimum trailing rows before CPU updates use Apple Accelerate.
+    threads : int or None, default None
+        CPU threads for SPARTA's own work: the analysis, CPU factorization and
+        solves, and the hybrid's CPU share. 0 uses the process-wide pool, which
+        RAYON_NUM_THREADS sizes; a positive count, up to 4096, gives the solver
+        a pool of its own and keeps Accelerate from threading past it. The
+        SPARTA_NUM_THREADS environment variable, when set to a positive count,
+        overrides this. None uses the config's threads, or 0 without a config.
     config : Config, str or None, default None
         Every tuning setting at once, from Config.defaults(), Config.preset()
         or Config.load(). A string names a profile saved by sparta.optimize()
@@ -215,7 +223,7 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
                   schur_chunk=schur_chunk, force_cpu=force_cpu,
                   hybrid_cpu=None if hybrid is None else _hybrid_share(hybrid),
                   cpu_panel=cpu_panel, cpu_block_rows=cpu_block_rows,
-                  cpu_blas_min_rows=cpu_blas_min_rows)
+                  cpu_blas_min_rows=cpu_blas_min_rows, threads=threads)
     if config is not None:
         base = Config.resolve(config).to_dict()
         tuning = {name: base[name] if value is None else value

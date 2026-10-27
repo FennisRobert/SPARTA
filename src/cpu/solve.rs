@@ -101,6 +101,11 @@ fn dot(acc: &mut [C], l: &[C], z: &[C]) {
 impl Solver {
     /// Solve column-major `b` containing `nrhs` right-hand sides.
     pub(crate) fn solve_many(&self, b: &[C], nrhs: usize) -> Result<Vec<C>> {
+        self.pool.run(|| self.solve_here(b, nrhs))
+    }
+
+    /// [`Solver::solve_many`] on the calling thread's pool.
+    fn solve_here(&self, b: &[C], nrhs: usize) -> Result<Vec<C>> {
         if !self.valid {
             return Err(Error::Invalid(
                 "successful factorization required before solve".into(),

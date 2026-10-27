@@ -79,6 +79,7 @@ class _Options:
     cpu_panel: int | None
     cpu_block_rows: int | None
     cpu_blas_min_rows: int | None
+    threads: int | None
 
     def __post_init__(self) -> None:
         """Validate enum choices, positive limits and dimensionless tolerances."""
@@ -126,7 +127,8 @@ class _Options:
         for name in ("nemin", "small_front_rows", "wide_cycles", "fm_passes",
                      "separator_trials", "schur_batch", "panel_threads", "solve_threads",
                      "panel", "schur_block", "strip_block", "narrow_cols",
-                     "pivot_threads", "schur_chunk", "cpu_panel", "cpu_block_rows", "cpu_blas_min_rows"):
+                     "pivot_threads", "schur_chunk", "cpu_panel", "cpu_block_rows", "cpu_blas_min_rows",
+                     "threads"):
             value = getattr(self, name)
             if value is not None and (type(value) is not int or value < 0):
                 raise ValueError(f"{name} must be None or a non-negative integer")

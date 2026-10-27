@@ -106,12 +106,22 @@ which Accelerate (`BLASSetThreading`) and MKL (`MKL_Set_Num_Threads_Local`)
 have and OpenBLAS does not. OpenBLAS's `openblas_set_num_threads` is
 process-wide, so `dense::set_global_threading` sets it between levels instead,
 when no thread is inside BLAS: one thread for a spread level, the size of the
-Rayon pool for a lone front, so `RAYON_NUM_THREADS` bounds OpenBLAS too and an
+Rayon pool it runs on for a lone front, so `RAYON_NUM_THREADS` or `threads`
+bounds OpenBLAS too and an
 `OPENBLAS_NUM_THREADS` meant for another library in the process is overridden.
 Its `?sytrf` therefore runs on one thread inside a spread level. The per-thread
 controls are only taken from the vendor `SPARTA_BLAS_LIB` names, so an MKL
 loaded by something else in the process (PARDISO, say) is not mistaken for the
 library SPARTA calls.
+
+`Config::threads` (`src/threads.rs`) gives a solver a Rayon pool of its own;
+`SPARTA_NUM_THREADS` overrides it. A solver on its own pool never hands a
+product to the library to thread, since Accelerate's and MKL's own threads
+would not respect the pool's size: a lone front splits its work over the pool
+like a front in a spread level. The controls are resolved by a query that sets
+nothing (`dense::controllable`): a lookup that probed by setting the calling
+thread to `Machine` would leave that thread threading its BLAS calls inside the
+spread levels of the process's first factorization.
 
 On a Ryzen 5 3600XT (Zen 2, 6 cores, Windows) with an 84k complex-symmetric
 EMerge patch antenna system, complex128 LDLᵀ took 1.52 s with every level run

@@ -42,6 +42,14 @@ pub struct Config {
     pub device: Device,
     /// Run factorization and solves in Rust complex128 instead of on the GPU.
     pub force_cpu: bool,
+    /// Threads for SPARTA's own parallel work: the analysis, the CPU
+    /// factorization and solve, and the hybrid's CPU share. 0, the default,
+    /// uses Rayon's global pool, which `RAYON_NUM_THREADS` sizes for the whole
+    /// process. A positive count gives each analysis and each CPU solver a pool
+    /// of that many threads, and keeps the dense library from threading past
+    /// it. `SPARTA_NUM_THREADS`, when set to a positive count, overrides this
+    /// setting wherever it was given.
+    pub threads: usize,
     /// CPU pivots accumulated before updating a trailing Schur block, on the
     /// panel path only. May be exceeded by one column to keep a 2x2 pivot
     /// together. The LDL^T path normally eliminates the whole fully summed
@@ -136,6 +144,10 @@ impl Config {
     }
 }
 
+/// Largest [`Config::threads`]: far past any machine, and small enough that a
+/// mistaken count fails the check rather than trying to spawn it.
+const MAX_THREADS: usize = 4096;
+
 /// Reads `name` from the environment as a `T`, or returns `fallback`.
 /// A value that will not parse is ignored rather than failing the run, since
 /// these variables exist for ad-hoc sweeps.
@@ -169,6 +181,7 @@ impl Config {
         Self {
             device,
             force_cpu: false,
+            threads: 0,
             // Conservative starting geometry, independent of Metal threadgroup limits.
             // These defaults are not a hardware performance claim.
             cpu_panel: 32,
@@ -234,6 +247,7 @@ impl Config {
             .or(rule(self.cpu_block_rows >= 1 && self.cpu_block_rows <= u32::MAX as usize, "cpu_block_rows must be between 1 and u32::MAX"))
             .or(rule(self.cpu_blas_min_rows >= 1, "cpu_blas_min_rows must be at least 1"))
             .or(rule(self.nemin >= 1, "nemin must be at least 1"))
+            .or(rule(self.threads <= MAX_THREADS, "threads must be at most 4096"))
             .or(rule(
                 (0.0..1.0).contains(&self.hybrid_cpu),
                 "hybrid_cpu must be at least 0 and below 1",

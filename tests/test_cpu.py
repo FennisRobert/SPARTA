@@ -31,6 +31,27 @@ class CpuTests(unittest.TestCase):
                     self.assertEqual(f.factor_device_seconds, 0)
                     f.destroy()
 
+    def test_thread_counts(self) -> None:
+        """A solver on its own pool of threads matches one on the shared pool;
+        the setting travels through Config and bad counts are refused."""
+        rng = np.random.default_rng(632)
+        n = 300
+        raw = rng.normal(size=(n, n)) + 1j*rng.normal(size=(n, n))
+        a = sparse.csc_matrix(raw + raw.T + n*np.eye(n))
+        b = rng.normal(size=(n, 3)) + 1j*rng.normal(size=(n, 3))
+        shared = sparta.analyze(a, force_cpu=True, refinement_steps=0).factorize().solve_many(b)
+        for threads in (1, 2):
+            with self.subTest(threads=threads):
+                f = sparta.analyze(a, force_cpu=True, refinement_steps=0, threads=threads).factorize()
+                np.testing.assert_allclose(f.solve_many(b), shared, rtol=1e-12, atol=1e-12)
+                f.destroy()
+        self.assertEqual(sparta.Config.defaults().threads, 0)
+        configured = sparta.analyze(a, config=sparta.Config.defaults().with_(threads=2), force_cpu=True)
+        self.assertLess(np.linalg.norm(a @ configured.factorize().solve(b[:, 0]) - b[:, 0]), 1e-9 * np.linalg.norm(b[:, 0]))
+        for bad in (-1, 5000):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                sparta.analyze(a, force_cpu=True, threads=bad)
+
     def test_default_refinement_keeps_double_precision(self) -> None:
         """Refinement, on by default, must hand the double factors unrounded
         right-hand sides; narrowing them to single precision left a residual

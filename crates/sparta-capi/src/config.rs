@@ -31,6 +31,7 @@ pub struct CConfig {
     pub pivot_threads: u32,
     pub schur_chunk: u32,
     pub hybrid_cpu: f64,
+    pub threads: u32,
 }
 
 impl From<Config> for CConfig {
@@ -58,6 +59,7 @@ impl From<Config> for CConfig {
             pivot_threads: config.pivot_threads,
             schur_chunk: config.schur_chunk,
             hybrid_cpu: config.hybrid_cpu,
+            threads: config.threads.min(u32::MAX as usize) as u32,
         }
     }
 }
@@ -101,6 +103,7 @@ impl CConfig {
             cpu_block_rows: base.cpu_block_rows,
             cpu_blas_min_rows: base.cpu_blas_min_rows,
             hybrid_cpu: self.hybrid_cpu,
+            threads: self.threads as usize,
         };
         config.check().map(|()| config)
     }
