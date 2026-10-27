@@ -107,8 +107,7 @@ double-precision CPU backend, but has no GPU backend.
 **Windows.** Any 64-bit machine runs the analysis and the double-precision CPU
 backend. AMD and NVIDIA GPUs run through the [Vulkan](#vulkan) backend, which
 is in alpha: tested on an NVIDIA RTX 3080 and an AMD Radeon integrated GPU,
-correct but not yet tuned for speed. For a fast CPU backend, install a BLAS
-library (see [Building from source](#building-from-source)).
+correct but not yet tuned for speed.
 
 **Linux.** The same as Windows: the analysis, the CPU backend and the alpha
 Vulkan backend. Not yet tested on Linux.
@@ -122,7 +121,6 @@ Vulkan backend. Not yet tested on Linux.
 | git | Downloading the source from GitHub. |
 | Python 3.9 or later, with pip | The Python package. |
 | NumPy and SciPy | Used by the Python package. pip installs them automatically. |
-| OpenBLAS or Intel MKL | Optional, Linux and Windows only: makes the CPU backend fast. |
 
 ### Installing the packages
 
@@ -243,7 +241,7 @@ pip downloads its build helper (maturin), NumPy and SciPy from PyPI.
 no compiler, no source code needed.
 
 ```sh
-pip install sparta_solver-0.3.1-cp39-abi3-macosx_11_0_arm64.whl
+pip install sparta_solver-0.3.2-cp39-abi3-macosx_11_0_arm64.whl
 ```
 
 One wheel works for every Python from 3.9 up, on Apple Silicon only. To make a
@@ -878,8 +876,8 @@ improving first, it returns the best answer it found and says so in its report
 
 `force_cpu` runs the factorization and the solves in double precision on the
 CPU. It uses the same analysis and the same kind of factorization as the GPU.
-The large dense updates go to Apple Accelerate on a Mac, or to whichever BLAS
-library the build linked elsewhere (see
+The large dense updates go to Apple Accelerate on a Mac, or to a BLAS library
+loaded at run time elsewhere (see
 [CPU dense kernels](#cpu-dense-kernels-blas-and-lapack)).
 
 SPARTA never switches to the CPU on its own. If the GPU fails, you get an
@@ -1043,6 +1041,7 @@ report the same things in code:
 | Property | Tells you |
 |---|---|
 | `sparta.gpu_available()` | Whether this build's GPU backend (Metal or Vulkan) can run in this process |
+| `sparta.blas_library()` | The CPU backend's BLAS library, or `"portable loops"` without one |
 | `F.n`, `F.path` | Matrix size and the chosen method |
 | `F.info` | Pattern statistics and estimated memory |
 | `F.quality` | How trustworthy the factors are (see [Checking a solve](#checking-a-solve)) |
@@ -1147,73 +1146,50 @@ libraries by default. The Metal-only hybrid tests skip themselves.
 
 ### CPU dense kernels (BLAS and LAPACK)
 
-The CPU backend (`force_cpu`) hands its large dense matrix operations to a
-BLAS/LAPACK library. Which library is fixed when SPARTA is compiled. Without
-one, the CPU backend still gives correct answers, just much more slowly,
-because it falls back on plain Rust loops. The GPU path does not use BLAS at
-all.
+The CPU backend (`force_cpu`) hands its large dense operations to a BLAS and
+LAPACK library. Without one it gives the same answers, several times more
+slowly, on plain Rust loops. The GPU path does not use BLAS.
 
-Two build-time environment variables choose the library:
+| Platform | What to do |
+|---|---|
+| macOS | Nothing. Every Mac build uses Apple's Accelerate. |
+| Python on Linux and Windows | Nothing. pip installs `scipy-openblas32` with SPARTA, and SPARTA loads it on import. |
+| Rust on Linux and Windows | Set `SPARTA_BLAS` to the library's path, or call `sparta::load_blas(path)` before the first CPU factorization. |
+
+`sparta.blas_library()` (Python) and `sparta::blas_library()` (Rust) name the
+library in use, or return `"portable loops"`. If Python finds none, the import
+warns. It tries, in order: `SPARTA_BLAS`; the `scipy-openblas32` package; the
+OpenBLAS inside SciPy's install; a conda environment's OpenBLAS or MKL. The
+library is fixed for the process once the first CPU factorization runs.
+
+```sh
+SPARTA_BLAS=/usr/lib/x86_64-linux-gnu/libopenblas.so.0 cargo run --release   # Rust
+```
+
+On a Ryzen 5 3600XT (Windows), an 84k-unknown complex system factored in
+0.56 s with `scipy-openblas32`, 0.55 s with a linked OpenBLAS and 0.65 to
+0.76 s with MKL. Intel processors have not been measured.
+
+#### Linking a library at build time
+
+Two build-time variables link a library into SPARTA instead. A linked library
+always wins over one loaded at run time, and a wrong name fails the build
+with a link error.
 
 | Variable | Meaning |
 |---|---|
 | `SPARTA_BLAS_LIB` | Library to link, without the `lib` prefix: `openblas`, or `mkl_rt` for Intel MKL. Several may be given, separated by commas. |
 | `SPARTA_BLAS_DIR` | Folder to look for it in, when it is not on the default search path. |
 
-They apply to `cargo build` and to `pip install .` alike, because both compile
-the same Rust code. A wrong name fails at link time, not at run time.
-
-#### macOS (Apple Silicon and Intel)
-
-Nothing to do. Every Mac build uses Apple's Accelerate framework, which ships
-with macOS. The variables above are ignored.
-
-#### Linux with OpenBLAS
-
 ```sh
-sudo apt install libopenblas-dev          # Debian, Ubuntu
-sudo dnf install openblas-devel           # Fedora, RHEL
-
-SPARTA_BLAS_LIB=openblas cargo build --release
-SPARTA_BLAS_LIB=openblas pip install .    # for the Python package
+SPARTA_BLAS_LIB=openblas cargo build --release                         # Linux, after: apt install libopenblas-dev
+SPARTA_BLAS_DIR=$MKLROOT/lib SPARTA_BLAS_LIB=mkl_rt pip install .       # Linux, Intel oneAPI MKL
+SPARTA_BLAS_DIR='C:\venv\Library\lib' SPARTA_BLAS_LIB=mkl_rt cargo build --release   # Windows, pip mkl + mkl-devel
 ```
 
-If OpenBLAS is installed somewhere non-standard, add
-`SPARTA_BLAS_DIR=/path/to/openblas/lib`.
-
-#### Linux with Intel MKL
-
-Either MKL or OpenBLAS works. On a Ryzen 5 3600XT (Windows), an 84k-unknown
-complex system factored in 0.55 s with OpenBLAS and 0.65 to 0.76 s with MKL.
-Intel processors have not been measured.
-
-```sh
-# Install Intel oneAPI MKL from https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl.html
-source /opt/intel/oneapi/setvars.sh       # sets MKLROOT and the library path
-
-SPARTA_BLAS_DIR=$MKLROOT/lib SPARTA_BLAS_LIB=mkl_rt cargo build --release
-SPARTA_BLAS_DIR=$MKLROOT/lib SPARTA_BLAS_LIB=mkl_rt pip install .
-```
-
-Run `source /opt/intel/oneapi/setvars.sh` in every shell that runs SPARTA as
-well, so the library is found at run time.
-
-#### Windows with Intel MKL
-
-The `mkl-devel` package from PyPI carries the import library and `mkl` the
-DLLs. With both installed in a virtual environment at `C:\venv`:
-
-```sh
-SPARTA_BLAS_DIR='C:\venv\Library\lib' SPARTA_BLAS_LIB=mkl_rt cargo build --release
-```
-
-`C:\venv\Library\bin` must be on `PATH` when the result runs.
-
-#### Other platforms
-
-Only macOS on Apple Silicon is tested. The same two variables apply anywhere
-else. With neither set, the build still works, and the CPU backend uses its
-portable Rust loops.
+A linked MKL needs its library folder at run time too: `source
+/opt/intel/oneapi/setvars.sh` on Linux, `C:\venv\Library\bin` on `PATH` on
+Windows. On macOS the variables are ignored.
 
 ## Development
 

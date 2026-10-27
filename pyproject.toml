@@ -11,9 +11,11 @@ build-backend = "maturin"
 
 [project]
 name = "sparta-solver"
-version = "0.3.1"
+version = "0.3.2"
 requires-python = ">=3.9"
-dependencies = ["numpy>=1.21", "scipy>=1.7"]
+dependencies = ["numpy>=1.21", "scipy>=1.7",
+                # The CPU solver's BLAS, loaded at import (sparta/_blas.py).
+                "scipy-openblas32; sys_platform != 'darwin'"]
 description = "Experimental Apple Silicon GPU-resident sparse complex-symmetric solver"
 license = { text = "AGPL-3.0-or-later" }
 authors = [{ name = "Robert Fennis" }, { name = "Milan Rother" }]

@@ -1,6 +1,6 @@
 [package]
 name = "sparta-solver"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 authors = ["Robert Fennis", "Milan Rother"]
 license = "AGPL-3.0-or-later"
@@ -38,6 +38,10 @@ ash = { version = "0.38", optional = true }
 # Vulkan is the default backend there, so `ash` is needed without the feature.
 [target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
 ash = "0.38"
+
+# Opens the CPU BLAS at run time; see src/blas.rs. Already a dependency of `ash`.
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+libloading = "0.8"
 
 [dev-dependencies]
 rayon = "1.12"

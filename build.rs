@@ -12,8 +12,9 @@
 //!   supports nothing compiles the symbolic analysis and the CPU backend, and
 //!   reports no device.
 //! - **CPU BLAS and LAPACK.** `src/cpu/dense.rs` calls plain CBLAS and
-//!   f2c-style LAPACK, which Accelerate, OpenBLAS and MKL all export. The
-//!   provider is published as `cfg(sparta_accelerate)` / `cfg(sparta_blas)`.
+//!   f2c-style LAPACK, which Accelerate, OpenBLAS and MKL all export. A
+//!   linked provider is published as `cfg(sparta_accelerate)` /
+//!   `cfg(sparta_blas)`; without either, `src/blas.rs` loads one at run time.
 
 use std::{env, fs, path::{Path, PathBuf}, process::Command};
 
@@ -119,13 +120,13 @@ fn backend(os: &str, arch: &str) -> Backend {
 /// Emits the link directives for the CPU dense kernels.
 ///
 /// Accelerate is the obvious choice on Apple and needs no external package.
-/// Elsewhere the crate links a system CBLAS and LAPACK when `SPARTA_BLAS_LIB`
-/// names the library (for example `openblas`, or `mkl_rt` for MKL);
+/// Elsewhere nothing is linked by default: `src/blas.rs` loads a CBLAS and
+/// LAPACK at run time, which the Python package finds on its own (the
+/// `scipy-openblas32` wheel it depends on). A build can still link one, when
+/// `SPARTA_BLAS_LIB` names it (for example `openblas`, or `mkl_rt` for MKL);
 /// `SPARTA_BLAS_DIR` adds a search path for one that is not on the default
-/// one. When `SPARTA_BLAS_LIB` is unset nothing is linked and the portable
-/// Rust loops are used. Both are read at build time and are the only way to redirect this,
-/// because a wrong choice must fail to link rather than fail at runtime.
-/// `SPARTA_DENSE_LIBRARY` carries the choice to every target for reporting.
+/// one. A linked library is then the only one used.
+/// `SPARTA_DENSE_LIBRARY` carries a linked choice to `src/blas.rs` for reporting.
 fn dense_kernels(os: &str) {
     println!("cargo:rerun-if-env-changed=SPARTA_BLAS_LIB");
     println!("cargo:rerun-if-env-changed=SPARTA_BLAS_DIR");
@@ -136,9 +137,8 @@ fn dense_kernels(os: &str) {
         return;
     }
     // No system BLAS is guaranteed to exist off Apple, so a build that was not
-    // told which one to use gets the portable Rust loops rather than a link
-    // error: `dense::available()` reports false and every caller keeps to
-    // `panel.rs`.
+    // told which one to link loads one at run time instead (`src/blas.rs`),
+    // and keeps to the portable Rust loops when it finds none.
     let Ok(lib) = env::var("SPARTA_BLAS_LIB") else {
         println!("cargo:rustc-env=SPARTA_DENSE_LIBRARY=portable loops");
         return;

@@ -4,11 +4,12 @@
 //! `symbolic` orders the matrix and partitions it into supernodes; `Analysis`
 //! turns that into a shared storage layout; `Solver` selects the GPU or Rust
 //! numerics from `Config::force_cpu`. One build targets one GPU backend, named
-//! by `Device::COMPILED`; CPU dense updates go through whichever BLAS and
-//! LAPACK `build.rs` linked.
+//! by `Device::COMPILED`; CPU dense updates go through the BLAS and LAPACK
+//! `blas` chose: linked by `build.rs`, or loaded at run time by [`load_blas`].
 // `is_multiple_of` needs Rust 1.87; `%` keeps older toolchains building.
 #![allow(unknown_lints, clippy::manual_is_multiple_of)]
 mod analysis;
+mod blas;
 mod config;
 // The CPU backend is compiled once per value type from one source, so each
 // copy is plain code over a concrete type: `cpu_z` complex128, `cpu_c`
@@ -68,6 +69,7 @@ mod solver;
 pub mod symbolic;
 mod threads;
 pub use analysis::{Analysis, Kind};
+pub use blas::{describe as blas_library, load as load_blas};
 pub use config::Config;
 pub use device::Device;
 pub use gpu::gpu_available;

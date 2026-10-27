@@ -156,6 +156,8 @@ idempotent and leave `Drop` with nothing to do.
 ## Inspection and availability
 
 - `sparta.gpu_available()` reports whether Metal is visible to the process.
+- `sparta.blas_library()` names the CPU backend's BLAS library, or returns
+  `"portable loops"` when none was found.
 - `F.path` is the selected Path enum; `F.n` is the matrix dimension.
 - `F.info` reports symbolic counts and byte estimates.
 - `F.factor_device_seconds` is GPU factor time, excluding CPU analysis/preparation.

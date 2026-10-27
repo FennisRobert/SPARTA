@@ -74,7 +74,7 @@ struct Config : sparta_config {
 /** Returns true when a usable GPU is visible to this process. */
 inline bool gpu_available() { return sparta_gpu_available() != 0; }
 
-/** Returns the library version, for example "0.3.1". */
+/** Returns the library version, for example "0.3.2". */
 inline std::string version() { return sparta_version(); }
 
 namespace detail {

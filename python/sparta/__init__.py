@@ -8,7 +8,8 @@ from scipy import sparse
 # Absolute entrywise tolerance for numerical symmetry, in matrix-value units.
 EPS: float = 1e-10
 
-from ._sparta import gpu_available, __version__
+from ._sparta import gpu_available, blas_library, __version__
+from . import _blas  # loads the CPU solver's BLAS; see _blas.py
 from ._types import Ordering, MatrixType, Path, Backend
 from ._options import _Options, _hybrid_share
 from ._config import Config, presets, profiles
@@ -20,7 +21,7 @@ from ._quality import FactorQuality
 __all__ = ['EPS', '__version__', 'analyze', 'Solver', 'Config', 'presets',
            'profiles', 'optimize', 'Optimization', 'Progress',
            'Ordering', 'MatrixType', 'Path', 'Backend',
-           'gpu_available', 'RefinementReport', 'RefinementStatus', 'FactorQuality']
+           'gpu_available', 'blas_library', 'RefinementReport', 'RefinementStatus', 'FactorQuality']
 
 
 def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,

@@ -137,7 +137,7 @@ fn main() {
 
     if force_cpu {
         let precision = if single { "complex64" } else { "complex128" };
-        println!("backend  CPU {precision} ({})", env!("SPARTA_DENSE_LIBRARY"));
+        println!("backend  CPU {precision} ({})", sparta::blas_library());
     } else {
         println!("backend  {} complex64", sparta::Device::COMPILED.name());
     }

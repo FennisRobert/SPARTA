@@ -324,8 +324,7 @@ NVIDIA GPUs run through the Vulkan backend, which is in alpha: tested on an
 NVIDIA RTX 3080 and an AMD Radeon integrated GPU, correct but not yet tuned
 for speed. A normal install includes it and needs nothing extra; running it
 needs a GPU driver with Vulkan 1.3. Without one, `gpu_available()` is false and
-`force_cpu=True` selects the CPU backend. For a fast CPU backend, install a
-BLAS library (@blas).
+`force_cpu=True` selects the CPU backend.
 
 *Linux.* The same as Windows: the analysis, the CPU backend and the alpha
 Vulkan backend. Not yet tested on Linux.
@@ -340,7 +339,6 @@ Vulkan backend. Not yet tested on Linux.
   [git], [Downloading SPARTA from GitHub.],
   [Python 3.9 or later, with pip], [The Python package.],
   [NumPy and SciPy], [Used by the Python package. pip installs them automatically.],
-  [OpenBLAS or Intel MKL], [Optional, Linux and Windows only: makes the CPU backend fast.],
 )
 
 == Installing the packages
@@ -457,7 +455,7 @@ Rust and no compiler. One wheel works for every Python from 3.9 up, on Apple
 Silicon only:
 
 #code(```sh
-pip install sparta_solver-0.3.1-cp39-abi3-macosx_11_0_arm64.whl
+pip install sparta_solver-0.3.2-cp39-abi3-macosx_11_0_arm64.whl
 ```)
 
 == Checking the installation
@@ -477,50 +475,50 @@ If `gpu_available()` prints `False` on an Apple Silicon Mac, the process
 cannot see the GPU. This happens in some sandboxed or remote sessions; run
 from a normal Terminal window.
 
-== A fast CPU backend on Linux and Windows <blas>
+== The CPU backend's BLAS library <blas>
 
-Skip this on a Mac, which always uses Apple's Accelerate. On Linux and
-Windows, the CPU backend needs a BLAS library linked at install time to be
-fast; without one it gives the same answers much more slowly. Set these
-variables in front of the install command:
+The CPU backend hands its large dense operations to a BLAS and LAPACK library.
+Without one it gives the same answers, several times more slowly.
 
-#table(columns: (auto, 1fr),
-  head([Variable], [Meaning]),
-  [`SPARTA_BLAS_LIB`], [Library to link, without the `lib` prefix: `openblas`, or `mkl_rt` for Intel MKL.],
-  [`SPARTA_BLAS_DIR`], [Folder containing it, if it is not on the default search path.],
-)
+*macOS:* always Apple's Accelerate. Nothing to do.
+
+*Python on Linux and Windows:* nothing to do. pip installs the
+`scipy-openblas32` package along with SPARTA, and SPARTA loads it on import.
+To check:
+
+#code(```python
+import sparta
+print(sparta.blas_library())   # names the library, or "portable loops" without one
+```)
+
+If no library is found, the import warns. SPARTA tries these in order:
+
++ `SPARTA_BLAS`, a path to an OpenBLAS or MKL shared library, if set.
++ The `scipy-openblas32` package.
++ The OpenBLAS inside SciPy's own install, then a conda environment's OpenBLAS
+  or MKL.
+
+*Rust on Linux and Windows:* set `SPARTA_BLAS` to the library's path, or call
+`sparta::load_blas(path)` before the first CPU factorization. After that the
+choice is fixed for the process. `sparta::blas_library()` reports it.
 
 #code(```sh
-# OpenBLAS
-sudo apt install libopenblas-dev
-SPARTA_BLAS_LIB=openblas pip install .          # or: cargo build --release
+SPARTA_BLAS=/usr/lib/x86_64-linux-gnu/libopenblas.so.0 cargo run --release
+```)
 
-# Intel MKL (preferred on x86 processors)
-source /opt/intel/oneapi/setvars.sh
+*Linking at build time instead.* `SPARTA_BLAS_LIB` names a library to link
+when SPARTA is compiled, and `SPARTA_BLAS_DIR` the folder it is in. A linked
+library always wins over one loaded at run time. Use this only when you need
+the library fixed at build time; a wrong name fails the build with a link
+error.
+
+#code(```sh
 SPARTA_BLAS_DIR=$MKLROOT/lib SPARTA_BLAS_LIB=mkl_rt pip install .
 ```)
 
-On Windows, install the `mkl` and `mkl-devel` packages from PyPI into a virtual
-environment, here at `C:\venv`, and point the build at its `Library` folder:
-
-#code(```sh
-SPARTA_BLAS_DIR='C:\venv\Library\lib' SPARTA_BLAS_LIB=mkl_rt pip install .
-```)
-
-`C:\venv\Library\bin` must be on `PATH` whenever SPARTA runs.
-
-Either library works. On a Ryzen 5 3600XT (Windows), an 84k-unknown complex
-system factored in 0.55 s with OpenBLAS and 0.65 to 0.76 s with MKL. Intel
-processors have not been measured.
-
-The same variables work for a one-line install from GitHub:
-
-#code(```sh
-SPARTA_BLAS_LIB=openblas pip install "git+ssh://git@github.com/FennisRobert/SPARTA.git"
-```)
-
-pip keeps the first build of a pinned commit. After changing
-`SPARTA_BLAS_LIB`, add `--no-cache-dir --force-reinstall`.
+*Which library.* On a Ryzen 5 3600XT (Windows), an 84k-unknown complex system
+factored in 0.56 s with `scipy-openblas32`, 0.55 s with a linked OpenBLAS and
+0.65 to 0.76 s with MKL. Intel processors have not been measured.
 
 = Quick use
 
@@ -1543,8 +1541,8 @@ solver.factor_values(&values)?;
 let x = solver.solve_values(&b, 1)?;
 ```)
 
-On Linux and Windows, install a BLAS library first, or the CPU backend runs
-much more slowly (@blas).
+The large dense operations go to a BLAS library, found automatically in Python
+(@blas).
 
 == CPU and GPU together <hybrid>
 

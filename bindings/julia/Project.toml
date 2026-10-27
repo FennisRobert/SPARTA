@@ -1,7 +1,7 @@
 name = "SPARTA"
 uuid = "a9bf8545-1622-41e3-8c81-97e8eb29d76b"
 authors = ["Robert Fennis", "Milan Rother"]
-version = "0.3.1"
+version = "0.3.2"
 
 [deps]
 Libdl = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
