@@ -16,6 +16,7 @@ debug
 # Python
 __pycache__/
 *.so
+*.pyd
 *.egg-info/
 
 # rustfmt backups and cargo-mutants output

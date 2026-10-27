@@ -1,6 +1,8 @@
 //! SCALPEL: Sparse Coarsening And Local Partitioning Elimination Logic.
 //! Independent, deterministic parallel nested dissection. No GPU dependency.
 //! Input is an undirected CSR graph; output uses `permutation[new] = old`.
+// `is_multiple_of` needs Rust 1.87; `%` keeps older toolchains building.
+#![allow(unknown_lints, clippy::manual_is_multiple_of)]
 #![forbid(unsafe_code)]
 mod compress;
 mod cover;

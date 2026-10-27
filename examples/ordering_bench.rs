@@ -130,9 +130,8 @@ fn main() {
                 (h ^ v as u64).wrapping_mul(0x100000001b3)
             });
             println!(
-                "{},{},{},{},{:.3},{},{},{:016x}",
+                "{},SCALPEL,{},{},{:.3},{},{},{:016x}",
                 s.name,
-                "SCALPEL",
                 count.max(1),
                 s.n,
                 samples[repeat / 2],

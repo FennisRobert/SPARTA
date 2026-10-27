@@ -775,6 +775,7 @@ impl Analysis {
     /// Shared symbolic path. `sym_*` is the lower triangle of the symmetrized
     /// pattern, which decides the fronts; `ptr`/`rows` is the caller's own CSC,
     /// which decides only where each input value is scattered.
+    #[allow(clippy::too_many_arguments)]
     fn build(
         kind: Kind,
         n: usize,
@@ -1082,61 +1083,6 @@ impl Analysis {
     #[cfg(not(any(test, sparta_metal, sparta_vulkan)))]
     pub fn device_bytes(&self) -> usize {
         0
-    }
-    /// Bytes every front would occupy if none were ever reused. Reported for
-    /// comparison against [`Analysis::front_bytes`]; SPARTA never allocates this.
-    pub fn resident_front_bytes(&self) -> usize {
-        self.nodes
-            .iter()
-            .map(|d| d.nr as usize * d.nr as usize * self.scalar_bytes())
-            .sum()
-    }
-    /// Peak bytes of front data simultaneously live under this schedule: the
-    /// floor any workspace allocator could reach. [`Analysis::front_bytes`] exceeds
-    /// it by whatever the first-fit placement fragments.
-    ///
-    /// Counts what [`assign_front_offsets`] actually has to hold -- each front
-    /// for its own level, and the contribution block it compacts into until the
-    /// parent assembles it -- not the whole front across that whole span.
-    pub fn live_front_bound_bytes(&self) -> usize {
-        let mut level = vec![0usize; self.nodes.len()];
-        for (l, nodes) in self.levels.iter().enumerate() {
-            for &s in nodes {
-                level[s as usize] = l;
-            }
-        }
-        let mut last_read = level.clone();
-        for (up, node) in self.nodes.iter().enumerate() {
-            let first = node.children as usize;
-            for child in &self.children[first..first + node.count as usize] {
-                last_read[child.node as usize] = level[up];
-            }
-        }
-        let mut delta = vec![0i64; self.levels.len() + 2];
-        for (s, node) in self.nodes.iter().enumerate() {
-            let last = last_read[s];
-            let own = level[s];
-            let (nr, nc) = (node.nr as usize, node.nc as usize);
-            // The front for its own level, then only the contribution block it
-            // compacts into, which is what the allocator actually holds.
-            delta[own] += (nr * nr) as i64;
-            delta[own + 1] -= (nr * nr) as i64;
-            let tail = if worth_compacting(nr, nc) {
-                (nr - nc) * (nr - nc)
-            } else {
-                // Not compacted: the whole front is held until the parent
-                // assembles the block still sitting inside it.
-                nr * nr
-            };
-            delta[own] += tail as i64;
-            delta[last + 1] -= tail as i64;
-        }
-        let (mut live, mut peak) = (0i64, 0i64);
-        for d in delta {
-            live += d;
-            peak = peak.max(live);
-        }
-        peak as usize * self.scalar_bytes()
     }
 }
 

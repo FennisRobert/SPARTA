@@ -19,21 +19,13 @@ fn main() {
     println!("matrix,ordering,digest");
     for s in systems {
         let unsymmetric = s.name.contains("asym");
-        for (label, ordering) in [
-            ("scalpel", OrderingMethod::Scalpel),
-        ] {
-            let analyze = if unsymmetric {
-                Analysis::lu
-            } else {
-                Analysis::ldlt
-            };
-            let config = Config {
-                ordering,
-                max_front: Some(1 << 20),
-                ..Config::default()
-            };
-            let plan = analyze(s.n, &s.col_ptr, &s.row_idx, &config).unwrap();
-            println!("{},{},{:016x}", s.name, label, plan.digest());
-        }
+        let analyze = if unsymmetric { Analysis::lu } else { Analysis::ldlt };
+        let config = Config {
+            ordering: OrderingMethod::Scalpel,
+            max_front: Some(1 << 20),
+            ..Config::default()
+        };
+        let plan = analyze(s.n, &s.col_ptr, &s.row_idx, &config).unwrap();
+        println!("{},scalpel,{:016x}", s.name, plan.digest());
     }
 }

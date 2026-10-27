@@ -273,9 +273,10 @@ fn initial(g: &Graph, trial: usize, o: &Options) -> Vec<u8> {
         total += wv;
         levels[level] += wv;
         let reach = max_neighbor[v] as usize;
-        for cut in level.saturating_sub(width - 1)..=level {
+        let first = level.saturating_sub(width - 1);
+        for (cut, slot) in redundant.iter_mut().enumerate().take(level + 1).skip(first) {
             if reach < cut + width {
-                redundant[cut] += wv;
+                *slot += wv;
             }
         }
     }

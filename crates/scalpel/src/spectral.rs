@@ -155,6 +155,8 @@ fn lowest_modes(g: &Graph, steps: usize) -> Vec<Vec<f64>> {
 
 /// Cyclic Jacobi eigendecomposition of symmetric `a`. Returns eigenvalues and
 /// a matrix whose column `k` is the eigenvector of eigenvalue `k`.
+// The rotations read and write two entries per row, which index loops say plainly.
+#[allow(clippy::needless_range_loop)]
 fn jacobi(mut a: Vec<Vec<f64>>) -> (Vec<f64>, Vec<Vec<f64>>) {
     let m = a.len();
     let mut v = vec![vec![0.0; m]; m];

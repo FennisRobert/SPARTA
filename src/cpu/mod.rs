@@ -35,7 +35,6 @@ struct Worker {
     report: Report,
 }
 
-/// CPU allocation; front slots are reused only after their factors are stored.
 /// Read access to a CPU solver's plan and factor storage; see [`Solver::storage`].
 // Used by the hybrid factorization through the complex64 copy only.
 #[allow(dead_code)]
@@ -81,40 +80,23 @@ pub(crate) struct Solver {
 impl Solver {
     /// Allocate buffers of this copy's value type for the immutable symbolic `plan`.
     pub(crate) fn new(plan: Analysis) -> Result<Self> {
-        plan.config.check().map_err(Error::Invalid)?;
         if plan.n == 0 {
             return Err(Error::Invalid("released analysis".into()));
         }
-        let pool = Pool::new(plan.config.threads)?;
-        let threads = pool.threads();
-        Ok(Self {
-            workers: Mutex::new((0..threads).map(|_| Worker::default()).collect()),
-            schedule: level::schedule(&plan),
-            pool,
-            rowmajor: true,
-            fronts: allocate_lazy(plan.elements)?,
-            factors: allocate_lazy(plan.factor_elements)?,
-            upper: allocate_lazy(plan.upper_elements)?,
-            diagonal: allocate_lazy(plan.n)?,
-            subdiag: allocate_lazy(plan.n)?,
-            perms: vec![0; plan.n],
-            two: vec![false; plan.n],
-            plan,
-            valid: false,
-            destroyed: false,
-            seconds: 0.0,
-            perturbed: 0,
-        })
+        Self::build(plan, true)
     }
 
-    /// Factor finite complex128 `values` in the analyzed CSC entry order.
+    /// A solver for factoring only part of the tree, whose factors the GPU
+    /// reads: column-major, and the pages of nodes it never factors are never
+    /// committed.
     // `new_lazy`, `restrict` and `storage` serve the hybrid factorization,
     // which uses the complex64 copy of this module only.
     #[allow(dead_code)]
-    /// A solver whose storage is reserved but not touched until a front writes
-    /// it, for factoring only part of the tree: the pages of nodes it never
-    /// factors are never committed.
     pub(crate) fn new_lazy(plan: Analysis) -> Result<Self> {
+        Self::build(plan, false)
+    }
+
+    fn build(plan: Analysis, rowmajor: bool) -> Result<Self> {
         plan.config.check().map_err(Error::Invalid)?;
         let pool = Pool::new(plan.config.threads)?;
         let threads = pool.threads();
@@ -122,7 +104,7 @@ impl Solver {
             workers: Mutex::new((0..threads).map(|_| Worker::default()).collect()),
             schedule: level::schedule(&plan),
             pool,
-            rowmajor: false,
+            rowmajor,
             fronts: allocate_lazy(plan.elements)?,
             factors: allocate_lazy(plan.factor_elements)?,
             upper: allocate_lazy(plan.upper_elements)?,
@@ -138,10 +120,10 @@ impl Solver {
         })
     }
 
-    #[allow(dead_code)]
     /// Factor only the nodes `keep` marks from now on, replacing any earlier
     /// restriction. They must be closed under taking children, so that no
     /// kept front waits on one left out.
+    #[allow(dead_code)]
     pub(crate) fn restrict(&mut self, keep: &[bool]) {
         self.schedule = level::schedule(&self.plan);
         for level in &mut self.schedule {
@@ -158,10 +140,10 @@ impl Solver {
         &self.pool
     }
 
-    #[allow(dead_code)]
     /// The plan and the numerical storage of the latest factorization: fronts,
     /// factor columns, `D`'s diagonal and subdiagonal, pivot permutations and
     /// the 2x2 flags, laid out exactly as the GPU buffers are.
+    #[allow(dead_code)]
     pub(crate) fn storage(&self) -> Storage<'_> {
         Storage {
             plan: &self.plan,
@@ -175,6 +157,7 @@ impl Solver {
         }
     }
 
+    /// Factor finite `values` in the analyzed CSC entry order.
     pub(crate) fn factor(&mut self, values: &[C]) -> Result<()> {
         self.valid = false;
         self.seconds = 0.0;
@@ -235,12 +218,19 @@ impl Solver {
         let take = || workers.lock().unwrap().pop().unwrap_or_default();
         let give = |worker: Worker| workers.lock().unwrap().push(worker);
         let bumped = AtomicU64::new(0);
+        // SPARTA_CPU_DUMP=1 prints each level's wall time, work and root width.
         let dump = std::env::var_os("SPARTA_CPU_DUMP").is_some();
+        let report_level = |depth: usize, how: &str, t0: Instant| {
+            let level = &schedule[depth];
+            let gflop = FLOPS * level.nodes.iter().map(|&id| work(plan, id)).sum::<f64>() / 1e9;
+            eprintln!("LEVEL {depth} {how} {} {:.4} {gflop:.2} {}", level.nodes.len(),
+                t0.elapsed().as_secs_f64(), plan.nodes[level.nodes[0] as usize].nr);
+        };
         let result = schedule.iter().enumerate().try_for_each(|(depth, level)| {
             // OpenBLAS's control is process-wide, so it is set here, where the
             // previous level has joined and no thread is inside BLAS.
             dense::set_global_threading(if level.spread { Threading::Caller } else { Threading::Machine });
-            let t0 = std::time::Instant::now();
+            let t0 = Instant::now();
             let clock = Report::clock();
             if !level.spread {
                 let mut worker = take();
@@ -266,14 +256,7 @@ impl Solver {
                 worker.report.level(false, clock);
                 give(worker);
                 if dump {
-                    let work: f64 = level.nodes.iter().map(|&i| {
-                        let nd = plan.nodes[i as usize];
-                        let (t, n) = ((nd.nr - nd.nc) as f64, nd.nc as f64);
-                        FLOPS * (t * t * n + t * n * n / 2.0 + n * n * n / 3.0)
-                    }).sum();
-                    eprintln!("LEVEL {depth} seq {} {:.4} {:.2} {}", level.nodes.len(),
-                        t0.elapsed().as_secs_f64(), work / 1e9,
-                        plan.nodes[level.nodes[0] as usize].nr);
+                    report_level(depth, "seq", t0);
                 }
                 return Ok(());
             }
@@ -308,14 +291,7 @@ impl Solver {
             pool[0].report.level(true, clock);
             drop(pool);
             if dump {
-                let work: f64 = level.nodes.iter().map(|&i| {
-                    let nd = plan.nodes[i as usize];
-                    let (t, n) = ((nd.nr - nd.nc) as f64, nd.nc as f64);
-                    FLOPS * (t * t * n + t * n * n / 2.0 + n * n * n / 3.0)
-                }).sum();
-                eprintln!("LEVEL {depth} par {} {:.4} {:.2} {}", level.nodes.len(),
-                    t0.elapsed().as_secs_f64(), work / 1e9,
-                    plan.nodes[level.nodes[0] as usize].nr);
+                report_level(depth, "par", t0);
             }
             Ok(())
         });
@@ -401,7 +377,6 @@ impl Solver {
 /// Real flops per multiply-add of this copy's value type.
 pub(crate) const FLOPS: f64 = if <C as Scalar>::KIND.is_complex() { 8.0 } else { 2.0 };
 
-/// Allocate `count` elements, reporting capacity failures as solver errors.
 /// Relative arithmetic of node `id`: its leading block, off-diagonal solve and
 /// Schur product, in multiply-adds.
 fn work(plan: &Analysis, id: u32) -> f64 {

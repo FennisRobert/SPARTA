@@ -658,7 +658,7 @@ double, and `enum` is one of the named choices.
 | `ordering` | enum | SCALPEL | Nested-dissection implementation. SCALPEL is the only one. |
 | `imbalance` | float64 | `0.8` | SCALPEL only. How unequal a split may be. |
 | `wide_cycles` | uint32 | `4` | SCALPEL only. Separator refinement cycles per split. |
-| `fm_passes` | uint32 | `2` | SCALPEL only. Refinement passes per separator. |
+| `fm_passes` | uint32 | `4` | SCALPEL only. Refinement passes per separator. |
 | `separator_trials` | uint32 | `4` | SCALPEL only. Candidate separators tried per split. |
 | **Supernodes and fronts** | | | |
 | `nemin` | uint64 | `16` | How eagerly groups of columns merge into wider blocks. |
@@ -815,7 +815,7 @@ The last six are compiled into the GPU kernels. A combination the process has
 not used before costs about 300 ms of shader compilation the first time.
 Settings that break a device limit, such as shared memory, are rejected with a
 message naming the setting. `SPARTA_SCHUR_BATCH`, `SPARTA_PANEL_THREADS`,
-`SPARTA_SOLVE_THREADS` and `SPARTA_LU_DIAG_THRESHOLD` override their defaults
+`SPARTA_SOLVE_THREADS`, `SPARTA_LU_DIAG_THRESHOLD` and `SPARTA_HYBRID_CPU` override their defaults
 from the environment, for quick experiments.
 
 ## Precision and accuracy
@@ -1181,11 +1181,11 @@ SPARTA_BLAS_LIB=openblas pip install .    # for the Python package
 If OpenBLAS is installed somewhere non-standard, add
 `SPARTA_BLAS_DIR=/path/to/openblas/lib`.
 
-#### Linux with Intel MKL (preferred on Intel and AMD x86)
+#### Linux with Intel MKL
 
-MKL is the better choice on x86. SPARTA spreads its own work across threads
-and needs to set BLAS threading *per thread*, which MKL supports and OpenBLAS
-does not.
+Either MKL or OpenBLAS works. On a Ryzen 5 3600XT (Windows), an 84k-unknown
+complex system factored in 0.55 s with OpenBLAS and 0.65 to 0.76 s with MKL.
+Intel processors have not been measured.
 
 ```sh
 # Install Intel oneAPI MKL from https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl.html

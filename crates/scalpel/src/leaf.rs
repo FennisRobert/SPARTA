@@ -202,7 +202,7 @@ mod tests {
             let mut root = Graph::checked(&ptr, &adj).unwrap();
             root.weight = (0..total).map(|v| 1 + (v + seed) % 4).collect();
             let inside: Vec<usize> = (0..n).collect();
-            let g = root.induced(&inside, &root.local_map(&[inside.clone()]), |u| u < n);
+            let g = root.induced(&inside, &root.local_map(std::slice::from_ref(&inside)), |u| u < n);
             let w = &root.weight;
             let mut neighbors: Vec<BTreeSet<usize>> = (0..total)
                 .map(|v| root.neighbors(v).iter().map(|&u| u as usize).collect())

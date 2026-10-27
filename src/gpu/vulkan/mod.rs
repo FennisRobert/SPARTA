@@ -559,9 +559,7 @@ impl Inner {
                 input.len().min(up_bytes as usize),
             )
         };
-        let profiling =
-            std::env::var_os("SPARTA_PROFILE").is_some_and(|v| v != "0" && !v.is_empty());
-        let marks = if profiling { Some(self.marks()?) } else { None };
+        let marks = if crate::profile::enabled() { Some(self.marks()?) } else { None };
         let (commands, marks) = self.record(factoring, nrhs, up_bytes, state_bytes, marks)?;
         let submitted = self.submit(&commands);
         if let Some(marks) = marks {

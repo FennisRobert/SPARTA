@@ -140,6 +140,9 @@ a block is carried through one pass over the factors (through GEMM from four
 right-hand sides). This preserves sparse storage and the numerical algorithm,
 not bitwise arithmetic order or GPU scheduling.
 
+`SPARTA_CPU_DUMP=1` prints one line per level of a CPU factorization: depth,
+`seq` or `par`, front count, wall seconds, GFLOP and the first front's rows.
+
 ## Precision and settings
 
 All CPU front, factor, panel, diagonal, RHS and output scalars are the copy's

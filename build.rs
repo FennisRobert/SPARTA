@@ -15,7 +15,7 @@
 //!   f2c-style LAPACK, which Accelerate, OpenBLAS and MKL all export. The
 //!   provider is published as `cfg(sparta_accelerate)` / `cfg(sparta_blas)`.
 
-use std::{env, fs, path::PathBuf, process::Command};
+use std::{env, fs, path::{Path, PathBuf}, process::Command};
 
 /// `src/kernels/*.metal`, concatenated in this order to form the shader
 /// source. Dependency order, not alphabetical.
@@ -154,7 +154,7 @@ fn dense_kernels(os: &str) {
 }
 
 /// Compiles the Metal shader source and the Objective-C bridge.
-fn build_metal(out: &PathBuf) {
+fn build_metal(out: &Path) {
     // One Metal translation unit, concatenated in dependency order: `common`
     // defines everything the rest share, and each path's files follow it. The
     // split is for reading, not for compilation -- there are no include
@@ -265,7 +265,7 @@ fn vulkan_source_hash() -> String {
 /// as the kernel sources still hash to what they were built from. With it, the
 /// kernels are compiled fresh, and `SPARTA_WRITE_SPIRV=1` also refreshes the
 /// shipped copies: run that after editing a `.comp` file.
-fn build_vulkan(out: &PathBuf) {
+fn build_vulkan(out: &Path) {
     println!("cargo:rerun-if-env-changed=SPARTA_WRITE_SPIRV");
     println!("cargo:rerun-if-changed={SHIPPED}");
     let hash = vulkan_source_hash();
@@ -348,7 +348,7 @@ fn build_vulkan(out: &PathBuf) {
 
 /// Writes `vulkan_shaders.rs` over the shipped SPIR-V, in the same order and
 /// under the same names as a fresh compile.
-fn embed_shipped(out: &PathBuf) {
+fn embed_shipped(out: &Path) {
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join(SHIPPED);
     let mut table = String::from("pub(super) const SHADERS: &[(&str, &[u8])] = &[\n");
     let mut add = |name: String| {
