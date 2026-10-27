@@ -168,6 +168,19 @@ fn build_metal(out: &PathBuf) {
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(out.join("shader.h"), format!("@{source:?}")).unwrap();
+    // Objective-C class names share one table per process, so two libraries
+    // that each compile this bridge -- SPARTA's Python extension and another
+    // crate depending on SPARTA, loaded together -- would both register
+    // `SpartaContext`, and the runtime warns that which one it uses is
+    // undefined. The name is made unique to this build instead: `OUT_DIR`
+    // differs per build tree, and the macro renames every use in `metal.m`.
+    // Nothing looks the class up by name, so the name itself is free.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(out, &mut hasher);
+    let class = format!(
+        "-DSpartaContext=SpartaContext_{:016x}",
+        std::hash::Hasher::finish(&hasher)
+    );
     assert!(Command::new("xcrun")
         .args([
             "clang",
@@ -181,6 +194,7 @@ fn build_metal(out: &PathBuf) {
             "-o"
         ])
         .arg(out.join("metal.o"))
+        .arg(&class)
         .arg("-I")
         .arg(out)
         .status()

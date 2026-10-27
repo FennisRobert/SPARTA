@@ -45,7 +45,7 @@ extern "C" {
 #define SPARTA_VERSION_MINOR 1
 #define SPARTA_VERSION_PATCH 4
 
-/** Returns the library version as text, for example "0.3.0". */
+/** Returns the library version as text, for example "0.3.1". */
 const char *sparta_version(void);
 
 /** Returns the GPU backend this library was built for: "metal" or "vulkan".
