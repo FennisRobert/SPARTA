@@ -1,0 +1,120 @@
+# Builds the Python wheels and attaches them to a GitHub Release, so users can
+# install SPARTA without Rust or a C compiler. Nothing goes to PyPI.
+#
+# Pushing a tag v* builds that tag and creates its release. Running the
+# workflow by hand ("Run workflow" on the Actions tab) builds without
+# releasing, or, given a tag, builds that tag and attaches the wheels to its
+# release, creating the release if needed.
+name: wheels
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and release, e.g. v0.3.2. Empty: build only."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || '' }}
+
+jobs:
+  wheel:
+    name: wheel ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macos-arm64, os: macos-14, target: aarch64-apple-darwin, test: true }
+          # Intel Macs: cross-compiled, CPU backend only, not run here.
+          - { name: macos-x86_64, os: macos-14, target: x86_64-apple-darwin, test: false }
+          - { name: linux-x86_64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, test: true }
+          - { name: linux-aarch64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, test: true }
+          - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc, test: true }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # One abi3 wheel per platform serves Python 3.9 and later.
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: auto
+      # A CPU solve on a 2D grid, wide enough to reach the BLAS path. The
+      # runners have no usable GPU.
+      - name: Test the wheel
+        if: matrix.test
+        shell: bash
+        run: |
+          python -m pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          python - <<'PY'
+          import sys
+          import numpy as np
+          from scipy import sparse
+          import sparta
+          print(sparta.__version__, sparta.blas_library(), sparta.gpu_available())
+          if sys.platform != "darwin":
+              assert sparta.blas_library() != "portable loops", "no BLAS found"
+          m = 120
+          t = sparse.diags([-1.0, 4.0, -1.0], [-1, 0, 1], shape=(m, m))
+          a = (sparse.kron(sparse.eye(m), t) + sparse.kron(sparse.diags([-1.0, -1.0], [-1, 1], shape=(m, m)), sparse.eye(m))).tocsc()
+          a = (a + 0.1j * sparse.eye(m * m)).tocsc()
+          b = np.ones(m * m, dtype=complex)
+          x = sparta.analyze(a, force_cpu=True).factorize().solve(b)
+          r = np.linalg.norm(a @ x - b) / np.linalg.norm(b)
+          print("relative residual", r)
+          assert r < 1e-10
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.name }}
+          path: dist/*.whl
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG || github.ref }}
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  release:
+    needs: [wheel, sdist]
+    if: ${{ inputs.tag != '' || startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: SPARTA ${{ env.TAG }}
+          files: dist/*
+          body: |
+            Install without Rust or a compiler (macOS, Linux and Windows, Python 3.9 or later):
+
+            ```
+            pip install sparta-solver --find-links https://github.com/${{ github.repository }}/releases/expanded_assets/${{ env.TAG }}
+            ```
