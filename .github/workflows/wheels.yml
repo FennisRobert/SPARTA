@@ -31,9 +31,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: macos-arm64, os: macos-14, target: aarch64-apple-darwin, test: true }
+          - { name: macos-arm64, os: macos-15, target: aarch64-apple-darwin, test: true }
           # Intel Macs: cross-compiled, CPU backend only, not run here.
-          - { name: macos-x86_64, os: macos-14, target: x86_64-apple-darwin, test: false }
+          - { name: macos-x86_64, os: macos-15, target: x86_64-apple-darwin, test: false }
           - { name: linux-x86_64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, test: true }
           - { name: linux-aarch64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, test: true }
           - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc, test: true }
