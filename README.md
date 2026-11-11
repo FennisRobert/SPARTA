@@ -596,6 +596,40 @@ sparta_solve_many(solver, b, x, nrhs);        /* complex b, columns end to end a
 sparta_solve_many_real(solver, b, x, nrhs);   /* real b against real factors */
 ```
 
+### Port matrices and sparse right-hand sides (CPU)
+
+A frequency-domain model often needs only the `p × p` port matrix
+`Z = Bᵀ A⁻¹ B`, where each column of `B` has a handful of nonzeros. On CPU
+`LDLᵀ` factors, `port_matrix` computes it from the forward sweep alone:
+`Z = Yᵀ D⁻¹ Y` with `Y = L⁻¹ Pᵀ B`, plain transpose, and each column's sweep
+visits only the fronts on the paths from its nonzeros to the root of the
+assembly tree. There is no backward sweep and no dense `n × p` block.
+
+```python
+F = sparta.analyze(A, force_cpu=True).factorize()
+Z = F.port_matrix(B)          # B: scipy.sparse (n, p); Z: (p, p), exactly symmetric
+X = F.solve_sparse(B)         # (n, p), unrefined
+F.sparse_reach(B[:, 0].indices)   # how much of the factor one column touches
+```
+
+```rust
+use sparta::SparseRhs;
+// Column c holds the (row, value) pairs of port c, rows in the matrix's own numbering.
+let b = SparseRhs::from_columns(n, &ports)?;
+let z = solver.port_matrix(&b)?;       // p × p, column-major, exactly symmetric
+let x = solver.solve_sparse(&b)?;      // A X = B, n × p, columns end to end
+let reach = solver.sparse_reach(&rows)?; // how much of the factor one such column touches
+```
+
+`Z` is that of the factored matrix: statically perturbed pivots are in it and
+nothing refines it (in Python, equilibration is taken into account and
+refinement is not applied). Rows listed twice in a column are summed, and an empty column
+gives a zero row and column. The value types follow `solve_values`. GPU
+factors are refused, since `Z` formed from single-precision factors could not
+be refined. The gain follows the reach: on the 2D Helmholtz grid of
+`examples/port_matrix_timing.rs` a port reaches a few percent of the factor,
+on a small 3D curl-curl operator a third of it.
+
 ## Configuration
 
 Most users need no settings at all: the defaults are measured, and the ones
@@ -1226,6 +1260,7 @@ cargo run --release --example dispatch_audit -- test_matrices/em_m1_sym1.sparta
 | `bench` | Analyzes the first file once and reuses it for the rest, reporting per-stage timings, the double-precision residual and the distance to a shipped reference solution. |
 | `refine` | Mixed-precision refinement in Rust. |
 | `dispatch_audit` | Dispatched versus useful GPU threadgroups. |
+| `port_matrix_timing` | The port matrix `Bᵀ A⁻¹ B` of sparse ports against dense solves, on a 2D Helmholtz grid or a 3D curl-curl operator; `--release --example port_matrix_timing -- helmholtz 400 200 1 5 scattered`. |
 | `plan_digest` | A fingerprint of the analysis, used to show that a change to the analysis leaves the numerical work untouched. |
 | `run_sparta.sh` | One system through the Python API, with a formatted report. Takes `--refine N`, `--minimize`, `--ldlt`, `--verbose`. |
 | `tools/npz_to_sparta.py` | Converts EMerge exports (`MLPreconData` snapshots and bare SciPy matrices) into the `.sparta` format these tools read. |

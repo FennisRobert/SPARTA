@@ -105,6 +105,29 @@ count, residual history, and a `converged` property. History can include a rejec
 final correction. An invalid initial numerical result raises FloatingPointError.
 A small residual does not guarantee a small field-vector or S-parameter error.
 
+## F.port_matrix(B) → Z, F.solve_sparse(B) → X and F.sparse_reach(rows)
+
+For a sparse block `B` (a SciPy sparse matrix of shape `(n, p)`, each column a
+handful of nonzeros), `port_matrix` returns the `(p, p)` port matrix
+`Z = Bᵀ A⁻¹ B` (plain transpose, exactly symmetric) and `solve_sparse` returns
+`X = A⁻¹ B` with shape `(n, p)`. Both need CPU LDLT factors (`force_cpu=True`
+and a symmetric matrix) and raise `RuntimeError` on GPU or LU factors. Each
+column's forward sweep visits only the fronts on the paths from its nonzeros
+to the root of the assembly tree, and `port_matrix` runs no backward sweep, so
+on 2D-like problems it costs a small fraction of `solve_many` on the dense
+block. Rows stored twice in a column are summed, and an empty column gives a
+zero row and column of `Z`. Equilibration is taken into account; iterative
+refinement is not applied, so `Z` is that of the factored matrix and
+`refinement_reports` is empty afterwards. `sparse_reach(rows)` returns a dict
+of `fronts`, `columns` and `factor_entries` one column with nonzeros at `rows`
+reaches, and the factor's `total_fronts` and `total_factor_entries`.
+
+```python
+F = sparta.analyze(A, force_cpu=True).factorize()
+Z = F.port_matrix(B)          # B: scipy.sparse, shape (n, p)
+X = F.solve_sparse(B)         # shape (n, p), unrefined
+```
+
 ## Matrix types and factorization paths
 
 | MatrixType | Interpretation | AUTO path |

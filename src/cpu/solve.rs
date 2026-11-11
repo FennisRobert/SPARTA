@@ -59,7 +59,7 @@ const GEMM_RHS: usize = 4;
 const GEMM_MIN: usize = 4096;
 
 /// Whether a trailing product over `elements` factor values goes to GEMM.
-fn gemm(r: usize, elements: usize) -> bool {
+pub(super) fn gemm(r: usize, elements: usize) -> bool {
     cfg!(any(sparta_accelerate, sparta_blas)) && r >= GEMM_RHS && elements >= GEMM_MIN
 }
 
@@ -128,6 +128,15 @@ impl Solver {
                     *slot = b[c * n + old as usize];
                 }
             });
+        self.sweeps(&mut x, r, true);
+        self.unpermute(&x, r)
+    }
+
+    /// The forward sweep when `forward`, then the diagonal and backward
+    /// sweeps, over permuted right-hand sides `x` holding `r` values per
+    /// unknown.
+    pub(super) fn sweeps(&self, x: &mut [C], r: usize, forward: bool) {
+        debug_assert_eq!(x.len(), self.plan.n * r);
         let rows = Rows(x.as_mut_ptr());
         // Rayon owns the parallelism, as in the factorization: the GEMMs run
         // one per task, on the calling thread.
@@ -136,9 +145,12 @@ impl Solver {
             dense::set_global_threading(Threading::Caller);
             rayon::broadcast(|_| dense::set_threading(Threading::Caller));
         }
-        // SAFETY: each sweep keeps to the per-level discipline `Rows` states.
+        // SAFETY: each sweep keeps to the per-level discipline `Rows` states,
+        // and `x` is borrowed mutably for all of them.
         unsafe {
-            self.forward(rows, r);
+            if forward {
+                self.forward(rows, r);
+            }
             if self.plan.kind == Kind::Ldlt {
                 self.diagonal_solve(rows, r);
             }
@@ -148,7 +160,13 @@ impl Solver {
             dense::set_global_threading(Threading::Machine);
             rayon::broadcast(|_| dense::set_threading(Threading::Machine));
         }
-        let mut out = vec![C::from_re(0.0); b.len()];
+    }
+
+    /// Permuted solutions `x`, `r` values per unknown, as `r` columns in the
+    /// matrix's own numbering packed end to end.
+    pub(super) fn unpermute(&self, x: &[C], r: usize) -> Result<Vec<C>> {
+        let (n, perm) = (self.plan.n, &self.plan.perm);
+        let mut out = vec![C::from_re(0.0); n * r];
         out.par_chunks_mut(n).enumerate().for_each(|(c, column)| {
             for (row, &old) in x.chunks_exact(r).zip(perm.iter()) {
                 column[old as usize] = row[c];
@@ -158,6 +176,36 @@ impl Solver {
             return Err(Error::Invalid("nonfinite CPU solve result".into()));
         }
         Ok(out)
+    }
+
+    /// The full forward sweep alone, for tests that compare against it.
+    #[cfg(test)]
+    pub(super) fn forward_all(&self, x: &mut [C], r: usize) {
+        assert_eq!(x.len(), self.plan.n * r);
+        // SAFETY: `x` is borrowed mutably for the whole sweep.
+        unsafe { self.forward(Rows(x.as_mut_ptr()), r) }
+    }
+
+    /// `D^{-1}` on the right-hand sides of the pivot at `at`: `xi` alone for
+    /// a 1x1 pivot, `xi` and `xj`, its partner row, for a 2x2 block. Returns
+    /// the pivot's width.
+    pub(super) fn invert_pivot(&self, at: usize, xi: &mut [C], xj: Option<&mut [C]>) -> usize {
+        if let (true, Some(xj)) = (self.two[at], xj) {
+            let (a, b, c, s, det) =
+                block(self.diagonal[at], self.subdiag[at], self.diagonal[at + 1]);
+            for (vi, vj) in xi.iter_mut().zip(xj.iter_mut()) {
+                let (u, v) = (*vi / s, *vj / s);
+                *vi = div(u * c - v * b, det);
+                *vj = div(v * a - u * b, det);
+            }
+            return 2;
+        }
+        debug_assert!(!self.two[at], "2x2 pivot without its partner row");
+        let d = self.diagonal[at];
+        for v in xi.iter_mut() {
+            *v = div(*v, d);
+        }
+        1
     }
 
     /// `L y = b`, leaves first. Each node's trailing update travels to its
@@ -261,26 +309,8 @@ impl Solver {
             let mut k = 0;
             while k < node.nc as usize {
                 let xi = x.row(global(k), r);
-                if self.two[first + k] {
-                    let xj = x.row(global(k + 1), r);
-                    let (a, b, c, s, det) = block(
-                        self.diagonal[first + k],
-                        self.subdiag[first + k],
-                        self.diagonal[first + k + 1],
-                    );
-                    for (vi, vj) in xi.iter_mut().zip(xj.iter_mut()) {
-                        let (u, v) = (*vi / s, *vj / s);
-                        *vi = div(u * c - v * b, det);
-                        *vj = div(v * a - u * b, det);
-                    }
-                    k += 2;
-                } else {
-                    let d = self.diagonal[first + k];
-                    for v in xi.iter_mut() {
-                        *v = div(*v, d);
-                    }
-                    k += 1;
-                }
+                let xj = self.two[first + k].then(|| x.row(global(k + 1), r));
+                k += self.invert_pivot(first + k, xi, xj);
             }
         });
     }

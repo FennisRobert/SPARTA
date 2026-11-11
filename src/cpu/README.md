@@ -140,6 +140,17 @@ a block is carried through one pass over the factors (through GEMM from four
 right-hand sides). This preserves sparse storage and the numerical algorithm,
 not bitwise arithmetic order or GPU scheduling.
 
+Sparse right-hand sides (`src/cpu/sparse.rs`, `Solver::port_matrix`,
+`Solver::solve_sparse`) reuse this structure. Fronts are numbered children
+first, a column's forward sweep is nonzero only on the fronts from its rows'
+fronts to the root, and because no pivot is delayed and a 2×2 block never
+leaves its front, those are the analyzed fronts and a block's two rows are
+always in the same reach (a 2×2 flag at a front's last column is refused,
+not guessed at). A block of eight columns runs the multifrontal forward sweep
+over the union of its reaches, large fronts through `?trsm` and GEMM as in the
+full solve. The port matrix is then `Yᵀ D⁻¹ Y`, one GEMM per run of fronts two
+blocks share; one triangle is formed and mirrored, so it is exactly symmetric.
+
 `SPARTA_CPU_DUMP=1` prints one line per level of a CPU factorization: depth,
 `seq` or `par`, front count, wall seconds, GFLOP and the first front's rows.
 

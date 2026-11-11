@@ -63,6 +63,7 @@ mod scalar;
 pub mod profiles;
 pub mod settings;
 mod solver;
+mod sparse_rhs;
 #[doc(hidden)]
 // Public so examples/colcount_bench.rs can time the symbolic internals.
 // Not part of the supported API surface.
@@ -79,6 +80,7 @@ pub use scalar::{Scalar, ScalarKind};
 /// Standalone Rust ordering API and tuning options.
 pub use scalpel;
 pub use solver::Solver;
+pub use sparse_rhs::{SparseReach, SparseRhs};
 pub use symbolic::OrderingMethod;
 /// Why a front's pivot search gave up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

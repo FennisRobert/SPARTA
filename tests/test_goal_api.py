@@ -156,6 +156,8 @@ class GoalApiTests(unittest.TestCase):
         public = {'analyze', 'solve', 'solve_many', 'factorize', 'diagnostics', 'destroy',
                   'n', 'info', 'refinement_reports', 'perturbed_pivots', 'reanalyses',
                   'factor_device_seconds', 'factor_seconds', 'compute_dtype', 'hybrid_timing', 'converged', 'estimated_relative_error',
+                  # Sparse right-hand sides on CPU LDLT factors.
+                  'port_matrix', 'solve_sparse', 'sparse_reach',
                   # FactorQuality, reachable as Solver.quality.
                   'quality', 'pivot_ratio', 'verdict', 'usable',
                   # Config and its constructors, which mirror sparta::Config.
