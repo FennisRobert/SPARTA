@@ -11,9 +11,11 @@ mod level;
 mod panel;
 mod profile;
 mod solve;
+mod sparse;
 mod update;
 
 use crate::{Analysis, Error, Kind, Result};
+pub(crate) use sparse::Columns;
 
 // `C`, the value type of this copy, and `R`, the real type of its precision.
 cpu_types!();
@@ -313,6 +315,11 @@ impl Solver {
     /// another value type to take over.
     pub(crate) fn into_plan(self) -> Analysis {
         self.plan
+    }
+
+    /// The analyzed dimension.
+    pub(crate) fn dimension(&self) -> usize {
+        self.plan.n
     }
 
     /// Release factors and symbolic storage; later numerical calls return errors.

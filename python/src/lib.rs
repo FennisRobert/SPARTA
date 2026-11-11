@@ -219,6 +219,35 @@ impl PyFactor {
     fn solve_many<'py>(&mut self, py: Python<'py>, rhs: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         values::solve_many(py, &mut self.solver, rhs)
     }
+    /// Refused: GPU factors are single precision. `B^T A^-1 B` for the CSC block `B` given by `n`, `ptr`, `rows` and
+    /// `values`, as a (ncols, ncols) array of the values' dtype.
+    fn port_matrix<'py>(
+        &self,
+        py: Python<'py>,
+        n: usize,
+        ptr: PyReadonlyArray1<'py, usize>,
+        rows: PyReadonlyArray1<'py, usize>,
+        values: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        values::port_matrix(py, &self.solver, n, ptr, rows, values)
+    }
+    /// Solve `A X = B` for a CSC block `B`, returning a (ncols, n) block.
+    fn solve_sparse<'py>(
+        &self,
+        py: Python<'py>,
+        n: usize,
+        ptr: PyReadonlyArray1<'py, usize>,
+        rows: PyReadonlyArray1<'py, usize>,
+        values: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        values::solve_sparse(py, &self.solver, n, ptr, rows, values)
+    }
+    /// How much of the factor a right-hand side with nonzeros at `rows`
+    /// reaches: (fronts, pivot columns, factor entries, total fronts, total
+    /// factor entries).
+    fn sparse_reach(&self, rows: PyReadonlyArray1<'_, usize>) -> PyResult<(usize, usize, usize, usize, usize)> {
+        values::sparse_reach(&self.solver, rows)
+    }
     /// Numerical factorization duration in seconds (CPU wall time or GPU commands).
     #[getter]
     fn factor_seconds(&self) -> f64 {

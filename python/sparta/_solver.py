@@ -392,6 +392,88 @@ class Solver:
             self._print_summary(b, result, time.perf_counter() - started)
         return result
 
+    def port_matrix(self, B: sparse.spmatrix) -> np.ndarray:
+        """Return the port matrix Z = B^T A^-1 B for a sparse block B.
+
+        B : SciPy sparse matrix, shape (n, p), real or complex floating-point
+            values; a row stored twice in a column counts with the sum.
+        Returns a (p, p) array, exactly symmetric (plain transpose, nothing
+        conjugated), of the dtype solve_many would return for B. An empty
+        column gives a zero row and column.
+
+        Needs CPU LDLT factors (force_cpu=True and a symmetric matrix). Only
+        the forward sweep over each column's reach in the assembly tree runs,
+        which costs a fraction of p dense solves when the columns are sparse;
+        see sparse_reach. Z is that of the factored (equilibrated) matrix:
+        iterative refinement is not applied, and refinement_reports is empty
+        afterwards. Raises RuntimeError on GPU or LU factors and ValueError
+        for an invalid block or before factorize.
+        """
+        native = self._require_factor()
+        ptr, rows, values, dtype = self._sparse_block(B)
+        self._refinement_reports = ()
+        z = np.asarray(native.port_matrix(self.n, ptr, rows, values))
+        return z.astype(self._result_dtype(dtype), copy=False)
+
+    def solve_sparse(self, B: sparse.spmatrix) -> np.ndarray:
+        """Solve A X = B for a sparse block B, returning X with shape (n, p).
+
+        Arguments, value types and backend requirements as for port_matrix.
+        The forward sweep visits only each column's reach; the diagonal and
+        backward sweeps are those of solve_many. Iterative refinement is not
+        applied: use solve_many for refined solutions.
+        """
+        native = self._require_factor()
+        ptr, rows, values, dtype = self._sparse_block(B)
+        self._refinement_reports = ()
+        x = np.asarray(native.solve_sparse(self.n, ptr, rows, values)).T
+        if self._column_scale is not None:
+            x = x.astype(np.result_type(x.dtype, np.float64)) * self._column_scale[:, None]
+        return x.astype(self._result_dtype(dtype), copy=False)
+
+    def sparse_reach(self, rows: np.ndarray) -> dict[str, int]:
+        """How much of the factor one right-hand side with nonzeros at rows reaches.
+
+        rows : integer indices in 0..n. Returns the fronts, pivot columns and
+        stored factor entries on the paths from those rows' fronts to the root
+        of the assembly tree, which is all the forward sweep of port_matrix or
+        solve_sparse visits for that column, and the totals of the whole
+        factor. Needs CPU LDLT factors.
+        """
+        native = self._require_factor()
+        index = np.asarray(rows)
+        if index.ndim != 1 or (index.size and index.dtype.kind not in 'iu'):
+            raise ValueError('rows must be a one-dimensional array of integer indices')
+        if index.size and (index.min() < 0 or index.max() >= self.n):
+            raise ValueError('rows must lie in 0..n')
+        reach = native.sparse_reach(np.ascontiguousarray(index, dtype=np.uintp))
+        names = ('fronts', 'columns', 'factor_entries', 'total_fronts', 'total_factor_entries')
+        return dict(zip(names, reach))
+
+    def _sparse_block(self, B: sparse.spmatrix) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.dtype]:
+        """Return the CSC arrays of a sparse right-hand side block for the factors.
+
+        B must be SciPy sparse with n rows and finite floating-point values.
+        Returns (indptr, indices, values, dtype of B): the indices as uintp,
+        the values row-scaled like the factored matrix and in its precision,
+        and complex when the matrix is, as _validate_rhs promotes.
+        """
+        if not sparse.issparse(B) or B.ndim != 2 or B.shape[0] != self.n:
+            raise ValueError('B must be a SciPy sparse matrix with n rows')
+        b = B.tocsc()
+        if b.dtype not in VALUE_TYPES or not np.isfinite(b.data).all():
+            raise ValueError('B must contain finite real or complex floating-point values')
+        data = b.data
+        if np.iscomplexobj(self._a.data) and not np.iscomplexobj(data):
+            data = data.astype(np.complex64 if data.dtype == np.float32 else np.complex128)
+        if self._row_scale is not None:
+            # LDLT equilibration scales rows and columns alike, so Z of the
+            # scaled factors with R B is B^T A^-1 B, and X is C times theirs.
+            data = data.astype(np.result_type(data.dtype, np.float64)) * self._row_scale[b.indices]
+        return (np.ascontiguousarray(b.indptr, dtype=np.uintp),
+                np.ascontiguousarray(b.indices, dtype=np.uintp),
+                self._native_values(data, 'B'), b.dtype)
+
     def _result_dtype(self, rhs: np.dtype) -> np.dtype:
         """Return the dtype a solve with a right-hand side of dtype rhs returns.
 

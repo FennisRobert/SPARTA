@@ -5,6 +5,7 @@
 //! backend compiled for that type; on the GPU, single precision only.
 use crate::scalar::{Scalar, ScalarKind};
 use crate::{cpu_c, cpu_d, cpu_s, cpu_z, gpu, Analysis, Complex32, Complex64, Device, Error, Result};
+use crate::{SparseReach, SparseRhs};
 use std::any::TypeId;
 
 /// Reusable factors. `Config::force_cpu` selects the Rust CPU numerics.
@@ -43,6 +44,38 @@ macro_rules! each_cpu {
             Cpu::D($s) => $body,
             Cpu::S($s) => $body,
             Cpu::Idle(_) | Cpu::Gone => $idle,
+        }
+    };
+}
+
+/// Run `$method` on sparse block `$b` with whichever typed CPU solver `$cpu`
+/// holds, its values converted to the factors' type. Against real factors a
+/// complex `$b` goes as its real and imaginary parts, and `$join` puts the
+/// result back together.
+macro_rules! sparse_call {
+    ($cpu:expr, $b:expr, $method:ident, $join:expr) => {
+        match $cpu {
+            Cpu::Z(s) => typed($b, |ptr, rows, values| {
+                s.$method(cpu_z::Columns { ptr, rows, values })
+            }),
+            Cpu::C(s) => typed($b, |ptr, rows, values| {
+                s.$method(cpu_c::Columns { ptr, rows, values })
+            }),
+            Cpu::D(s) if T::KIND.is_complex() => parts($b, |ptr, rows, values| {
+                s.$method(cpu_d::Columns { ptr, rows, values })
+            })
+            .map($join),
+            Cpu::S(s) if T::KIND.is_complex() => parts($b, |ptr, rows, values| {
+                s.$method(cpu_s::Columns { ptr, rows, values })
+            })
+            .map($join),
+            Cpu::D(s) => typed($b, |ptr, rows, values| {
+                s.$method(cpu_d::Columns { ptr, rows, values })
+            }),
+            Cpu::S(s) => typed($b, |ptr, rows, values| {
+                s.$method(cpu_s::Columns { ptr, rows, values })
+            }),
+            Cpu::Idle(_) | Cpu::Gone => Err(Error::Invalid("no CPU factors".into())),
         }
     };
 }
@@ -169,6 +202,95 @@ impl Solver {
                 Cpu::Idle(_) | Cpu::Gone => Err(Error::Invalid("no CPU factors".into())),
             },
         }
+    }
+
+    /// The port matrix `Z = B^T A^{-1} B` of a sparse block `B`, as an
+    /// `ncols` by `ncols` column-major block. Plain transpose: for a complex
+    /// symmetric `A`, nothing is conjugated.
+    ///
+    /// CPU `LDL^T` factors only. `Z = Y^T D^{-1} Y` with `Y = L^{-1} P^T B`:
+    /// each column's forward sweep visits only the fronts on the paths from
+    /// its nonzeros to the root, and no backward sweep runs, so `Z` costs a
+    /// fraction of `ncols` full solves when the columns are sparse (see
+    /// [`Solver::sparse_reach`]). `Z` is exactly symmetric (one triangle is
+    /// computed and mirrored), and an empty column gives a zero row and
+    /// column. Like the other solves, its rounding may differ between thread
+    /// counts. It is `Z` of the factored matrix: any
+    /// statically perturbed pivots (see [`Solver::perturbed_pivots`]) are in
+    /// it, and nothing refines it.
+    ///
+    /// The value types follow [`Solver::solve_values`]: `B` in the precision
+    /// the matrix was factored in; a complex `B` against real factors is
+    /// taken as its real and imaginary parts.
+    pub fn port_matrix<T: Scalar>(&self, b: &SparseRhs<T>) -> Result<Vec<T>> {
+        let cpu = self.sparse_cpu::<T>(b.n())?;
+        let p = b.ncols();
+        sparse_call!(cpu, b, port_matrix, |z| join_port_matrix(&z, p))
+    }
+
+    /// Solve `A X = B` for a sparse block `B`, returning `X` as dense columns
+    /// packed end to end, the layout of [`Solver::solve_values`].
+    ///
+    /// CPU `LDL^T` factors only. The forward sweep visits only each column's
+    /// reach; the diagonal and backward sweeps are those of
+    /// [`Solver::solve_values`], so the columns agree with it to rounding. No
+    /// refinement is applied. Value types as for [`Solver::port_matrix`].
+    pub fn solve_sparse<T: Scalar>(&self, b: &SparseRhs<T>) -> Result<Vec<T>> {
+        let cpu = self.sparse_cpu::<T>(b.n())?;
+        let n = b.n();
+        sparse_call!(cpu, b, solve_sparse, |x| join_columns(&x, n))
+    }
+
+    /// How much of the factor one right-hand side with nonzeros at `rows`
+    /// (the matrix's own numbering) reaches: the fronts on the paths from its
+    /// rows' fronts to the root, which are all its forward sweep visits.
+    ///
+    /// A caller can compare it with the whole factor to tell whether
+    /// [`Solver::port_matrix`] will pay over dense solves. CPU `LDL^T` plans
+    /// only; no factorization is needed, since the CPU factor delays no pivot
+    /// and so has exactly the analyzed fronts.
+    pub fn sparse_reach(&self, rows: &[usize]) -> Result<SparseReach> {
+        match &self.backend {
+            Backend::Gpu(_) => Err(gpu_sparse()),
+            Backend::Cpu(Cpu::Idle(plan)) => crate::sparse_rhs::reach_of(plan, rows),
+            Backend::Cpu(cpu) => {
+                let destroyed = || Err(Error::Invalid("the solver was destroyed".into()));
+                each_cpu!(cpu, s => s.sparse_reach(rows), destroyed())
+            }
+        }
+    }
+
+    /// The CPU factors a sparse right-hand side of value type `T` and
+    /// dimension `n` can be solved against.
+    fn sparse_cpu<T: Scalar>(&self, n: usize) -> Result<&Cpu> {
+        let cpu = match &self.backend {
+            Backend::Gpu(_) => return Err(gpu_sparse()),
+            Backend::Cpu(cpu) => cpu,
+        };
+        let Some(kind) = self.factored else {
+            return Err(Error::Invalid(
+                "successful factorization required before solve".into(),
+            ));
+        };
+        if kind.is_double() != T::KIND.is_double() {
+            return Err(Error::Invalid(format!(
+                "the matrix was factored in {kind}; solve with a right-hand side of the same precision, not {}",
+                T::KIND
+            )));
+        }
+        if kind.is_complex() && !T::KIND.is_complex() {
+            return Err(Error::Invalid(format!(
+                "the matrix was factored in {kind}, so the solution is complex; pass a complex right-hand side, not {}",
+                T::KIND
+            )));
+        }
+        let analyzed = each_cpu!(cpu, s => s.dimension(), 0);
+        if n != analyzed {
+            return Err(Error::Invalid(format!(
+                "sparse right-hand side of dimension {n} against a matrix of dimension {analyzed}"
+            )));
+        }
+        Ok(cpu)
     }
 
     /// Value type of the latest successful factorization, or `None` before one.
@@ -345,6 +467,82 @@ fn solve_real<T: Scalar, U: Scalar>(
         );
     }
     Ok(out)
+}
+
+/// Run `op` on the columns of `b` with their values in `U`, the factors' type,
+/// and convert its result back to `T`.
+fn typed<T: Scalar, U: Scalar>(
+    b: &SparseRhs<T>,
+    op: impl FnOnce(&[usize], &[usize], &[U]) -> Result<Vec<U>>,
+) -> Result<Vec<T>> {
+    let (ptr, rows, values) = b.parts();
+    op(ptr, rows, &convert(values)).map(|x| convert(&x))
+}
+
+/// Run `op`, against real factors of type `U`, on complex `b` taken as two
+/// real columns per column: its real part, then its imaginary part. A part
+/// that is exactly zero becomes an empty column.
+fn parts<T: Scalar, U: Scalar>(
+    b: &SparseRhs<T>,
+    op: impl FnOnce(&[usize], &[usize], &[U]) -> Result<Vec<U>>,
+) -> Result<Vec<U>> {
+    let (mut ptr, mut rows, mut values) = (vec![0], Vec::new(), Vec::new());
+    for c in 0..b.ncols() {
+        let (r, v) = b.column(c);
+        for part in [|z: Complex64| z.re, |z: Complex64| z.im] {
+            for (&row, &value) in r.iter().zip(v) {
+                let x = part(value.to_c64());
+                if x != 0.0 {
+                    rows.push(row);
+                    values.push(U::from_c64(Complex64::new(x, 0.0)));
+                }
+            }
+            ptr.push(rows.len());
+        }
+    }
+    op(&ptr, &rows, &values)
+}
+
+/// The complex port matrix of `p` columns from the real one of their `2p`
+/// real and imaginary parts: `Z[a, b] = (R[a, b] - I[a, b]) + i (C[a, b] + C[b, a])`.
+/// Each entry is built from the mirror images of its mirror's terms, so `Z`
+/// stays exactly symmetric.
+fn join_port_matrix<U: Scalar, T: Scalar>(z: &[U], p: usize) -> Vec<T> {
+    let q = 2 * p;
+    let at = |i: usize, j: usize| z[i + j * q].re_f64();
+    let mut out = Vec::with_capacity(p * p);
+    for b in 0..p {
+        for a in 0..p {
+            let re = at(2 * a, 2 * b) - at(2 * a + 1, 2 * b + 1);
+            let im = at(2 * a, 2 * b + 1) + at(2 * a + 1, 2 * b);
+            out.push(T::from_c64(Complex64::new(re, im)));
+        }
+    }
+    out
+}
+
+/// Complex columns of length `n` from real ones holding each column's real
+/// part, then its imaginary part.
+fn join_columns<U: Scalar, T: Scalar>(x: &[U], n: usize) -> Vec<T> {
+    let mut out = Vec::with_capacity(x.len() / 2);
+    for pair in x.chunks(2 * n) {
+        let (re, im) = pair.split_at(n);
+        out.extend(
+            re.iter()
+                .zip(im)
+                .map(|(r, i)| T::from_c64(Complex64::new(r.re_f64(), i.re_f64()))),
+        );
+    }
+    out
+}
+
+/// Why a sparse right-hand side cannot run on GPU factors.
+fn gpu_sparse() -> Error {
+    Error::Unsupported(
+        "sparse right-hand sides and the port matrix need CPU LDL^T factors (Config { force_cpu: true, .. }); \
+         GPU factors are single precision, and a port matrix formed from them could not be refined"
+            .into(),
+    )
 }
 
 /// `values` as a slice of `U`, which must be the same type as `T`.

@@ -656,6 +656,23 @@ let x = solver.solve_values(&b, nrhs)?;
 X = solver.solve_many(B)
 ```)
 
+*Sparse right-hand sides (CPU `LDLᵀ`):* when only $Z = B^T A^(-1) B$ is
+needed for a sparse $B$, such as the port matrix of a frequency-domain model,
+`port_matrix` forms it from forward sweeps limited to each column's reach in
+the assembly tree, without a backward sweep or a dense $n times p$ block.
+`solve_sparse` returns $X$ itself, and `sparse_reach` says how much of the
+factor one column touches.
+
+#code(```rust
+// Rust: column c holds the (row, value) pairs of port c.
+let b = sparta::SparseRhs::from_columns(n, &ports)?;
+let z = solver.port_matrix(&b)?;   // p x p, column-major, exactly symmetric
+```)
+#code(```python
+# Python: B is a SciPy sparse matrix of shape (n, p); needs force_cpu=True.
+Z = solver.port_matrix(B)
+```)
+
 *New values with the same pattern*, such as the next frequency: factor again.
 The analysis and the memory are reused.
 
