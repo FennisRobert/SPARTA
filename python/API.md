@@ -71,6 +71,8 @@ keep the current value. Numerical options (`equilibrate`, `refinement_steps`,
 `refinement_rtol`, `refinement_minimize`) can change and persist. Analysis options
 (`ordering`, `mtype`, `path`, `triangle`, `max_front`) can be repeated unchanged,
 so `factorize(**settings)` works. Changing them requires a new analyze call.
+`supernodal` is accepted and ignored, for the same reason: the route is
+chosen by analyze.
 `Path.AUTO` also accepts the already selected path; it does not reselect it.
 
 Invalid input/options preserve an existing factorization. A failure during GPU
@@ -334,16 +336,19 @@ complex128 even when the inputs are single precision. `refinement_steps=0`
 measures the direct solve; the existing refinement and scaling options also work.
 CPU tuning uses `cpu_panel`, `cpu_block_rows`, and `cpu_blas_min_rows`.
 
-`cpu_supernodal=True` factors LDLT supernodally instead of multifrontally. Each
-node's columns are assembled and factored in place in the factor store, and
-its update is added straight into the columns of the ancestors that own those
-rows, so no frontal matrix is ever cleared or passed up the tree. Pivoting, the
-factor layout and the solve are unchanged, and the front workspace is never
-allocated. On the EMerge systems in `test_matrices` (M4 Pro) it factors 25-43%
-faster with lower peak memory. It is off by default; LU and the GPU ignore it.
+`supernodal`, on by default, factors LDLT supernodally. On the CPU each node's
+columns are assembled and factored in place in the factor store, and its update
+is added straight into the columns of the ancestors that own those rows, so no
+frontal matrix is ever cleared or passed up the tree, and the front workspace is
+never allocated. On the GPU the fronts stay but keep only the lower half of
+their trailing blocks, which halves clearing, compaction and assembly. Pivoting,
+the factor layout and the solve are unchanged. On the EMerge systems in
+`test_matrices` (M4 Pro) the CPU factors 25-43% faster with lower peak memory,
+and the GPU about 15% faster. `supernodal=False` is the multifrontal route.
+LU ignores it.
 
 ```python
-solver = sparta.analyze(A, force_cpu=True, cpu_supernodal=True).factorize()
+solver = sparta.analyze(A, force_cpu=True, supernodal=False).factorize()  # multifrontal
 ```
 `threads=n` runs the solver's analysis, factorization and solves on a pool of
 its own `n` threads instead of the process-wide pool that `RAYON_NUM_THREADS`

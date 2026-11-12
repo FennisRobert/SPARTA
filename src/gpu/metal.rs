@@ -131,6 +131,8 @@ impl Context {
             plan.config.strip_block,
             plan.config.pivot_threads,
             plan.config.schur_chunk,
+            // SPARTA_LOWER: LDL^T trailing blocks kept lower only.
+            u32::from(plan.kind == crate::Kind::Ldlt && plan.config.supernodal),
         ];
         let raw = unsafe {
             sparta_v1_create(

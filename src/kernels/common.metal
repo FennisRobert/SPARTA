@@ -286,6 +286,16 @@ struct UpdateTile {
 #endif
 // Per-thread register block edge; the 16x16 threadgroup covers
 // SCHUR_TILE = 16*SCHUR_BLOCK. Overridden by Config::schur_block.
+// Set for LDL^T plans. The trailing block of a front -- rows and columns
+// past nc -- is then kept as its lower triangle only: update_schur writes no
+// mirror, compaction and the parent's extend-add move half the block, and the
+// front clear skips the part above the diagonal. Nothing on the LDL^T path
+// reads that half. Pivot searches and swaps are confined to the fully summed
+// block, whose upper triangle assembly still mirrors, and U12 is never read
+// (see cooperative_swap). LU needs both halves and leaves this 0.
+#ifndef SPARTA_LOWER
+#define SPARTA_LOWER 0
+#endif
 #ifndef SCHUR_BLOCK
 #define SCHUR_BLOCK 4
 #endif

@@ -56,7 +56,7 @@ The C/C++ ABI exposes the GPU only: complex64, and float32 through
 
 ## Supernodal LDLᵀ
 
-`Config::cpu_supernodal` (`cpu_supernodal=True` in Python) replaces the
+`Config::supernodal` (`supernodal` in Python, on by default) replaces the
 multifrontal LDLᵀ factorization with a right-looking supernodal one
 (`supernodal.rs`). Every node's `nr × nc` block of the factor store is cleared
 and given its original entries up front. A node is then factored in place --

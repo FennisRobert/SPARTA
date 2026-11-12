@@ -102,7 +102,7 @@ impl CConfig {
             cpu_panel: base.cpu_panel,
             cpu_block_rows: base.cpu_block_rows,
             cpu_blas_min_rows: base.cpu_blas_min_rows,
-            cpu_supernodal: base.cpu_supernodal,
+            supernodal: base.supernodal,
             hybrid_cpu: self.hybrid_cpu,
             threads: self.threads as usize,
         };

@@ -117,6 +117,47 @@ class SchurCadenceTests(unittest.TestCase):
         expected = rng.normal(size=a.shape[0]) + 1j * rng.normal(size=a.shape[0])
         self.sweep(a, expected)
 
+    def test_supernodal_matches_full_trailing_blocks(self):
+        """supernodal (the default) keeps LDLT trailing blocks lower only.
+
+        Every front kind hands its block to a parent here: the block matrix
+        has wide children under a wide root, and the shifted 3D grid has
+        small, narrow and wide fronts with 2x2 pivots. Both systems must solve
+        alike with supernodal on and off.
+        """
+        rng = np.random.default_rng(57)
+
+        def block(n):
+            x = rng.uniform(-0.01, 0.01, (n, n)) + 1j * rng.uniform(-0.01, 0.01, (n, n))
+            return sparse.csc_matrix(x + x.T + np.eye(n) * 8)
+
+        c1 = sparse.csc_matrix(rng.uniform(-0.01, 0.01, (200, 176)) * (1 + 0.1j))
+        c2 = sparse.csc_matrix(rng.uniform(-0.01, 0.01, (232, 176)) * (1 + 0.1j))
+        tree = sparse.bmat([[block(200), None, c1], [None, block(232), c2],
+                            [c1.T, c2.T, block(176)]], format='csc')
+        side = 14
+        line = sparse.diags([-1.0, 2.0, -1.0], [-1, 0, 1], shape=(side, side))
+        eye = sparse.identity(side)
+        grid = sparse.csc_matrix(
+            sparse.kron(sparse.kron(line, eye), eye) + sparse.kron(sparse.kron(eye, line), eye)
+            + sparse.kron(sparse.kron(eye, eye), line) - (2.3 - 0.4j) * sparse.identity(side**3))
+        for name, a in (('tree', tree), ('grid', grid)):
+            expected = rng.normal(size=a.shape[0]) + 1j * rng.normal(size=a.shape[0])
+            b = a @ expected
+            solutions, perturbed = [], []
+            for supernodal in (True, False):
+                with self.subTest(system=name, supernodal=supernodal):
+                    f = sparta.analyze(a, refinement_steps=0, supernodal=supernodal).factorize()
+                    x = f.solve(b)
+                    self.assertLess(float(np.linalg.norm(a @ x - b) / np.linalg.norm(b)), 3e-5)
+                    solutions.append(x)
+                    perturbed.append(f.perturbed_pivots)
+                    del f
+            drift = float(np.linalg.norm(solutions[0] - solutions[1]) / np.linalg.norm(solutions[1]))
+            self.assertLess(drift, 1e-5, f'{name}: supernodal drifted {drift:.3g}')
+            self.assertEqual(perturbed[0], perturbed[1])
+        self.assertTrue(sparta.Config.defaults().supernodal)
+
     def test_cadence_does_not_change_two_by_two_pivots(self):
         """2x2 pivots, including ones that straddle a drain boundary.
 

@@ -3,8 +3,10 @@
 // `update_strip` refreshes the fully summed columns after every panel, because
 // that is what the next pivot search reads. `update_schur` drains the
 // trailing-by-trailing block on the host's own cadence, since nothing reads it
-// until the parent assembles it. Both fold the block diagonal into one operand
-// and exploit symmetry by writing each result twice.
+// until the parent assembles it. Both fold the block diagonal into one operand.
+// The strip writes each result twice inside the fully summed block, where the
+// pivot row search reads the mirror; the Schur block is kept lower only
+// (SPARTA_LOWER in common.metal).
 // Folds the block diagonal into one row of the factor panel. Reads the paired
 // column straight from device memory, which keeps the staged panel to the two
 // arrays actually consumed by the inner product.
@@ -111,6 +113,113 @@ kernel void update_strip(
 // already refuses to split a 2x2 pivot across chunks. Accumulating the whole
 // batch in `acc` before touching `a` is what saves the traffic, and it rounds
 // the destination once per batch instead of once per panel.
+#if SCHUR_TILE == 64 && SCHUR_CHUNK % 8 == 0 && SCHUR_CHUNK <= 16
+// The same update on the simdgroup matrix units. The tile is an 8 x 8 grid of
+// 8 x 8 blocks, and simdgroup `sg` owns block row `sg`, accumulating its
+// eight blocks in registers. A complex product is four real ones, with the
+// real and imaginary parts staged separately and the imaginary part of the
+// row operand staged negated as well, since the units only add:
+//   re += Wr Lr^T + (-Wi) Li^T,   im += Wr Li^T + Wi Lr^T.
+// Staging, the chunk loop and the 2x2 rule are those of the scalar kernel
+// below, which remains for the geometries this one does not cover.
+kernel void update_schur(
+    device const Node* nodes [[buffer(0)]], device float2* fronts [[buffer(7)]],
+    device const float2* diagonal [[buffer(8)]], device const float2* subdiag [[buffer(9)]],
+    device const uint* two [[buffer(11)]], device atomic_uint* status [[buffer(12)]],
+    constant uint2& range [[buffer(14)]], device const FrontState* state [[buffer(15)]],
+    device const UpdateTile* jobs [[buffer(18)]], uint2 group [[threadgroup_position_in_grid]],
+    uint2 lane [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]], uint sl [[thread_index_in_simdgroup]]) {
+    UpdateTile job = jobs[range.x + group.x];
+    uint s = job.node;
+    Node node = nodes[s];
+    FrontState st = state[s];
+    if (st.next <= st.panel || atomic_load_explicit(status + s, memory_order_relaxed) != 0)
+        return;
+    uint m = node.nr, base = node.nc, first = node.first;
+    device float2* a = fronts + node.offset;
+    threadgroup float wr[SCHUR_TILE][SCHUR_CHUNK], wi[SCHUR_TILE][SCHUR_CHUNK],
+        wn[SCHUR_TILE][SCHUR_CHUNK], lr[SCHUR_TILE][SCHUR_CHUNK], li[SCHUR_TILE][SCHUR_CHUNK];
+    // One 8 x 8 result block per simdgroup at a time, real then imaginary.
+    threadgroup float out[8][2][64];
+    uint rowbase = base + job.row * SCHUR_TILE, colbase = base + job.col * SCHUR_TILE;
+    uint linear = lane.y * 16 + lane.x;
+    bool diag = job.row == job.col;
+    // Group-uniform per simdgroup: a block row past the front's last row, or
+    // a block above the diagonal of a diagonal tile, has nothing to compute.
+    bool rowlive = rowbase + 8 * sg < m;
+    simdgroup_float8x8 cr[8], ci[8];
+#pragma unroll
+    for (uint b = 0; b < 8; b++) {
+        cr[b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        ci[b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    for (uint c0 = st.panel; c0 < st.next;) {
+        uint width = min((uint)SCHUR_CHUNK, st.next - c0);
+        if (c0 + width < st.next && two[first + c0 + width - 1])
+            width--;
+        // Padded with zeros to whole 8-column steps.
+        uint padded = (width + 7u) & ~7u;
+        for (uint idx = linear; idx < SCHUR_TILE * padded; idx += 256) {
+            uint r = idx / padded, c = idx - r * padded, k = c0 + c;
+            uint ri = rowbase + r, rj = colbase + r;
+            float2 wv = c < width && ri < m ? fold_diagonal(a + ri * m, first, k, two, diagonal, subdiag)
+                                             : float2(0);
+            float2 lv = c < width && rj < m ? a[rj * m + k] : float2(0);
+            wr[r][c] = wv.x;
+            wi[r][c] = wv.y;
+            wn[r][c] = -wv.y;
+            lr[r][c] = lv.x;
+            li[r][c] = lv.y;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (rowlive) {
+            for (uint k8 = 0; k8 < padded; k8 += 8) {
+                simdgroup_float8x8 ar, ai, an;
+                simdgroup_load(ar, &wr[8 * sg][k8], SCHUR_CHUNK);
+                simdgroup_load(ai, &wi[8 * sg][k8], SCHUR_CHUNK);
+                simdgroup_load(an, &wn[8 * sg][k8], SCHUR_CHUNK);
+#pragma unroll
+                for (uint b = 0; b < 8; b++) {
+                    if ((diag && b > sg) || colbase + 8 * b >= m)
+                        continue;
+                    simdgroup_float8x8 br, bi;
+                    simdgroup_load(br, &lr[8 * b][k8], SCHUR_CHUNK, ulong2(0, 0), true);
+                    simdgroup_load(bi, &li[8 * b][k8], SCHUR_CHUNK, ulong2(0, 0), true);
+                    simdgroup_multiply_accumulate(cr[b], ar, br, cr[b]);
+                    simdgroup_multiply_accumulate(cr[b], an, bi, cr[b]);
+                    simdgroup_multiply_accumulate(ci[b], ar, bi, ci[b]);
+                    simdgroup_multiply_accumulate(ci[b], ai, br, ci[b]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        c0 += width;
+    }
+    if (!rowlive)
+        return;
+#pragma unroll
+    for (uint b = 0; b < 8; b++) {
+        if ((diag && b > sg) || colbase + 8 * b >= m)
+            continue;
+        simdgroup_store(cr[b], &out[sg][0][0], 8);
+        simdgroup_store(ci[b], &out[sg][1][0], 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint e = sl; e < 64; e += 32) {
+            uint i = rowbase + 8 * sg + e / 8, j = colbase + 8 * b + e % 8;
+            if (i >= m || j > i)
+                continue;
+            float2 v = a[i * m + j] - float2(out[sg][0][e], out[sg][1][e]);
+            if (!all(isfinite(v)))
+                atomic_store_explicit(status + s, 0xfffffffeu, memory_order_relaxed);
+            a[i * m + j] = v;
+            if (!SPARTA_LOWER)
+                a[j * m + i] = v;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+#else
 kernel void update_schur(
     device const Node* nodes [[buffer(0)]], device float2* fronts [[buffer(7)]],
     device const float2* diagonal [[buffer(8)]], device const float2* subdiag [[buffer(9)]],
@@ -191,3 +300,4 @@ kernel void update_schur(
             a[j * m + i] = v;
         }
 }
+#endif

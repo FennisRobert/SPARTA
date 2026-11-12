@@ -65,12 +65,16 @@ pub struct Config {
     pub cpu_block_rows: usize,
     /// Minimum trailing rows before updates use Apple Accelerate. Raise to avoid BLAS overhead on small blocks.
     pub cpu_blas_min_rows: usize,
-    /// Factor `LDL^T` on the CPU supernodally rather than multifrontally:
-    /// each node's columns are assembled and factored in place in the factor
-    /// store, and its update goes straight into its ancestors' columns, so no
-    /// frontal matrix is ever cleared or extend-added. Same pivoting, same
-    /// factor layout, same solve. Off by default; LU and the GPU ignore it.
-    pub cpu_supernodal: bool,
+    /// Factor `LDL^T` supernodally, on by default. On the CPU each node's
+    /// columns are assembled and factored in place in the factor store, and
+    /// its update goes straight into its ancestors' columns, so no frontal
+    /// matrix is ever cleared or extend-added (`src/cpu/supernodal.rs`). On
+    /// Metal the fronts stay, but their trailing blocks are kept as the lower
+    /// triangle only, so clearing, compaction and extend-add move half as much
+    /// (`SPARTA_LOWER` in `src/kernels/common.metal`). Same pivoting, same
+    /// factor layout, same solve either way. `false` is the multifrontal
+    /// route. LU, the hybrid's CPU share and Vulkan ignore it.
+    pub supernodal: bool,
     /// Minimum eliminated columns before two supernodes may merge. Larger
     /// values give fewer, wider fronts for more factor storage.
     pub nemin: usize,
@@ -193,7 +197,7 @@ impl Config {
             cpu_panel: 32,
             cpu_block_rows: 96,
             cpu_blas_min_rows: 64,
-            cpu_supernodal: false,
+            supernodal: true,
             nemin: 16,
             small_front_rows: profile.small_front_rows,
             max_front: None,

@@ -79,7 +79,7 @@ class _Options:
     cpu_panel: int | None
     cpu_block_rows: int | None
     cpu_blas_min_rows: int | None
-    cpu_supernodal: bool | None
+    supernodal: bool | None
     threads: int | None
 
     def __post_init__(self) -> None:
@@ -88,8 +88,8 @@ class _Options:
         if type(self.force_cpu) is not bool:
             raise ValueError("force_cpu must be a boolean")
 
-        if self.cpu_supernodal is not None and type(self.cpu_supernodal) is not bool:
-            raise ValueError("cpu_supernodal must be None or a boolean")
+        if self.supernodal is not None and type(self.supernodal) is not bool:
+            raise ValueError("supernodal must be None or a boolean")
 
         if not isinstance(self.hybrid_cpu, (int, float)) or not 0 <= self.hybrid_cpu < 1:
             raise ValueError("hybrid_cpu must be at least 0 and below 1")

@@ -67,10 +67,16 @@ kernel void factor_nodes(
         }
         uint tail = cn.nr - cn.nc;
         // `soffset`/`sld` locate the block whether or not it was compacted.
+        // Only its lower triangle is kept (SPARTA_LOWER); this serial kernel
+        // works on the whole square, so it mirrors as it adds.
         for (uint i = 0; i < tail; i++)
-            for (uint j = 0; j < tail; j++)
-                a[maps[child.map + i] * m + maps[child.map + j]] +=
-                    fronts[cn.soffset + i * cn.sld + j];
+            for (uint j = 0; j <= i; j++) {
+                uint mi = maps[child.map + i], mj = maps[child.map + j];
+                float2 v = fronts[cn.soffset + i * cn.sld + j];
+                a[mi * m + mj] += v;
+                if (i != j)
+                    a[mj * m + mi] += v;
+            }
     }
     // The reference scale for a perturbed pivot is computed only if a pivot
     // actually dies, so a healthy front never pays for the extra sweep.

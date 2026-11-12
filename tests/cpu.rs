@@ -79,7 +79,7 @@ fn dense_pivoting_and_multiple_rhs() {
             ] {
                 let config = Config {
                     force_cpu: true,
-                    cpu_supernodal: supernodal,
+                    supernodal,
                     small_front_rows: small,
                     cpu_panel: panel,
                     cpu_blas_min_rows: blas,
@@ -308,7 +308,7 @@ fn static_perturbations_are_counted() {
         for (small, supernodal) in [(1, false), (32, false), (1, true), (32, true)] {
             let config = Config {
                 force_cpu: true,
-                cpu_supernodal: supernodal,
+                supernodal,
                 small_front_rows: small,
                 cpu_panel: 1,
                 ..Config::default()
@@ -354,7 +354,7 @@ fn supernodal_matches_multifrontal() {
         let solve = |supernodal: bool, scale: f64| {
             let config = Config {
                 force_cpu: true,
-                cpu_supernodal: supernodal,
+                supernodal,
                 small_front_rows: small,
                 nemin,
                 threads,

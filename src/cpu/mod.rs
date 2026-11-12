@@ -69,7 +69,7 @@ pub(crate) struct Solver {
     /// The threads this solver factors and solves on; see `Config::threads`.
     pool: Pool,
     /// Present when this solver factors supernodally; see
-    /// `Config::cpu_supernodal`.
+    /// `Config::supernodal`.
     supernodal: Option<supernodal::Layout>,
     /// Whether each node's `nc` L columns are stored row-major, `nr` rows of
     /// `nc` values, rather than column-major. Row-major is what the CPU solve
@@ -107,7 +107,7 @@ impl Solver {
         let threads = pool.threads();
         // Supernodal needs the row-major factor the CPU solve reads, so the
         // hybrid's column-major solvers stay multifrontal.
-        let supernodal = (plan.config.cpu_supernodal && plan.kind == Kind::Ldlt && rowmajor)
+        let supernodal = (plan.config.supernodal && plan.kind == Kind::Ldlt && rowmajor)
             .then(|| supernodal::Layout::new(&plan));
         Ok(Self {
             workers: Mutex::new((0..threads).map(|_| Worker::default()).collect()),

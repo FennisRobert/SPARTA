@@ -42,7 +42,7 @@ def _symbolic(a: sparse.csc_matrix, path: Path, options: _Options) -> _Analysis:
                      schur_chunk=options.schur_chunk, force_cpu=options.force_cpu,
                      cpu_panel=options.cpu_panel, cpu_block_rows=options.cpu_block_rows,
                      cpu_blas_min_rows=options.cpu_blas_min_rows,
-                     cpu_supernodal=options.cpu_supernodal,
+                     supernodal=options.supernodal,
                      threads=options.threads)
 
 
@@ -116,7 +116,8 @@ class Solver:
                   path: Path | None = None, triangle: str | None = None,
                   max_front: int | None = None, equilibrate: bool | None = None,
                   refinement_steps: int | None = None, refinement_rtol: float | None = None,
-                  refinement_minimize: bool | None = None, verbose: bool | None = None) -> Solver:
+                  refinement_minimize: bool | None = None, verbose: bool | None = None,
+                  supernodal: bool | None = None) -> Solver:
         """Factor a matrix and return this solver; reuse storage while the backend is unchanged.
 
         Parameters
@@ -174,6 +175,10 @@ class Solver:
         verbose : bool or None
             Print bounded per-solve summaries to stderr; None keeps current setting.
             Extra CPU residual evaluation is performed when enabled.
+        supernodal : bool or None
+            Accepted and ignored, so that one set of settings can be passed to
+            both analyze() and factorize(). The factorization route is chosen
+            when the matrix is analyzed; set it in analyze().
 
         Raises
         ------
@@ -189,6 +194,7 @@ class Solver:
             Input validation failures preserve old factors too.
         """
         self._live()
+        del supernodal  # Chosen in analyze(); see the docstring.
         updates = dict(force_cpu=force_cpu,
                        hybrid_cpu=None if hybrid is None else _hybrid_share(hybrid),
                        verbose=verbose, safe_mode=safe_mode, ordering=ordering, mtype=mtype, triangle=triangle, max_front=max_front,
@@ -497,7 +503,7 @@ class Solver:
             'upper_bytes': upper, 'path': self.path,
             'gpu_bytes': device_bytes,
             # A supernodal LDLT never allocates fronts.
-            'cpu_bytes': (factor_bytes + (0 if self._options.cpu_supernodal and self.path != Path.LU
+            'cpu_bytes': (factor_bytes + (0 if self._options.supernodal and self.path != Path.LU
                                           else front_bytes)) if self._options.force_cpu else 0,
         }
 

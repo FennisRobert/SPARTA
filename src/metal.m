@@ -184,6 +184,9 @@ void* sparta_v1_create(const void* const* data,const size_t* lengths,const uint3
     @"PIVOT_THREADS":@(geometry[3]),
     @"SCHUR_CHUNK":@(geometry[4]),
     @"TAIL_ROWS":@(SPARTA_TAIL_THREADS),
+    // LDL^T keeps only the lower triangle of every trailing block; see
+    // SPARTA_LOWER in common.metal.
+    @"SPARTA_LOWER":@(geometry[5]),
   };
   NSError* e=nil;id<MTLLibrary> library=[c->device newLibraryWithSource:source options:options error:&e];
   if(!library){message(error,cap,e.localizedDescription);return NULL;}

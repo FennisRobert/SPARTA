@@ -44,7 +44,7 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
             force_cpu: bool | None = None, hybrid: bool | float | None = None,
             cpu_panel: int | None = None,
             cpu_block_rows: int | None = None, cpu_blas_min_rows: int | None = None,
-            cpu_supernodal: bool | None = None,
+            supernodal: bool | None = None,
             threads: int | None = None) -> Solver:
     """Analyze a matrix pattern on CPU and return an unfactorized Solver.
 
@@ -71,12 +71,13 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
         Rows per tile for small CPU updates below the Accelerate threshold.
     cpu_blas_min_rows : int or None, default None
         Minimum trailing rows before CPU updates use Apple Accelerate.
-    cpu_supernodal : bool or None, default None
-        With force_cpu, factor LDLT supernodally instead of multifrontally:
-        each node's columns are factored in place and its update goes straight
-        into its ancestors' columns, so no frontal matrix is ever cleared or
-        assembled. Same pivoting, same solve, no front workspace. LU and the
-        GPU ignore it. None uses the config's setting, or False without one.
+    supernodal : bool or None, default None
+        Factor LDLT supernodally, which is faster and uses less memory. On the
+        CPU no frontal matrix is ever built: each node's columns are factored
+        in place and its update goes straight into its ancestors' columns. On
+        the GPU the fronts keep only the lower half of their trailing blocks.
+        Same pivoting, same solve. False is the multifrontal route. LU ignores
+        it. None uses the config's setting, which is True by default.
     threads : int or None, default None
         CPU threads for SPARTA's own work: the analysis, CPU factorization and
         solves, and the hybrid's CPU share. 0 uses the process-wide pool, which
@@ -231,7 +232,7 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
                   schur_chunk=schur_chunk, force_cpu=force_cpu,
                   hybrid_cpu=None if hybrid is None else _hybrid_share(hybrid),
                   cpu_panel=cpu_panel, cpu_block_rows=cpu_block_rows,
-                  cpu_blas_min_rows=cpu_blas_min_rows, cpu_supernodal=cpu_supernodal,
+                  cpu_blas_min_rows=cpu_blas_min_rows, supernodal=supernodal,
                   threads=threads)
     if config is not None:
         base = Config.resolve(config).to_dict()
@@ -247,6 +248,8 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
         tuning["force_cpu"] = False
     if tuning["hybrid_cpu"] is None:
         tuning["hybrid_cpu"] = 0.0
+    if tuning["supernodal"] is None:
+        tuning["supernodal"] = Config.defaults().supernodal
     options = _Options(**tuning, verbose=verbose, safe_mode=safe_mode, ordering=ordering, mtype=mtype, triangle=triangle,
                       max_front=max_front, equilibrate=equilibrate,
                       refinement_steps=refinement_steps, refinement_rtol=refinement_rtol,

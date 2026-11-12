@@ -53,9 +53,10 @@ class CpuTests(unittest.TestCase):
                 sparta.analyze(a, force_cpu=True, threads=bad)
 
     def test_supernodal_matches_multifrontal(self) -> None:
-        """cpu_supernodal factors a sparse complex-symmetric 3D grid to the
-        multifrontal solution, real and complex, reached by keyword and by
-        Config, and refactors the same pattern; LU accepts and ignores it."""
+        """supernodal, on by default, factors a sparse complex-symmetric 3D
+        grid to the multifrontal solution, real and complex, reached by
+        default, keyword and Config, and refactors the same pattern; LU
+        accepts and ignores it."""
         side = 14
         n = side**3
         grid = sparse.diags([-1.0, 2.0, -1.0], [-1, 0, 1], shape=(side, side))
@@ -68,14 +69,16 @@ class CpuTests(unittest.TestCase):
             shift = 2.3 + (0.4j if dtype == np.complex128 else 0)
             a = sparse.csc_matrix(lap - shift*sparse.identity(n), dtype=dtype)
             b = rng.normal(size=(n, 2)).astype(dtype)
-            multi = sparta.analyze(a, force_cpu=True, refinement_steps=0).factorize()
+            multi = sparta.analyze(a, force_cpu=True, refinement_steps=0, supernodal=False).factorize()
             expected = multi.solve_many(b)
-            for how in ('keyword', 'config'):
+            for how in ('default', 'keyword', 'config'):
                 with self.subTest(dtype=dtype, how=how):
-                    if how == 'keyword':
-                        s = sparta.analyze(a, force_cpu=True, refinement_steps=0, cpu_supernodal=True)
+                    if how == 'default':
+                        s = sparta.analyze(a, force_cpu=True, refinement_steps=0)
+                    elif how == 'keyword':
+                        s = sparta.analyze(a, force_cpu=True, refinement_steps=0, supernodal=True)
                     else:
-                        config = sparta.Config.defaults().with_(cpu_supernodal=True)
+                        config = sparta.Config.defaults().with_(supernodal=True)
                         s = sparta.analyze(a, config=config, force_cpu=True, refinement_steps=0)
                     s.factorize()
                     np.testing.assert_allclose(s.solve_many(b), expected, rtol=1e-9, atol=1e-11)
@@ -83,13 +86,17 @@ class CpuTests(unittest.TestCase):
                     self.assertLess(s.info['cpu_bytes'], multi.info['cpu_bytes'])
                     s.factorize(2*a)
                     np.testing.assert_allclose(s.solve_many(b), expected/2, rtol=1e-9, atol=1e-11)
+                    # factorize() takes the setting too, so one settings dict
+                    # serves both calls, and ignores it.
+                    s.factorize(a, supernodal=False)
+                    np.testing.assert_allclose(s.solve_many(b), expected, rtol=1e-9, atol=1e-11)
                     s.destroy()
             multi.destroy()
-        self.assertFalse(sparta.Config.defaults().cpu_supernodal)
+        self.assertTrue(sparta.Config.defaults().supernodal)
         with self.assertRaises(ValueError):
-            sparta.analyze(a, force_cpu=True, cpu_supernodal=1)
+            sparta.analyze(a, force_cpu=True, supernodal=1)
         lu = sparse.csc_matrix(lap - 2.3*sparse.identity(n) + sparse.random(n, n, 1e-3, random_state=1))
-        x = sparta.analyze(lu, path=sparta.Path.LU, force_cpu=True, cpu_supernodal=True).factorize().solve(b[:, 0].real)
+        x = sparta.analyze(lu, path=sparta.Path.LU, force_cpu=True, supernodal=True).factorize().solve(b[:, 0].real)
         self.assertLess(np.linalg.norm(lu @ x - b[:, 0].real), 1e-9*np.linalg.norm(b[:, 0].real))
 
     def test_default_refinement_keeps_double_precision(self) -> None:

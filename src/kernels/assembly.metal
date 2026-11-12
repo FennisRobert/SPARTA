@@ -182,10 +182,18 @@ kernel void assemble_children(device const Node* nodes [[buffer(0)]],
     uint invalid = 0;
     for (uint index = slice * width + lane; index < tail * tail; index += splits * width) {
         uint i = index / tail, j = index - i * tail;
-        uint dest = maps[child.map + i] * m + maps[child.map + j];
-        float2 v = a[dest] + source[i * sld + j];
+        // LDL^T adds the lower triangle only (maps ascend, so it lands in the
+        // parent's), and mirrors it where the parent's pivot row search reads:
+        // inside the fully summed block. See SPARTA_LOWER.
+        if (SPARTA_LOWER && j > i)
+            continue;
+        uint mi = maps[child.map + i], mj = maps[child.map + j];
+        float2 add = source[i * sld + j];
+        float2 v = a[mi * m + mj] + add;
         invalid |= uint(!all(isfinite(v)));
-        a[dest] = v;
+        a[mi * m + mj] = v;
+        if (SPARTA_LOWER && i != j && mi < node.nc)
+            a[mj * m + mi] += add;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Every lane runs the reduction: it barriers internally, so it must not sit
@@ -219,10 +227,18 @@ kernel void zero_fronts(device const Node* nodes [[buffer(0)]], device const uin
     uint s = ids[range.x + group / splits];
     uint slice = group - (group / splits) * splits;
     Node node = nodes[s];
-    uint total = node.nr * node.nr;
+    uint m = node.nr, total = m * m;
     device float2* a = fronts + node.offset;
-    for (uint i = slice * width + lane; i < total; i += splits * width)
+    for (uint i = slice * width + lane; i < total; i += splits * width) {
+        // LDL^T never reads above the diagonal of the trailing rows; see
+        // SPARTA_LOWER.
+        if (SPARTA_LOWER) {
+            uint r = i / m;
+            if (r >= node.nc && i - r * m > r)
+                continue;
+        }
         a[i] = float2(0);
+    }
 }
 // Compacts the trailing `nr-nc` square of a finished front into the node's
 // contribution slot, densely, leading dimension `nr-nc`.
@@ -241,7 +257,7 @@ kernel void zero_fronts(device const Node* nodes [[buffer(0)]], device const uin
 // and are held until the parent has assembled instead; those are exactly the
 // ones whose block already starts at its place inside the front, which is what
 // the offset test below recognises. A fully summed front has no block at all.
-static void compact_block(Node node, device float2* fronts, uint lane, uint width) {
+static void compact_block(Node node, device float2* fronts, uint lane, uint width, bool lower) {
     // `lane` and `width` are a thread's position and the stride over every
     // slice of the front, so a sliced dispatch divides the copy between them.
     uint m = node.nr, nc = node.nc, tail = m - nc;
@@ -251,6 +267,9 @@ static void compact_block(Node node, device float2* fronts, uint lane, uint widt
     device float2* block = fronts + node.soffset;
     for (uint idx = lane; idx < tail * tail; idx += width) {
         uint i = idx / tail, j = idx - i * tail;
+        // LDL^T moves the lower triangle only; see SPARTA_LOWER.
+        if (lower && j > i)
+            continue;
         block[idx] = a[(nc + i) * m + nc + j];
     }
 }
@@ -279,7 +298,7 @@ kernel void store_factors(
         uint k = idx / m, i = idx - k * m;
         l[idx] = a[i * m + k];
     }
-    compact_block(node, fronts, lane, width);
+    compact_block(node, fronts, lane, width, SPARTA_LOWER);
 }
 // The LU form of the same copy.
 //
@@ -312,5 +331,5 @@ kernel void store_factors_lu(
         uint k = idx / tail, j = idx - k * tail;
         u[idx] = a[k * m + nc + j];
     }
-    compact_block(node, fronts, lane, width);
+    compact_block(node, fronts, lane, width, false);
 }

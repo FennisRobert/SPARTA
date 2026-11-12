@@ -1,4 +1,4 @@
-//! Supernodal `LDL^T` on the CPU, selected by `Config::cpu_supernodal`.
+//! Supernodal `LDL^T` on the CPU, selected by `Config::supernodal`.
 //!
 //! The multifrontal route assembles every node into a dense `nr` by `nr`
 //! front: the slot is cleared, the original entries and every child's

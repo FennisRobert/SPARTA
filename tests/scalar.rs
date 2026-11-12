@@ -77,11 +77,11 @@ fn apply<T: Scalar>(kind: Kind, entries: &[(usize, usize, T)], x: &[T]) -> Vec<C
 /// Factor and solve two right-hand sides in `T`, and return the worst
 /// relative error against the known solution. `blas` sends every CPU front
 /// through the blocked BLAS and LAPACK route; `supernodal` sets
-/// `Config::cpu_supernodal`.
+/// `Config::supernodal`.
 fn solve<T: Scalar>(kind: Kind, force_cpu: bool, blas: bool, supernodal: bool) -> f64 {
     let mut config = Config {
         force_cpu,
-        cpu_supernodal: supernodal,
+        supernodal,
         ..Config::default()
     };
     if blas {
