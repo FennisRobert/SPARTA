@@ -42,22 +42,22 @@ pub(crate) struct Scratch {
     /// LAPACK interchanges for the fully summed block.
     pub(super) ipiv: Vec<i32>,
     /// LAPACK's preferred `zsytrf` workspace, and the order it was sized for.
-    work: Vec<C>,
+    pub(super) work: Vec<C>,
     fitted: usize,
     /// Row-major `(nr - nc)` by `nc` block, holding `A21` then `L21 * D`.
-    packed: Vec<C>,
+    pub(super) packed: Vec<C>,
     /// Reciprocal pivots, and the off-diagonal coefficient of a 2x2 block.
-    inv: Vec<C>,
-    off: Vec<C>,
+    pub(super) inv: Vec<C>,
+    pub(super) off: Vec<C>,
     /// Fully summed columns that begin a 2x2 pivot block.
-    twos: Vec<u32>,
+    pub(super) twos: Vec<u32>,
     /// Child row owning each row of the front being assembled, or `u32::MAX`.
     inverse: Vec<u32>,
 }
 
 impl Scratch {
     /// Grow every buffer to hold one `rows` by `columns` front.
-    fn fit(&mut self, rows: usize, columns: usize) {
+    pub(super) fn fit(&mut self, rows: usize, columns: usize) {
         grow(&mut self.leading, columns * columns);
         grow(&mut self.packed, (rows - columns) * columns);
         grow(&mut self.inv, columns);
@@ -182,7 +182,7 @@ impl Front<'_> {
     /// columns already written converts the factor to the single-permutation
     /// form `P A P^T = L D L^T`, which is the form the solve and the child
     /// scatter maps assume.
-    fn adopt(&mut self, leading: &mut [C], ipiv: &[i32], twos: &mut Vec<u32>) {
+    pub(super) fn adopt(&mut self, leading: &mut [C], ipiv: &[i32], twos: &mut Vec<u32>) {
         let n = self.n;
         twos.clear();
         let mut k = 0;
@@ -216,7 +216,7 @@ impl Front<'_> {
     /// `D(k+1,k)` and the transposed factor, which must read as zero. `inv` and
     /// `off` hold the coefficients that turn `L21 * D` into `L21` with
     /// multiplications only; see [`Front::store_trailing`].
-    fn reciprocals(
+    pub(super) fn reciprocals(
         &mut self,
         leading: &mut [C],
         inv: &mut [C],
@@ -257,7 +257,7 @@ impl Front<'_> {
     /// subdiagonal slot of a 2x2 block, unit multipliers below. With a
     /// row-major factor block they go there instead, zero above the diagonal,
     /// and the return value says whether all of them are finite.
-    fn store_leading(&mut self, leading: &[C]) -> bool {
+    pub(super) fn store_leading(&mut self, leading: &[C]) -> bool {
         let (m, n) = (self.m, self.n);
         if let Some(l) = self.l.as_deref_mut() {
             let zero = C::from_re(0.0);
@@ -399,7 +399,7 @@ impl Front<'_> {
     /// The scaling runs as one contiguous multiply per row, then a short fixup
     /// over the 2x2 columns only, so the common all-1x1 front never branches
     /// inside the row loop.
-    fn store_trailing(&mut self, packed: &[C], inv: &[C], off: &[C], twos: &[u32]) -> bool {
+    pub(super) fn store_trailing(&mut self, packed: &[C], inv: &[C], off: &[C], twos: &[u32]) -> bool {
         let (m, n, rows) = (self.m, self.n, self.stripe());
         let scale = |out: &mut [C], row: &[C]| {
             for (slot, (&v, &r)) in out.iter_mut().zip(row.iter().zip(inv.iter())) {

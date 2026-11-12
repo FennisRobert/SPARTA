@@ -65,6 +65,12 @@ pub struct Config {
     pub cpu_block_rows: usize,
     /// Minimum trailing rows before updates use Apple Accelerate. Raise to avoid BLAS overhead on small blocks.
     pub cpu_blas_min_rows: usize,
+    /// Factor `LDL^T` on the CPU supernodally rather than multifrontally:
+    /// each node's columns are assembled and factored in place in the factor
+    /// store, and its update goes straight into its ancestors' columns, so no
+    /// frontal matrix is ever cleared or extend-added. Same pivoting, same
+    /// factor layout, same solve. Off by default; LU and the GPU ignore it.
+    pub cpu_supernodal: bool,
     /// Minimum eliminated columns before two supernodes may merge. Larger
     /// values give fewer, wider fronts for more factor storage.
     pub nemin: usize,
@@ -187,6 +193,7 @@ impl Config {
             cpu_panel: 32,
             cpu_block_rows: 96,
             cpu_blas_min_rows: 64,
+            cpu_supernodal: false,
             nemin: 16,
             small_front_rows: profile.small_front_rows,
             max_front: None,

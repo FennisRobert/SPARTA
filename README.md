@@ -241,7 +241,7 @@ pip downloads its build helper (maturin), NumPy and SciPy from PyPI.
 no compiler, no source code needed.
 
 ```sh
-pip install sparta_solver-0.3.2-cp39-abi3-macosx_11_0_arm64.whl
+pip install sparta_solver-0.3.3-cp39-abi3-macosx_11_0_arm64.whl
 ```
 
 One wheel works for every Python from 3.9 up, on Apple Silicon only. To make a
@@ -669,6 +669,7 @@ double, and `enum` is one of the named choices.
 | `cpu_panel` | uint64 | `32` | Pivots per panel before an update. |
 | `cpu_block_rows` | uint64 | `96` | Rows per block in the trailing update. |
 | `cpu_blas_min_rows` | uint64 | `64` | Smallest block handed to BLAS. |
+| `cpu_supernodal` | bool | `False` | LDLT only. Factor supernodally, without frontal matrices. |
 | **GPU scheduling** | | | |
 | `small_front_rows` | uint32 | `32` | Block height where the GPU leaves its serial kernel. |
 | `schur_batch` | uint32 | `0` | Panels completed between update drains. |
@@ -790,6 +791,7 @@ These only matter with `force_cpu`.
 | `cpu_panel` | uint64 | 1 or more | Pivots gathered before a trailing update, on the LU path and on fronts LAPACK cannot factor. |
 | `cpu_block_rows` | uint64 | 1 or more | Rows per block in the trailing update, and the unit of work when one front is split across threads. |
 | `cpu_blas_min_rows` | uint64 | 1 or more | Smallest trailing block handed to BLAS. Raise it to avoid BLAS overhead on small blocks. |
+| `cpu_supernodal` | bool | `True` or `False` | LDLT only. Factor each node's columns in place and add its update straight into its ancestors' columns, instead of building, clearing and passing on a dense front per node. Same pivoting and solve, no front workspace; 25-43% faster on the EMerge test systems. LU ignores it. |
 
 ### GPU tuning (advanced)
 

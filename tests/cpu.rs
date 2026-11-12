@@ -68,15 +68,18 @@ fn dense_pivoting_and_multiple_rhs() {
                 .map(|i| C::new((i as f64).sin(), (i as f64 * 0.3).cos()))
                 .collect();
             let b = product(&a, n, &expected);
-            for (small, panel, blas) in [
-                (100, 7, 1),
-                (1, 1, 1),
-                (1, 3, usize::MAX),
-                (1, 16, 1),
-                (1, 32, 64),
+            for (small, panel, blas, supernodal) in [
+                (100, 7, 1, false),
+                (1, 1, 1, false),
+                (1, 3, usize::MAX, false),
+                (1, 16, 1, false),
+                (1, 32, 64, false),
+                (100, 7, 1, true),
+                (1, 32, 64, true),
             ] {
                 let config = Config {
                     force_cpu: true,
+                    cpu_supernodal: supernodal,
                     small_front_rows: small,
                     cpu_panel: panel,
                     cpu_blas_min_rows: blas,
@@ -302,9 +305,10 @@ fn configuration_and_memory() {
 fn static_perturbations_are_counted() {
     let a = vec![C::new(1.0, 0.0); 4];
     for kind in [Kind::Ldlt, Kind::Lu] {
-        for small in [1, 32] {
+        for (small, supernodal) in [(1, false), (32, false), (1, true), (32, true)] {
             let config = Config {
                 force_cpu: true,
+                cpu_supernodal: supernodal,
                 small_front_rows: small,
                 cpu_panel: 1,
                 ..Config::default()
@@ -319,5 +323,60 @@ fn static_perturbations_are_counted() {
             assert!(s.factor_c128(&[C::new(f64::NAN, 0.0); 3]).is_err());
             assert!(s.solve_c128(&b).is_err());
         }
+    }
+}
+
+#[test]
+/// The supernodal route factors a sparse indefinite 3D grid to the same
+/// solution as the multifrontal one, through the serial and blocked routes,
+/// with 2x2 pivots, on one thread and many, and again after refactoring.
+fn supernodal_matches_multifrontal() {
+    let side = 7;
+    let n = side * side * side;
+    let mut a = vec![C::new(0.0, 0.0); n * n];
+    for i in 0..n {
+        // Small and sign-alternating, so Bunch-Kaufman takes 2x2 pivots.
+        a[i * n + i] = C::new(if i % 3 == 0 { 0.01 } else { -2.5 + (i % 5) as f64 }, 0.2);
+        for step in [1, side, side * side] {
+            let j = i + step;
+            let same_line = step != 1 || i / side == j / side;
+            let same_plane = step != side || i / (side * side) == j / (side * side);
+            if j < n && same_line && same_plane {
+                let v = C::new(-1.0 + 0.1 * (i % 7) as f64, 0.05 * (j % 3) as f64);
+                a[i * n + j] = v;
+                a[j * n + i] = v;
+            }
+        }
+    }
+    let expected: Vec<_> = (0..2 * n).map(|i| C::new((i as f64 * 0.37).sin(), (i as f64).cos())).collect();
+    let b = product(&a, n, &expected);
+    for (small, nemin, threads) in [(1, 1, 1), (1, 8, 0), (1000, 4, 0), (16, 2, 3)] {
+        let solve = |supernodal: bool, scale: f64| {
+            let config = Config {
+                force_cpu: true,
+                cpu_supernodal: supernodal,
+                small_front_rows: small,
+                nemin,
+                threads,
+                cpu_block_rows: 5,
+                cpu_blas_min_rows: 1,
+                ..Config::default()
+            };
+            let (p, values) = plan(&a, n, Kind::Ldlt, &config, false);
+            assert!(p.levels() > 2);
+            let mut s = Solver::new(p).unwrap();
+            for first in [0.5, scale] {
+                s.factor_c128(&values.iter().map(|&v| v * first).collect::<Vec<_>>()).unwrap();
+            }
+            let rhs: Vec<_> = b.iter().map(|v| v * scale).collect();
+            (s.solve_many_c128(&rhs, 2).unwrap(), s.perturbed_pivots(), s.pivot_range().unwrap())
+        };
+        let (multi, bumped, range) = solve(false, -1.3);
+        let (sn, sn_bumped, sn_range) = solve(true, -1.3);
+        close(&multi, &expected, 1e-9);
+        close(&sn, &expected, 1e-9);
+        close(&sn, &multi, 1e-11);
+        assert_eq!(sn_bumped, bumped);
+        assert!((sn_range.0 / range.0 - 1.0).abs() < 1e-8 && (sn_range.1 / range.1 - 1.0).abs() < 1e-8);
     }
 }

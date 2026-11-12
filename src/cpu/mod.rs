@@ -11,6 +11,7 @@ mod level;
 mod panel;
 mod profile;
 mod solve;
+mod supernodal;
 mod update;
 
 use crate::{Analysis, Error, Kind, Result};
@@ -33,6 +34,7 @@ use std::time::Instant;
 struct Worker {
     scratch: Scratch,
     report: Report,
+    sn: supernodal::Work,
 }
 
 /// Read access to a CPU solver's plan and factor storage; see [`Solver::storage`].
@@ -66,6 +68,9 @@ pub(crate) struct Solver {
     schedule: Vec<Level>,
     /// The threads this solver factors and solves on; see `Config::threads`.
     pool: Pool,
+    /// Present when this solver factors supernodally; see
+    /// `Config::cpu_supernodal`.
+    supernodal: Option<supernodal::Layout>,
     /// Whether each node's `nc` L columns are stored row-major, `nr` rows of
     /// `nc` values, rather than column-major. Row-major is what the CPU solve
     /// reads and what a front's rows copy into without a transpose; the hybrid
@@ -100,12 +105,18 @@ impl Solver {
         plan.config.check().map_err(Error::Invalid)?;
         let pool = Pool::new(plan.config.threads)?;
         let threads = pool.threads();
+        // Supernodal needs the row-major factor the CPU solve reads, so the
+        // hybrid's column-major solvers stay multifrontal.
+        let supernodal = (plan.config.cpu_supernodal && plan.kind == Kind::Ldlt && rowmajor)
+            .then(|| supernodal::Layout::new(&plan));
         Ok(Self {
             workers: Mutex::new((0..threads).map(|_| Worker::default()).collect()),
             schedule: level::schedule(&plan),
             pool,
             rowmajor,
-            fronts: allocate_lazy(plan.elements)?,
+            // A supernodal solver never builds a front.
+            fronts: allocate_lazy(if supernodal.is_some() { 0 } else { plan.elements })?,
+            supernodal,
             factors: allocate_lazy(plan.factor_elements)?,
             upper: allocate_lazy(plan.upper_elements)?,
             diagonal: allocate_lazy(plan.n)?,
@@ -196,6 +207,7 @@ impl Solver {
             perturbed,
             rowmajor,
             pool,
+            supernodal,
             ..
         } = self;
         // A front alone on the machine may have the library thread its
@@ -226,7 +238,15 @@ impl Solver {
             eprintln!("LEVEL {depth} {how} {} {:.4} {gflop:.2} {}", level.nodes.len(),
                 t0.elapsed().as_secs_f64(), plan.nodes[level.nodes[0] as usize].nr);
         };
-        let result = schedule.iter().enumerate().try_for_each(|(depth, level)| {
+        let result = if let Some(layout) = supernodal {
+            supernodal::factor_all(
+                plan, layout, schedule, factors, diagonal, subdiag, perms, two, values, workers, machine, report,
+            )
+            .map(|count| {
+                bumped.fetch_add(count, Ordering::Relaxed);
+            })
+        } else {
+            schedule.iter().enumerate().try_for_each(|(depth, level)| {
             // OpenBLAS's control is process-wide, so it is set here, where the
             // previous level has joined and no thread is inside BLAS.
             dense::set_global_threading(if level.spread { Threading::Caller } else { Threading::Machine });
@@ -268,7 +288,7 @@ impl Solver {
                 / rayon::current_num_threads() as f64;
             level.nodes.par_iter().try_for_each(|&id| {
                 let mut worker = take();
-                let Worker { scratch, report } = &mut worker;
+                let Worker { scratch, report, .. } = &mut worker;
                 let split = work(plan, id) > share;
                 // SAFETY: every node in `level` is distinct and the iterator
                 // joins before the next level starts, which is exactly the
@@ -294,7 +314,8 @@ impl Solver {
                 report_level(depth, "par", t0);
             }
             Ok(())
-        });
+        })
+        };
         // Leave the pool as it was found, for whatever else in the process
         // calls Accelerate.
         dense::set_global_threading(Threading::Machine);

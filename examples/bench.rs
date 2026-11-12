@@ -5,7 +5,8 @@
 //!
 //! The pattern is analyzed once; every later snapshot reuses that plan through
 //! `refactor`, which is how an EMerge frequency sweep actually calls the solver.
-//! `--force-cpu` selects end-to-end complex128 CPU numerics.
+//! `--force-cpu` selects end-to-end complex128 CPU numerics; `--supernodal`
+//! then factors supernodally (`Config::cpu_supernodal`).
 //! Throughput is reported in MDOF/s, millions of unknowns per second: `fact`
 //! over the device (or CPU) factorization time, `step` over one sweep step's
 //! factor and solve wall time.
@@ -29,6 +30,7 @@ fn main() {
     let mut max_front = usize::MAX;
     let mut skip_solve = false;
     let mut force_cpu = false;
+    let mut supernodal = false;
     let mut lu = false;
     let mut single = false;
     let mut nrhs = 1usize;
@@ -45,6 +47,7 @@ fn main() {
                     .unwrap()
             }
             "--force-cpu" | "--force_cpu" => force_cpu = true,
+            "--supernodal" => supernodal = true,
             "--lu" => lu = true,
             // With --force-cpu: factor in complex64, the hybrid's CPU precision.
             "--single" => single = true,
@@ -61,7 +64,7 @@ fn main() {
         }
     }
     if paths.is_empty() && generate.is_empty() {
-        eprintln!("usage: bench [--max-front N] [--skip-solve] [--nrhs K] [--force-cpu [--single]] [--lu] [--curl-curl K] FILE...");
+        eprintln!("usage: bench [--max-front N] [--skip-solve] [--nrhs K] [--force-cpu [--single] [--supernodal]] [--lu] [--curl-curl K] FILE...");
         std::process::exit(2);
     }
 
@@ -102,6 +105,7 @@ fn main() {
     };
     let config = sparta::Config {
         force_cpu,
+        cpu_supernodal: supernodal,
         max_front: (max_front != usize::MAX).then_some(max_front),
         ..sparta::Config::default()
     };

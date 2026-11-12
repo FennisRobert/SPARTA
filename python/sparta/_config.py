@@ -43,6 +43,12 @@ class Config:
         single front is spread across threads.
     cpu_blas_min_rows : int
         Minimum trailing rows before CPU updates use Accelerate.
+    cpu_supernodal : bool
+        Factor LDLT on the CPU supernodally: each node's columns are factored
+        in place and its update goes straight into its ancestors' columns, so
+        no frontal matrix is cleared or assembled. Same pivoting and solve as
+        the default multifrontal route, less memory, usually faster. LU and
+        the GPU ignore it.
     threads : int
         CPU threads for SPARTA's own work: the analysis, CPU factorization and
         solves, and the hybrid's CPU share. 0 uses the process-wide pool, which
@@ -104,6 +110,7 @@ class Config:
     cpu_panel: int
     cpu_block_rows: int
     cpu_blas_min_rows: int
+    cpu_supernodal: bool
     threads: int
 
     @classmethod

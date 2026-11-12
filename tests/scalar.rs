@@ -76,10 +76,12 @@ fn apply<T: Scalar>(kind: Kind, entries: &[(usize, usize, T)], x: &[T]) -> Vec<C
 
 /// Factor and solve two right-hand sides in `T`, and return the worst
 /// relative error against the known solution. `blas` sends every CPU front
-/// through the blocked BLAS and LAPACK route.
-fn solve<T: Scalar>(kind: Kind, force_cpu: bool, blas: bool) -> f64 {
+/// through the blocked BLAS and LAPACK route; `supernodal` sets
+/// `Config::cpu_supernodal`.
+fn solve<T: Scalar>(kind: Kind, force_cpu: bool, blas: bool, supernodal: bool) -> f64 {
     let mut config = Config {
         force_cpu,
+        cpu_supernodal: supernodal,
         ..Config::default()
     };
     if blas {
@@ -112,17 +114,24 @@ fn solve<T: Scalar>(kind: Kind, force_cpu: bool, blas: bool) -> f64 {
 
 #[test]
 /// Every value type on the CPU, LDL^T and LU, each to its own precision, on
-/// the default routes and on the BLAS route.
+/// the default routes and on the BLAS route, and LDL^T supernodally.
 fn cpu_all_types() {
-    for (kind, blas) in [(Kind::Ldlt, false), (Kind::Lu, false), (Kind::Ldlt, true), (Kind::Lu, true)] {
+    for (kind, blas, sn) in [
+        (Kind::Ldlt, false, false),
+        (Kind::Lu, false, false),
+        (Kind::Ldlt, true, false),
+        (Kind::Lu, true, false),
+        (Kind::Ldlt, false, true),
+        (Kind::Ldlt, true, true),
+    ] {
         let errors = [
-            (ScalarKind::F32, solve::<f32>(kind, true, blas), 1e-3),
-            (ScalarKind::F64, solve::<f64>(kind, true, blas), 1e-11),
-            (ScalarKind::Complex32, solve::<Complex32>(kind, true, blas), 1e-3),
-            (ScalarKind::Complex64, solve::<Complex64>(kind, true, blas), 1e-11),
+            (ScalarKind::F32, solve::<f32>(kind, true, blas, sn), 1e-3),
+            (ScalarKind::F64, solve::<f64>(kind, true, blas, sn), 1e-11),
+            (ScalarKind::Complex32, solve::<Complex32>(kind, true, blas, sn), 1e-3),
+            (ScalarKind::Complex64, solve::<Complex64>(kind, true, blas, sn), 1e-11),
         ];
         for (scalar, error, tol) in errors {
-            eprintln!("cpu {kind:?} blas={blas} {scalar}: max error {error:.2e}");
+            eprintln!("cpu {kind:?} blas={blas} supernodal={sn} {scalar}: max error {error:.2e}");
             assert!(error < tol, "cpu {kind:?} {scalar}: error {error:.2e}");
         }
     }
@@ -136,8 +145,8 @@ fn gpu_single_precision() {
     }
     for kind in [Kind::Ldlt, Kind::Lu] {
         for (scalar, error) in [
-            (ScalarKind::F32, solve::<f32>(kind, false, false)),
-            (ScalarKind::Complex32, solve::<Complex32>(kind, false, false)),
+            (ScalarKind::F32, solve::<f32>(kind, false, false, false)),
+            (ScalarKind::Complex32, solve::<Complex32>(kind, false, false, false)),
         ] {
             eprintln!("gpu {kind:?} {scalar}: max error {error:.2e}");
             assert!(error < 1e-3, "gpu {kind:?} {scalar}: error {error:.2e}");

@@ -42,6 +42,7 @@ def _symbolic(a: sparse.csc_matrix, path: Path, options: _Options) -> _Analysis:
                      schur_chunk=options.schur_chunk, force_cpu=options.force_cpu,
                      cpu_panel=options.cpu_panel, cpu_block_rows=options.cpu_block_rows,
                      cpu_blas_min_rows=options.cpu_blas_min_rows,
+                     cpu_supernodal=options.cpu_supernodal,
                      threads=options.threads)
 
 
@@ -495,7 +496,9 @@ class Solver:
             'large_fronts': large, 'factor_bytes': factor_bytes,
             'upper_bytes': upper, 'path': self.path,
             'gpu_bytes': device_bytes,
-            'cpu_bytes': front_bytes + factor_bytes if self._options.force_cpu else 0,
+            # A supernodal LDLT never allocates fronts.
+            'cpu_bytes': (factor_bytes + (0 if self._options.cpu_supernodal and self.path != Path.LU
+                                          else front_bytes)) if self._options.force_cpu else 0,
         }
 
     @property

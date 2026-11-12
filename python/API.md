@@ -333,6 +333,18 @@ Keep original complex128 matrix values and right-hand sides. CPU outputs are
 complex128 even when the inputs are single precision. `refinement_steps=0`
 measures the direct solve; the existing refinement and scaling options also work.
 CPU tuning uses `cpu_panel`, `cpu_block_rows`, and `cpu_blas_min_rows`.
+
+`cpu_supernodal=True` factors LDLT supernodally instead of multifrontally. Each
+node's columns are assembled and factored in place in the factor store, and
+its update is added straight into the columns of the ancestors that own those
+rows, so no frontal matrix is ever cleared or passed up the tree. Pivoting, the
+factor layout and the solve are unchanged, and the front workspace is never
+allocated. On the EMerge systems in `test_matrices` (M4 Pro) it factors 25-43%
+faster with lower peak memory. It is off by default; LU and the GPU ignore it.
+
+```python
+solver = sparta.analyze(A, force_cpu=True, cpu_supernodal=True).factorize()
+```
 `threads=n` runs the solver's analysis, factorization and solves on a pool of
 its own `n` threads instead of the process-wide pool that `RAYON_NUM_THREADS`
 sizes; `SPARTA_NUM_THREADS`, when set, overrides it. The

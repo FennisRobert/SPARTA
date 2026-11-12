@@ -256,6 +256,34 @@ pub(super) fn gemm_nt(
     }
 }
 
+/// `c[m][n] = -a[m][k] * b[n][k]^T`, all row-major: [`gemm_nt`] into a
+/// target whose old contents are discarded, so it needs no clearing first.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn gemm_nt_set(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[C],
+    lda: usize,
+    b: &[C],
+    ldb: usize,
+    c: &mut [C],
+    ldc: usize,
+) {
+    if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+    assert!(lda >= k && ldb >= k && ldc >= n, "row strides too short");
+    assert!(a.len() >= (m - 1) * lda + k, "left operand out of bounds");
+    assert!(b.len() >= (n - 1) * ldb + k, "right operand out of bounds");
+    assert!(c.len() >= (m - 1) * ldc + n, "target out of bounds");
+    let (minus, zero) = (C::from_re(-1.0), C::from_re(0.0));
+    // SAFETY: as in `gemm_nt`.
+    unsafe {
+        gemm(ffi::TRANS, (m, n, k), minus, a.as_ptr(), lda, b.as_ptr(), ldb, zero, c.as_mut_ptr(), ldc);
+    }
+}
+
 /// `c[m][n] -= a[m][k] * b[k][n]`, all row-major with the given row strides.
 ///
 /// `lda`, `ldb` and `ldc` are element strides between rows and must be at

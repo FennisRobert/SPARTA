@@ -68,6 +68,11 @@ impl Report {
         }
     }
 
+    /// Add `seconds` measured elsewhere to `phase`.
+    pub(super) fn add(&mut self, phase: Phase, seconds: f64) {
+        self.seconds[phase as usize] += seconds;
+    }
+
     /// Record one front of `rows` by `columns` taking `route`, and the complex
     /// multiply-adds each phase of it performs.
     ///

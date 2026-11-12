@@ -44,6 +44,7 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
             force_cpu: bool | None = None, hybrid: bool | float | None = None,
             cpu_panel: int | None = None,
             cpu_block_rows: int | None = None, cpu_blas_min_rows: int | None = None,
+            cpu_supernodal: bool | None = None,
             threads: int | None = None) -> Solver:
     """Analyze a matrix pattern on CPU and return an unfactorized Solver.
 
@@ -70,6 +71,12 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
         Rows per tile for small CPU updates below the Accelerate threshold.
     cpu_blas_min_rows : int or None, default None
         Minimum trailing rows before CPU updates use Apple Accelerate.
+    cpu_supernodal : bool or None, default None
+        With force_cpu, factor LDLT supernodally instead of multifrontally:
+        each node's columns are factored in place and its update goes straight
+        into its ancestors' columns, so no frontal matrix is ever cleared or
+        assembled. Same pivoting, same solve, no front workspace. LU and the
+        GPU ignore it. None uses the config's setting, or False without one.
     threads : int or None, default None
         CPU threads for SPARTA's own work: the analysis, CPU factorization and
         solves, and the hybrid's CPU share. 0 uses the process-wide pool, which
@@ -224,7 +231,8 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
                   schur_chunk=schur_chunk, force_cpu=force_cpu,
                   hybrid_cpu=None if hybrid is None else _hybrid_share(hybrid),
                   cpu_panel=cpu_panel, cpu_block_rows=cpu_block_rows,
-                  cpu_blas_min_rows=cpu_blas_min_rows, threads=threads)
+                  cpu_blas_min_rows=cpu_blas_min_rows, cpu_supernodal=cpu_supernodal,
+                  threads=threads)
     if config is not None:
         base = Config.resolve(config).to_dict()
         tuning = {name: base[name] if value is None else value

@@ -54,6 +54,22 @@ the precision of the hybrid's CPU half.
 The C/C++ ABI exposes the GPU only: complex64, and float32 through
 `sparta_factor_real`.
 
+## Supernodal LDLᵀ
+
+`Config::cpu_supernodal` (`cpu_supernodal=True` in Python) replaces the
+multifrontal LDLᵀ factorization with a right-looking supernodal one
+(`supernodal.rs`). Every node's `nr × nc` block of the factor store is cleared
+and given its original entries up front. A node is then factored in place --
+`?sytrf` on the fully summed block and the off-diagonal solve, or the serial
+kernel on a temporary front for narrow nodes and exactly singular blocks --
+and its update `L21 D L21ᵀ` is formed one row block at a time by GEMM into a
+per-thread buffer and added straight into the ancestors' columns, under
+striped locks because nodes of one level can share an ancestor. No front is
+cleared or extend-added, which was most of the multifrontal CPU time on large
+EMerge systems, and the frontal workspace is not allocated. The factor comes
+out in the multifrontal layout, so the solve, refinement and pivot reporting
+are shared. LU and the hybrid's column-major solvers stay multifrontal.
+
 ## Shared architecture
 
 Analysis, ordering, supernodes, child scatter maps, level order and reusable
