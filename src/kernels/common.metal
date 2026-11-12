@@ -107,9 +107,10 @@ float2 cdiv(float2 a, float2 b) {
 // largest entry, and flooring those wrecks the factorization instead of
 // rescuing it -- measured: a 3.45e-4 relative floor perturbed ~6500 pivots on a
 // healthy 88.8k EMerge system and drove the residual from 1.4e-4 to 1.2e1.
-// Perturbation fires only where the factorization would otherwise have failed
+// This floor fires only where the factorization would otherwise have failed
 // outright: a pivot of exactly zero, or a 2x2 block with no usable inverse.
-// Everywhere else the pivot is used exactly as found.
+// The one other perturbation is static pivoting (pivot_tiny below), whose
+// threshold is relative to the original matrix and sits far below it.
 //
 // sqrt(f32 epsilon) is the replacement value. Perturbing to the noise floor
 // instead would leave multipliers of order 1/epsilon, risking overflow in the
@@ -125,6 +126,16 @@ static float2 floor_pivot(float2 d, float floor) {
 // A pivot the factorization cannot divide by at all.
 static bool pivot_dead(float2 d) {
     return !(mag(d) > 0);
+}
+// Static pivoting (Config::static_pivot). `tiny` is absolute: the setting times
+// the matrix's largest entry, written by the host into buffer 21 before each
+// LDL^T factorization, 0 when disabled. A nonzero pivot below it is raised to
+// it by floor_pivot, keeping its phase. Unlike PIVOT_FLOOR this is relative to
+// the original matrix, so it stays far below every legitimate pivot (1e-12 by
+// default) and catches only pivots that would otherwise blow up the factor.
+static bool pivot_tiny(float2 d, float tiny) {
+    float v = mag(d);
+    return v > 0 && v < tiny;
 }
 // --- Hierarchical threadgroup reductions ------------------------------------
 // Every one of these replaces a log2(N)-stage barriered tree over threadgroup

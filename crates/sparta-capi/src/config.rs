@@ -103,6 +103,7 @@ impl CConfig {
             cpu_block_rows: base.cpu_block_rows,
             cpu_blas_min_rows: base.cpu_blas_min_rows,
             supernodal: base.supernodal,
+            static_pivot: base.static_pivot,
             hybrid_cpu: self.hybrid_cpu,
             threads: self.threads as usize,
         };

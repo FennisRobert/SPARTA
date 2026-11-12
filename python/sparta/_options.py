@@ -80,6 +80,7 @@ class _Options:
     cpu_block_rows: int | None
     cpu_blas_min_rows: int | None
     supernodal: bool | None
+    static_pivot: float | None
     threads: int | None
 
     def __post_init__(self) -> None:
@@ -137,6 +138,10 @@ class _Options:
             if value is not None and (type(value) is not int or value < 0):
                 raise ValueError(f"{name} must be None or a non-negative integer")
         
+        if self.static_pivot is not None and (
+                not isinstance(self.static_pivot, (int, float)) or not 0 <= self.static_pivot < 1):
+            raise ValueError("static_pivot must be None, or at least 0 and below 1")
+
         for name in ("imbalance", "lu_diag_threshold"):
             value = getattr(self, name)
             if value is not None and not isinstance(value, (int, float)):

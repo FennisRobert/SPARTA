@@ -133,7 +133,7 @@ impl Front<'_> {
         }
         // Nothing outside `leading` and `ipiv` has been written yet, so a
         // refusal here leaves the front exactly as it was assembled.
-        if info != 0 {
+        if info != 0 || super::factor::sytrf_tiny(leading, ipiv, n, self.tiny) {
             return Ok(false);
         }
         self.adopt(leading, ipiv, &mut s.twos);

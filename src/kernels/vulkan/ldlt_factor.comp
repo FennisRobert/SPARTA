@@ -154,7 +154,7 @@ void main() {
                 vec2 d = pivot_dead(da) ? floor_pivot(da, pfloor) : da;
                 fronts[a + k * m + k] = d;
                 diagonal[node.first + k] = d;
-                bumped++;
+                bumped += uint(pivot_dead(da));
                 for (uint i = k + 1; i < m; i++)
                     fronts[a + i * m + k] = cdiv(fronts[a + i * m + k], d);
                 for (uint i = k + 1; i < m; i++)
@@ -330,7 +330,7 @@ uint take_pivot(uint a, uint m, uint n, uint k, uint first, uint s, uint lane) {
             if (lane == 0) {
                 diagonal[first + k] = d;
                 fronts[a + k * m + k] = d;
-                state[s].perturbed++;
+                state[s].perturbed += uint(pivot_dead(da));
             }
             BARRIER_DEVICE();
             for (uint i = k + 1 + lane; i < n; i += PIVOT_THREADS)
@@ -714,7 +714,7 @@ void main() {
                 if (lane == 0) {
                     diagonal[first + k] = d;
                     panels[w + t * m + k] = d;
-                    state[s].perturbed++;
+                    state[s].perturbed += uint(pivot_dead(da));
                 }
                 BARRIER_DEVICE();
                 for (uint i = k + 1 + lane; i < n; i += width) {

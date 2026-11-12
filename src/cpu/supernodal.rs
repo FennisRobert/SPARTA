@@ -26,7 +26,7 @@ use super::blocked::grow;
 use super::dense::{self, Side, Threading, Tri};
 use super::factor::Front;
 use super::profile::{Phase, Report};
-use super::{work, Scalar, Worker, C};
+use super::{work, Scalar, Worker, C, R};
 use crate::{Analysis, Error, PivotFailure, Result};
 use rayon::prelude::*;
 use std::cell::RefCell;
@@ -102,6 +102,8 @@ struct Store {
     subdiag: *mut C,
     perms: *mut usize,
     two: *mut bool,
+    /// The absolute static-pivoting threshold; see `Front::tiny`.
+    tiny: R,
 }
 // SAFETY: a node writes its own pivot metadata and its own factor block, which
 // no other node of its level touches, and ancestors' factor rows only under
@@ -128,11 +130,13 @@ pub(super) fn factor_all(
     perms: &mut [usize],
     two: &mut [bool],
     values: &[C],
+    tiny: R,
     workers: &Mutex<Vec<Worker>>,
     machine: bool,
     report: &mut Report,
 ) -> Result<u64> {
     let store = Store {
+        tiny,
         factors: factors.as_mut_ptr(),
         diagonal: diagonal.as_mut_ptr(),
         subdiag: subdiag.as_mut_ptr(),
@@ -267,7 +271,7 @@ unsafe fn node(
         if alone {
             dense::set_threading(Threading::Caller);
         }
-        if info == 0 {
+        if info == 0 && !super::factor::sytrf_tiny(leading, &scratch.ipiv[..n], n, store.tiny) {
             let mut front = Front {
                 a: &mut [],
                 m,
@@ -279,6 +283,7 @@ unsafe fn node(
                 config: &plan.config,
                 kind: plan.kind,
                 bumped: 0,
+                tiny: store.tiny,
                 parallel,
                 alone,
                 l: Some(&mut *panel),
@@ -376,6 +381,7 @@ unsafe fn node(
         config: &plan.config,
         kind: plan.kind,
         bumped: 0,
+        tiny: store.tiny,
         parallel: false,
         alone,
         l: None,

@@ -122,6 +122,14 @@ impl Solver {
                 "finite complex64 values must match analyzed CSC pattern".into(),
             ));
         }
+        // Static pivoting is relative to the whole matrix; see
+        // `Config::static_pivot`. LU kernels never read it.
+        let tiny = if self.plan.kind == crate::Kind::Ldlt {
+            self.plan.config.static_pivot as f32 * values.iter().map(|v| v.norm()).fold(0.0, f32::max)
+        } else {
+            0.0
+        };
+        self.context.set_static_pivot(tiny)?;
         let mut status = vec![0u32; self.nodes];
         let mut perturbed = 0u64;
         #[cfg(sparta_metal)]

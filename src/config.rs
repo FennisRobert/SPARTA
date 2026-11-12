@@ -75,6 +75,20 @@ pub struct Config {
     /// factor layout, same solve either way. `false` is the multifrontal
     /// route. LU, the hybrid's CPU share and Vulkan ignore it.
     pub supernodal: bool,
+    /// Static pivoting threshold for `LDL^T`, relative to the largest entry
+    /// of the matrix. A 1x1 pivot smaller than `static_pivot * max|a_ij|` is
+    /// replaced by a pivot of that size and the same phase, and counted in
+    /// `Solver::perturbed_pivots`. On the CPU the size is also capped at
+    /// `static_pivot` times the largest entry below the pivot in its column,
+    /// so a small pivot that amplifies nothing is kept; the GPU's single
+    /// precision cannot tell such a pivot from noise and applies the bound
+    /// as is. SPARTA pivots only inside each front, so
+    /// without this a pivot that is tiny but not exactly zero, typical of
+    /// matrices with zero diagonal entries such as saddle-point systems,
+    /// is divided by as is and its growth can ruin the factorization. Default
+    /// `1e-12`; `0` replaces exact zeros only, as before 0.3.5. LU and Vulkan
+    /// ignore it.
+    pub static_pivot: f64,
     /// Minimum eliminated columns before two supernodes may merge. Larger
     /// values give fewer, wider fronts for more factor storage.
     pub nemin: usize,
@@ -198,6 +212,7 @@ impl Config {
             cpu_block_rows: 96,
             cpu_blas_min_rows: 64,
             supernodal: true,
+            static_pivot: from_env("SPARTA_STATIC_PIVOT", 1e-12),
             nemin: 16,
             small_front_rows: profile.small_front_rows,
             max_front: None,
@@ -291,6 +306,10 @@ impl Config {
             .or(rule(
                 (0.0..=1.0).contains(&self.lu_diag_threshold),
                 "lu_diag_threshold must be between 0 and 1",
+            ))
+            .or(rule(
+                (0.0..1.0).contains(&self.static_pivot),
+                "static_pivot must be at least 0 and below 1",
             ))
             // The strip tile is `16 * strip_block` rows by `panel` columns and
             // is indexed in whole column tiles, so the rows must divide evenly.

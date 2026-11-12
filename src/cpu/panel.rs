@@ -118,8 +118,8 @@ impl Front<'_> {
                     step = 1;
                     if da.norm() == 0.0 {
                         col[k] = self.rescue(k, false, &mut None, PivotFailure::TinyTwoByTwo)?;
+                        self.bumped += 1;
                     }
-                    self.bumped += 1;
                 } else {
                     self.d[k] = da;
                     self.d[k + 1] = dc;
@@ -138,6 +138,10 @@ impl Front<'_> {
                 let mut d = col[k];
                 if d.norm() == 0.0 {
                     d = self.rescue(k, false, &mut None, PivotFailure::ZeroColumn)?;
+                    self.bumped += 1;
+                }
+                if let Some(raised) = self.raise_tiny(d, col[k + 1..self.m].iter().copied()) {
+                    d = raised;
                     self.bumped += 1;
                 }
                 self.d[k] = d;

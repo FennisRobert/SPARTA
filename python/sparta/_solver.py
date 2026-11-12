@@ -43,6 +43,7 @@ def _symbolic(a: sparse.csc_matrix, path: Path, options: _Options) -> _Analysis:
                      cpu_panel=options.cpu_panel, cpu_block_rows=options.cpu_block_rows,
                      cpu_blas_min_rows=options.cpu_blas_min_rows,
                      supernodal=options.supernodal,
+                     static_pivot=options.static_pivot,
                      threads=options.threads)
 
 
@@ -117,7 +118,8 @@ class Solver:
                   max_front: int | None = None, equilibrate: bool | None = None,
                   refinement_steps: int | None = None, refinement_rtol: float | None = None,
                   refinement_minimize: bool | None = None, verbose: bool | None = None,
-                  supernodal: bool | None = None) -> Solver:
+                  supernodal: bool | None = None,
+                  static_pivot: float | None = None) -> Solver:
         """Factor a matrix and return this solver; reuse storage while the backend is unchanged.
 
         Parameters
@@ -175,10 +177,10 @@ class Solver:
         verbose : bool or None
             Print bounded per-solve summaries to stderr; None keeps current setting.
             Extra CPU residual evaluation is performed when enabled.
-        supernodal : bool or None
+        supernodal, static_pivot : bool or None, float or None
             Accepted and ignored, so that one set of settings can be passed to
-            both analyze() and factorize(). The factorization route is chosen
-            when the matrix is analyzed; set it in analyze().
+            both analyze() and factorize(). Both are fixed when the matrix is
+            analyzed; set them in analyze().
 
         Raises
         ------
@@ -194,7 +196,7 @@ class Solver:
             Input validation failures preserve old factors too.
         """
         self._live()
-        del supernodal  # Chosen in analyze(); see the docstring.
+        del supernodal, static_pivot  # Chosen in analyze(); see the docstring.
         updates = dict(force_cpu=force_cpu,
                        hybrid_cpu=None if hybrid is None else _hybrid_share(hybrid),
                        verbose=verbose, safe_mode=safe_mode, ordering=ordering, mtype=mtype, triangle=triangle, max_front=max_front,

@@ -10,7 +10,7 @@ use super::dense;
 use rayon::prelude::*;
 use super::profile::{Phase, Report};
 use super::Scalar;
-use super::{factor::Front, C};
+use super::{factor::Front, C, R};
 use crate::{Analysis, Error, Kind, Result};
 
 /// Raw handles to the numerical storage a level's fronts write concurrently.
@@ -33,6 +33,8 @@ pub(super) struct Shared {
     two: *mut bool,
     /// The factor layout; see `Solver::rowmajor`.
     rowmajor: bool,
+    /// The absolute static-pivoting threshold; see `Front::tiny`.
+    tiny: R,
 }
 
 // SAFETY: `Shared` is only ever used through `node`, which addresses one node's
@@ -54,6 +56,7 @@ impl Shared {
         perms: &mut [usize],
         two: &mut [bool],
         rowmajor: bool,
+        tiny: R,
     ) -> Self {
         Self {
             fronts: fronts.as_mut_ptr(),
@@ -64,6 +67,7 @@ impl Shared {
             perms: perms.as_mut_ptr(),
             two: two.as_mut_ptr(),
             rowmajor,
+            tiny,
         }
     }
 
@@ -180,6 +184,7 @@ impl Shared {
             config: &plan.config,
             kind: plan.kind,
             bumped: 0,
+            tiny: self.tiny,
             parallel,
             alone,
             l: (self.rowmajor && n > 0).then(|| {

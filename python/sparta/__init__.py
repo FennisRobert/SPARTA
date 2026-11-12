@@ -45,6 +45,7 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
             cpu_panel: int | None = None,
             cpu_block_rows: int | None = None, cpu_blas_min_rows: int | None = None,
             supernodal: bool | None = None,
+            static_pivot: float | None = None,
             threads: int | None = None) -> Solver:
     """Analyze a matrix pattern on CPU and return an unfactorized Solver.
 
@@ -78,6 +79,14 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
         the GPU the fronts keep only the lower half of their trailing blocks.
         Same pivoting, same solve. False is the multifrontal route. LU ignores
         it. None uses the config's setting, which is True by default.
+    static_pivot : float or None, default None
+        LDLT static pivoting threshold, relative to the matrix's largest entry.
+        A pivot smaller than this is raised to it and counted in
+        perturbed_pivots (on the CPU only as far as its column has entries to
+        amplify, so a badly scaled diagonal is left alone); this keeps a tiny pivot, typical of matrices with
+        zero diagonal entries such as saddle-point systems, from ruining the
+        factorization. 0 replaces exact zeros only. LU and Vulkan ignore it.
+        None uses the config's setting, which is 1e-12 by default.
     threads : int or None, default None
         CPU threads for SPARTA's own work: the analysis, CPU factorization and
         solves, and the hybrid's CPU share. 0 uses the process-wide pool, which
@@ -233,7 +242,7 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
                   hybrid_cpu=None if hybrid is None else _hybrid_share(hybrid),
                   cpu_panel=cpu_panel, cpu_block_rows=cpu_block_rows,
                   cpu_blas_min_rows=cpu_blas_min_rows, supernodal=supernodal,
-                  threads=threads)
+                  static_pivot=static_pivot, threads=threads)
     if config is not None:
         base = Config.resolve(config).to_dict()
         tuning = {name: base[name] if value is None else value

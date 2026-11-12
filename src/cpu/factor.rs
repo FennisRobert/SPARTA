@@ -18,6 +18,9 @@ pub(super) struct Front<'a> {
     pub config: &'a Config,
     pub kind: Kind,
     pub bumped: u64,
+    /// Absolute static-pivoting threshold, `Config::static_pivot` times the
+    /// largest entry of the matrix; 0 for LU or when disabled.
+    pub tiny: R,
     /// Whether this front splits its own work into Rayon tasks: when it is
     /// alone on the machine, or when it outweighs its level's other fronts and
     /// the threads that finish those steal from it.
@@ -108,6 +111,25 @@ impl Front<'_> {
             }
         }
         self.perm.swap(p, q);
+    }
+
+    /// Static pivoting (`Config::static_pivot`, here `tau`): a nonzero 1x1
+    /// pivot `d` below `tau * min(max|A|, colmax)` is raised to that size,
+    /// keeping its phase. `colmax` is the largest entry of `column`, the
+    /// pivot's column below the diagonal over every row of the front, and is
+    /// scanned only for a pivot already below `tiny = tau * max|A|`. The
+    /// column bound leaves an uncoupled small pivot alone, as in a badly
+    /// scaled diagonal, since it causes no growth; a coupled one is raised
+    /// until its multipliers are at most `1 / tau`. Exact zeros are left to
+    /// `rescue`.
+    pub(super) fn raise_tiny(&self, d: C, column: impl Iterator<Item = C>) -> Option<C> {
+        let v = d.norm();
+        if !(v > 0.0 && v < self.tiny) {
+            return None;
+        }
+        let colmax = column.map(|x| x.norm()).fold(0.0, R::max);
+        let raised = self.tiny.min(self.config.static_pivot as R * colmax);
+        (v < raised).then(|| d * C::from_re(raised / v))
     }
 
     /// Rescue a dead pivot at `k`, using a front-relative sqrt(epsilon_f64) floor.
@@ -267,8 +289,8 @@ impl Front<'_> {
                 step = 1;
                 if da.norm() == 0.0 {
                     self.a[k * m + k] = self.rescue(k, small, floor, PivotFailure::TinyTwoByTwo)?;
+                    self.bumped += 1;
                 }
-                self.bumped += 1;
             } else {
                 self.d[k] = da;
                 self.d[k + 1] = dc;
@@ -286,6 +308,11 @@ impl Front<'_> {
             let mut d = self.a[k * m + k];
             if d.norm() == 0.0 {
                 d = self.rescue(k, small, floor, PivotFailure::ZeroColumn)?;
+                self.a[k * m + k] = d;
+                self.bumped += 1;
+            }
+            if let Some(raised) = self.raise_tiny(d, (k + 1..m).map(|i| self.a[i * m + k])) {
+                d = raised;
                 self.a[k * m + k] = d;
                 self.bumped += 1;
             }
@@ -359,4 +386,23 @@ impl Front<'_> {
             }
         }
     }
+}
+
+/// Whether `?sytrf` took a 1x1 pivot below `tiny` in the `n`-column block
+/// `leading`. LAPACK divides by any nonzero pivot, so such a front is handed
+/// to the panel kernel, which applies `Config::static_pivot` with its column
+/// bound. Healthy fronts have no such pivot and never pay for the refactor.
+pub(super) fn sytrf_tiny(leading: &[C], ipiv: &[i32], n: usize, tiny: R) -> bool {
+    let mut k = 0;
+    while k < n {
+        if ipiv[k] < 0 {
+            k += 2;
+            continue;
+        }
+        if leading[k * n + k].norm() < tiny {
+            return true;
+        }
+        k += 1;
+    }
+    false
 }

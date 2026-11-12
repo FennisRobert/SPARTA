@@ -241,7 +241,7 @@ pip downloads its build helper (maturin), NumPy and SciPy from PyPI.
 no compiler, no source code needed.
 
 ```sh
-pip install sparta_solver-0.3.4-cp39-abi3-macosx_11_0_arm64.whl
+pip install sparta_solver-0.3.5-cp39-abi3-macosx_11_0_arm64.whl
 ```
 
 One wheel works for every Python from 3.9 up, on Apple Silicon only. To make a
@@ -666,6 +666,7 @@ double, and `enum` is one of the named choices.
 | `hybrid_cpu` | float64 | `0.0` | Share of the work the CPU does alongside the GPU; `hybrid=True` in Python. Metal only. |
 | `lu_diag_threshold` | float64 | `0.0` | LU only. How strongly to prefer the diagonal as pivot. |
 | `supernodal` | bool | `True` | LDLT only. Supernodal factorization: no frontal matrices on the CPU, half-size trailing blocks on the GPU. Faster and less memory; `False` is the multifrontal route. Ignored by LU and Vulkan. |
+| `static_pivot` | float64 | `1e-12` | LDLT only. Pivots smaller than this, relative to the largest matrix entry, are raised to it. `0` replaces exact zeros only. Ignored by LU and Vulkan. |
 | **CPU backend** (Python and Rust) | | | |
 | `cpu_panel` | uint64 | `32` | Pivots per panel before an update. |
 | `cpu_block_rows` | uint64 | `96` | Rows per block in the trailing update. |
@@ -761,6 +762,7 @@ measure both.
 | `force_cpu` | bool | | Factor and solve on the CPU in double precision instead of on the GPU. Python and Rust only. See [Precision and accuracy](#precision-and-accuracy). |
 | `hybrid_cpu` | float64 | 0 to below 1 | Share of the factorization work the CPU does at the same time as the GPU does the rest. `0` is the GPU alone. It is a starting point: the share adapts after every factorization. Python also takes `hybrid=True` (30%). Ignored except on Metal. See [CPU and GPU together](#cpu-and-gpu-together-hybrid). |
 | `lu_diag_threshold` | float64 | 0 to 1 | LU only. `0` is strict partial pivoting. Above 0 the factorization accepts the diagonal entry as pivot if it is within this fraction of the column's best candidate. That is faster, but less stable, and **it changes results**, not just speed. |
+| `static_pivot` | float64 | 0 to below 1 | LDLT only. SPARTA pivots inside each front and never passes a column on to the parent front, so a pivot can turn out tiny without being zero. Typical causes are zero diagonal entries, as in saddle-point or constrained systems. Dividing by it as found can ruin the factorization. Any pivot smaller than `static_pivot` times the largest entry of the matrix is therefore raised to that size and counted in `perturbed_pivots`. On the CPU the raise is also capped at `static_pivot` times the largest entry below the pivot in its column, so a small pivot with nothing to amplify, as in a badly scaled diagonal, is left alone. The GPU, whose single precision cannot tell such a pivot from rounding noise, applies the threshold as is. The default, `1e-12`, sits far below the pivots of ordinary matrices. `0` replaces exact zeros only, the behaviour before 0.3.5. Ignored by LU and Vulkan. Python and Rust only: C, Julia and MATLAB use the default, which `SPARTA_STATIC_PIVOT` overrides. |
 
 ### CPU threads
 
@@ -814,7 +816,7 @@ The last six are compiled into the GPU kernels. A combination the process has
 not used before costs about 300 ms of shader compilation the first time.
 Settings that break a device limit, such as shared memory, are rejected with a
 message naming the setting. `SPARTA_SCHUR_BATCH`, `SPARTA_PANEL_THREADS`,
-`SPARTA_SOLVE_THREADS`, `SPARTA_LU_DIAG_THRESHOLD` and `SPARTA_HYBRID_CPU` override their defaults
+`SPARTA_SOLVE_THREADS`, `SPARTA_LU_DIAG_THRESHOLD`, `SPARTA_STATIC_PIVOT` and `SPARTA_HYBRID_CPU` override their defaults
 from the environment, for quick experiments.
 
 ## Precision and accuracy
@@ -957,7 +959,8 @@ Check the result before trusting it, especially on a new kind of matrix.
 
 **Rust.**
 - `solver.perturbed_pivots()` counts pivots SPARTA had to nudge to avoid a
-  breakdown. Nonzero means the factors are of a slightly different matrix.
+  breakdown: exact zeros, and pivots below `static_pivot`. Nonzero means the
+  factors are of a slightly different matrix.
 - `solver.pivot_range()` gives the smallest and largest pivot. A ratio near
   single-precision resolution (about 1e-7) or below is a warning sign.
 - Compute `‖b − Ax‖ / ‖b‖` yourself, in double precision.

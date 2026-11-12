@@ -35,6 +35,9 @@ impl Context {
         unreachable!("no Context is ever constructed without a backend")
     }
     pub(crate) fn release(&mut self) {}
+    pub(crate) fn set_static_pivot(&mut self, _: f32) -> Result<()> {
+        Ok(())
+    }
     pub(crate) fn pivot_range(&self) -> Option<(f64, f64)> {
         None
     }

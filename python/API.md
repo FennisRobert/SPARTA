@@ -71,8 +71,8 @@ keep the current value. Numerical options (`equilibrate`, `refinement_steps`,
 `refinement_rtol`, `refinement_minimize`) can change and persist. Analysis options
 (`ordering`, `mtype`, `path`, `triangle`, `max_front`) can be repeated unchanged,
 so `factorize(**settings)` works. Changing them requires a new analyze call.
-`supernodal` is accepted and ignored, for the same reason: the route is
-chosen by analyze.
+`supernodal` and `static_pivot` are accepted and ignored, for the same reason:
+both are fixed by analyze.
 `Path.AUTO` also accepts the already selected path; it does not reselect it.
 
 Invalid input/options preserve an existing factorization. A failure during GPU
@@ -163,7 +163,10 @@ idempotent and leave `Drop` with nothing to do.
 - `F.path` is the selected Path enum; `F.n` is the matrix dimension.
 - `F.info` reports symbolic counts and byte estimates.
 - `F.factor_device_seconds` is GPU factor time, excluding CPU analysis/preparation.
-- `F.perturbed_pivots` counts rescued pivots; zero is not an accuracy certificate.
+- `F.perturbed_pivots` counts rescued pivots: exact zeros, and LDLT pivots below
+  `static_pivot` (default 1e-12) times the largest matrix entry, which are raised
+  to that size. `static_pivot=0` in analyze() replaces exact zeros only. Zero is
+  not an accuracy certificate.
 - `F.reanalyses` counts the factorize calls that met a new pattern and analyzed again.
 - `F.diagnostics()` reports sizes, current options, factorization state and reports.
 - `F.quality` returns a `FactorQuality` describing how far to trust the factors.

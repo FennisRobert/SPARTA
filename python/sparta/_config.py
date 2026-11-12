@@ -50,6 +50,13 @@ class Config:
         fronts keep only the lower half of their trailing blocks. Same pivoting
         and solve as the multifrontal route (False), less memory, faster. LU
         ignores it.
+    static_pivot : float
+        LDLT static pivoting threshold, relative to the matrix's largest entry
+        (default 1e-12). A pivot smaller than this is raised to it and counted
+        in perturbed_pivots; on the CPU only as far as its column has entries
+        to amplify. It stops a tiny pivot, typical of matrices with zero
+        diagonal entries, from ruining the factorization. 0 replaces exact
+        zeros only. LU and Vulkan ignore it.
     threads : int
         CPU threads for SPARTA's own work: the analysis, CPU factorization and
         solves, and the hybrid's CPU share. 0 uses the process-wide pool, which
@@ -112,6 +119,7 @@ class Config:
     cpu_block_rows: int
     cpu_blas_min_rows: int
     supernodal: bool
+    static_pivot: float
     threads: int
 
     @classmethod

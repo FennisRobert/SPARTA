@@ -16,7 +16,7 @@ typedef struct { uint32_t offset,nr,nc,rows,children,count,entries,nentries,firs
 _Static_assert(sizeof(SpartaNode)==14*sizeof(uint32_t),"SpartaNode must mirror struct Node");
 // Buffers bound to every kernel. Buffer 20 is the LU U12 store and stays at the
 // four-byte stub on the LDL^T path; buffer 14 is set per dispatch with setBytes.
-#define SPARTA_BUFFERS 21
+#define SPARTA_BUFFERS 22
 // Threadgroup width for factor_panel, the wide-front pivot kernel. Deliberately
 // not PIVOT_THREADS: that constant still sizes factor_narrow, whose fronts are
 // too thin to use a wide group. See the sweep in factor_panel. Override at run

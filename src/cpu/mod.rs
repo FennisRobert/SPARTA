@@ -193,6 +193,13 @@ impl Solver {
     /// Each level runs across the Rayon pool; the walk joins between levels,
     /// which is what makes the disjointness `Shared` relies on hold.
     fn factor_all(&mut self, values: &[C], report: &mut Report) -> Result<()> {
+        // Static pivoting is relative to the whole matrix, not to a front,
+        // whose entries may already carry the growth it is meant to stop.
+        let tiny = if self.plan.kind == Kind::Ldlt {
+            self.plan.config.static_pivot as R * values.iter().map(|v| v.norm()).fold(0.0, R::max)
+        } else {
+            0.0
+        };
         let Self {
             plan,
             fronts,
@@ -214,7 +221,7 @@ impl Solver {
         // products -- unless this solver is bounded to fewer threads, which
         // the library's own threading would not respect.
         let machine = !pool.bounded();
-        let shared = Shared::new(fronts, factors, upper, diagonal, subdiag, perms, two, *rowmajor);
+        let shared = Shared::new(fronts, factors, upper, diagonal, subdiag, perms, two, *rowmajor, tiny);
         // Rayon owns the parallelism: fronts across threads in wide levels, and
         // row blocks within one front in narrow ones. Accelerate threads only
         // inside `zsytrf`, which sets and clears this itself. The setting is
@@ -240,7 +247,8 @@ impl Solver {
         };
         let result = if let Some(layout) = supernodal {
             supernodal::factor_all(
-                plan, layout, schedule, factors, diagonal, subdiag, perms, two, values, workers, machine, report,
+                plan, layout, schedule, factors, diagonal, subdiag, perms, two, values, tiny, workers, machine,
+                report,
             )
             .map(|count| {
                 bumped.fetch_add(count, Ordering::Relaxed);

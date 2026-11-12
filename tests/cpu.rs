@@ -380,3 +380,124 @@ fn supernodal_matches_multifrontal() {
         assert!((sn_range.0 / range.0 - 1.0).abs() < 1e-8 && (sn_range.1 / range.1 - 1.0).abs() < 1e-8);
     }
 }
+
+/// 60 pairs `(2i, 2i+1)` with a zero diagonal, coupled inside each pair and
+/// weakly to the next one: nonsingular and well conditioned, but each zero
+/// pivot is only usable as a 2x2 block with its partner.
+fn zero_diagonal_pairs(pairs: usize) -> Vec<C> {
+    let n = 2 * pairs;
+    let mut a = vec![C::new(0.0, 0.0); n * n];
+    let mut set = |i: usize, j: usize, v: C| {
+        a[i * n + j] = v;
+        a[j * n + i] = v;
+    };
+    for i in 0..pairs {
+        let (j, k) = (2 * i, 2 * i + 1);
+        set(k, j, C::new(2.0 + (i % 5) as f64, 0.7));
+        if i + 1 < pairs {
+            set(j + 2, j, C::new(0.3, 0.0));
+            set(k + 2, j, C::new(-0.2, 0.0));
+        }
+    }
+    a
+}
+
+#[test]
+/// Small fronts split the pairs of a zero-diagonal matrix, so a front holds
+/// one member and its pivot is zero or tiny. Static pivoting keeps the factor
+/// usable without refinement; with exact-zero rescue alone, tiny pivots were
+/// divided by as found and the solution was off by about 1e22.
+fn zero_diagonal_pairs_split_over_fronts() {
+    let pairs = 60;
+    let n = 2 * pairs;
+    let a = zero_diagonal_pairs(pairs);
+    let expected: Vec<_> = (0..n).map(|i| C::new((i as f64).sin(), 0.3)).collect();
+    let b = product(&a, n, &expected);
+    for supernodal in [true, false] {
+        for nemin in [n, 4] {
+            let config = Config {
+                force_cpu: true,
+                supernodal,
+                nemin,
+                ..Config::default()
+            };
+            // The nonzeros and the (zero) diagonal, as the matrix would arrive.
+            let (mut ptr, mut rows, mut values) = (vec![0], Vec::new(), Vec::new());
+            for j in 0..n {
+                for i in j..n {
+                    if i == j || a[i * n + j] != C::new(0.0, 0.0) {
+                        rows.push(i);
+                        values.push(a[i * n + j]);
+                    }
+                }
+                ptr.push(rows.len());
+            }
+            let p = Analysis::ldlt(n, &ptr, &rows, &config).unwrap();
+            let fronts = p.supernodes();
+            let mut s = Solver::new(p).unwrap();
+            s.factor_c128(&values).unwrap();
+            let x = s.solve_c128(&b).unwrap();
+            if fronts == 1 {
+                assert_eq!(s.perturbed_pivots(), 0);
+                close(&x, &expected, 1e-13);
+            } else {
+                assert!(s.perturbed_pivots() > 0, "{fronts} fronts");
+                close(&x, &expected, 1e-3);
+            }
+        }
+    }
+}
+
+#[test]
+/// A 2x2 candidate with no usable inverse falls back to a 1x1 pivot. The
+/// fallback counts as a perturbation only when it changes the pivot.
+fn two_by_two_fallback_counts_only_real_perturbations() {
+    // Unknowns 0 and 1 form the candidate [[1e-30, 1e-9], [1e-9, 1]], whose
+    // scaled determinant is about -1e-18. Rows 3 and 4 are equal, so `?sytrf`
+    // reports a zero pivot and the panel kernel refactors the front, rescuing
+    // one pivot.
+    let n = 5;
+    let mut a = vec![C::new(0.0, 0.0); n * n];
+    for (i, j, v) in [
+        (0, 0, 1e-30),
+        (1, 0, 1e-9),
+        (1, 1, 1.0),
+        (2, 1, 10.0),
+        (2, 2, 1.0),
+        (3, 2, 1.0),
+        (4, 2, 1.0),
+        (3, 3, 1.0),
+        (4, 3, 1.0),
+        (4, 4, 1.0),
+    ] {
+        a[i * n + j] = C::new(v, 0.0);
+        a[j * n + i] = C::new(v, 0.0);
+    }
+    for supernodal in [true, false] {
+        for small_front_rows in [1, 64] {
+            // Without static pivoting 1e-30 is kept as found: one perturbation.
+            // With it, the panel kernel's fallback takes 1e-30 while 1e-9 is
+            // still below it, so it is raised too: two. The serial kernel
+            // takes 1e-30 last, with nothing left below it to grow, and keeps it.
+            let raised = if small_front_rows == 1 { 2 } else { 1 };
+            for (static_pivot, perturbed) in [(0.0, 1), (1e-12, raised)] {
+                let config = Config {
+                    force_cpu: true,
+                    supernodal,
+                    small_front_rows,
+                    static_pivot,
+                    ..Config::default()
+                };
+                let (p, values) = plan(&a, n, Kind::Ldlt, &config, false);
+                assert_eq!(p.supernodes(), 1);
+                let mut s = Solver::new(p).unwrap();
+                s.factor_c128(&values).unwrap();
+                assert_eq!(
+                    s.perturbed_pivots(),
+                    perturbed,
+                    "supernodal {supernodal}, small_front_rows {small_front_rows}, static_pivot {static_pivot}"
+                );
+            }
+        }
+    }
+}

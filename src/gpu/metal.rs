@@ -85,8 +85,8 @@ pub(crate) struct Context(Option<NonNull<c_void>>);
 impl Context {
     pub(super) fn new(plan: &Analysis) -> Result<Self> {
         let dispatch = plan.dispatch_plan();
-        let mut data = [std::ptr::null::<c_void>(); 21];
-        let mut lengths = [0usize; 21];
+        let mut data = [std::ptr::null::<c_void>(); 22];
+        let mut lengths = [0usize; 22];
         macro_rules! buffer {
             ($i:expr, $slice:expr) => {{
                 data[$i] = $slice.as_ptr().cast();
@@ -115,6 +115,8 @@ impl Context {
         // The LU U12 store. Zero on the LDL^T path, where the bridge binds
         // the four-byte stub every unused buffer gets.
         lengths[20] = plan.upper_elements * 8;
+        // The absolute static-pivoting threshold; see `set_static_pivot`.
+        lengths[21] = 4;
         // Sizes are bounded by the device's own reported limits inside
         // create; only host-side arithmetic overflow is rejected here.
         lengths
@@ -244,6 +246,16 @@ impl Context {
             return Err(Error::Invalid(format!("no device buffer {index}")));
         }
         Ok(std::slice::from_raw_parts_mut(data.cast(), length / std::mem::size_of::<T>()))
+    }
+    /// Write the absolute static-pivoting threshold (`Config::static_pivot`
+    /// times the matrix's largest entry) that the `LDL^T` factor kernels read
+    /// from buffer 21. Call before a factorization is committed.
+    pub(super) fn set_static_pivot(&mut self, tiny: f32) -> Result<()> {
+        // SAFETY: no factorization is in flight between calls, and buffer 21
+        // holds one f32.
+        let slot = unsafe { self.buffer::<f32>(21)? };
+        slot[0] = tiny;
+        Ok(())
     }
     /// Commit levels `[first, last)` of the GPU's share without waiting;
     /// `values` starts a new factorization.

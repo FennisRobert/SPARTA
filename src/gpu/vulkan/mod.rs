@@ -157,6 +157,12 @@ impl Context {
         Ok(Self(Some(inner)))
     }
 
+    /// `Config::static_pivot` is not applied on Vulkan: its kernels keep the
+    /// exact-zero rule.
+    pub(super) fn set_static_pivot(&mut self, _tiny: f32) -> Result<()> {
+        Ok(())
+    }
+
     pub(super) fn run(
         &mut self,
         values: &[Complex32],

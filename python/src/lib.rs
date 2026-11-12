@@ -33,7 +33,7 @@ impl PyAnalysis {
                         panel=None, schur_block=None, strip_block=None,
                         narrow_cols=None, pivot_threads=None, schur_chunk=None,
                         force_cpu=false, cpu_panel=None, cpu_block_rows=None, cpu_blas_min_rows=None,
-                        supernodal=None, threads=None))]
+                        supernodal=None, static_pivot=None, threads=None))]
     fn new(
         n: usize,
         ptr: PyReadonlyArray1<'_, usize>,
@@ -62,6 +62,7 @@ impl PyAnalysis {
         cpu_block_rows: Option<usize>,
         cpu_blas_min_rows: Option<usize>,
         supernodal: Option<bool>,
+        static_pivot: Option<f64>,
         threads: Option<usize>,
     ) -> PyResult<Self> {
         let ordering = match ordering {
@@ -101,6 +102,7 @@ impl PyAnalysis {
             cpu_block_rows: cpu_block_rows.unwrap_or(base.cpu_block_rows),
             cpu_blas_min_rows: cpu_blas_min_rows.unwrap_or(base.cpu_blas_min_rows),
             supernodal: supernodal.unwrap_or(base.supernodal),
+            static_pivot: static_pivot.unwrap_or(base.static_pivot),
             // Not a Python argument yet: the default, or SPARTA_HYBRID_CPU.
             hybrid_cpu: base.hybrid_cpu,
             threads: threads.unwrap_or(base.threads),

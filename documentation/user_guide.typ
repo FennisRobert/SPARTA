@@ -455,7 +455,7 @@ Rust and no compiler. One wheel works for every Python from 3.9 up, on Apple
 Silicon only:
 
 #code(```sh
-pip install sparta_solver-0.3.4-cp39-abi3-macosx_11_0_arm64.whl
+pip install sparta_solver-0.3.5-cp39-abi3-macosx_11_0_arm64.whl
 ```)
 
 == Checking the installation
@@ -1141,6 +1141,7 @@ Types are given in a language-neutral form. `uint32` is `u32` in Rust and
   [`hybrid_cpu`], [float64], [`0.0`], [Share of the work the CPU does alongside the GPU (Metal only).],
   [`lu_diag_threshold`], [float64], [`0.0`], [LU only. How strongly to prefer the diagonal as pivot.],
   [`supernodal`], [bool], [`True`], [LDLT only. Supernodal factorization: no frontal matrices on the CPU, half-size trailing blocks on the GPU. Faster and less memory; `False` is the multifrontal route. Ignored by LU and Vulkan.],
+  [`static_pivot`], [float64], [`1e-12`], [LDLT only. Pivots smaller than this, relative to the largest matrix entry, are raised to it. `0` replaces exact zeros only. Ignored by LU and Vulkan.],
   table.cell(colspan: 4)[*CPU backend*],
   [`cpu_panel`], [uint64], [`32`], [Pivots per panel before an update.],
   [`cpu_block_rows`], [uint64], [`96`], [Rows per block in the update.],
@@ -1229,6 +1230,7 @@ ordering research. Leave them at their defaults otherwise.
   [`force_cpu`], [bool], [Factor and solve in double precision on the CPU instead of the GPU. Much slower, but accurate to about sixteen digits. See @precision.],
   [`hybrid_cpu`], [0 to below 1], [Share of the factorization work the CPU does while the GPU does the rest. `0` is the GPU alone. A starting point: the share adapts after every factorization. Python also takes `hybrid=True`, which is 30%. Ignored except on Metal. See @hybrid.],
   [`lu_diag_threshold`], [0 to 1], [LU only. At `0`, each pivot is the largest candidate in its column (strict partial pivoting). Above 0, the diagonal entry is kept as pivot if it is at least this fraction of the largest candidate: `0.1` accepts a diagonal one tenth as large. This saves row swaps but accepts weaker pivots, and *changes the results*. Check residuals if you use it.],
+  [`static_pivot`], [0 to below 1], [LDLT only. SPARTA pivots inside each front and never passes a column on to the parent front, so a pivot can turn out tiny without being zero. Typical causes are zero diagonal entries, as in saddle-point or constrained systems. Dividing by it as found can ruin the factorization. Any pivot smaller than `static_pivot` times the largest entry of the matrix is therefore raised to that size and counted in `perturbed_pivots`. On the CPU the raise is also capped at `static_pivot` times the largest entry below the pivot in its column, so a small pivot with nothing to amplify, as in a badly scaled diagonal, is left alone. The GPU, whose single precision cannot tell such a pivot from rounding noise, applies the threshold as is. The default, `1e-12`, sits far below the pivots of ordinary matrices. `0` replaces exact zeros only, the behaviour before 0.3.5. Ignored by LU and Vulkan. Python and Rust only: C, Julia and MATLAB use the default, which `SPARTA_STATIC_PIVOT` overrides.],
 )
 
 == CPU backend settings
@@ -1295,6 +1297,7 @@ setting.
   [`SPARTA_PANEL_THREADS`], [Overrides the default of `panel_threads`.],
   [`SPARTA_SOLVE_THREADS`], [Overrides the default of `solve_threads`.],
   [`SPARTA_LU_DIAG_THRESHOLD`], [Overrides the default of `lu_diag_threshold`.],
+  [`SPARTA_STATIC_PIVOT`], [Overrides the default of `static_pivot`.],
   [`SPARTA_HYBRID_CPU`], [Overrides the default of `hybrid_cpu`.],
   [`RAYON_NUM_THREADS`], [Sizes the process-wide thread pool that SPARTA uses when `threads` is `0`. Set it before the program starts.],
   [`SPARTA_NUM_THREADS`], [A positive count overrides `threads` wherever it was given, in every language.],
@@ -1389,8 +1392,8 @@ let nudged = solver.perturbed_pivots();
 - `pivot_range()` returns the smallest and largest pivot size. A ratio
   `smallest / largest` near single-precision resolution (about $10^(-7)$) is a
   warning; far below it, expect the solve to fail.
-- `perturbed_pivots()` counts pivots SPARTA had to nudge away from zero to
-  avoid a breakdown. Nonzero means the factors belong to a slightly different
+- `perturbed_pivots()` counts pivots SPARTA had to nudge away from zero, or up
+  to `static_pivot`, to avoid a breakdown. Nonzero means the factors belong to a slightly different
   matrix: use refinement.
 
 Neither a good verdict nor zero perturbed pivots guarantees an accurate

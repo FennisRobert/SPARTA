@@ -75,7 +75,15 @@ are shared. LU and the hybrid's column-major solvers stay multifrontal.
 Analysis, ordering, supernodes, child scatter maps, level order and reusable
 front offsets are unchanged. Input remains lower CSC for transpose-symmetric
 LDLᵀ, full CSC for LU. Nothing conjugates. Fully summed columns alone may pivot;
-pivots are not delayed to a parent. Completed L columns and LU U12 are copied
+pivots are not delayed to a parent. A front may therefore be left with a tiny
+pivot, typically when its zero-diagonal column's 2×2 partner sits in another
+front. `Config::static_pivot` (default `1e-12`, τ) raises a nonzero LDLᵀ pivot below
+τ·min(max|A|, colmax) to that size, keeping its phase, where colmax is the
+largest entry below it in its column. The column is scanned only for a pivot
+already below τ·max|A|, so healthy fronts pay nothing, and a small pivot with
+nothing below it (a badly scaled diagonal) is kept. LAPACK's
+`?sytrf` cannot, so a front where it took such a pivot is refactored by the
+panel kernel. Exact zeros keep their front-relative `sqrt(eps)` rescue. Completed L columns and LU U12 are copied
 into permanent storage before a later level can reuse the frontal workspace.
 
 Small fronts follow Metal's serial complete diagonal/off-diagonal search for

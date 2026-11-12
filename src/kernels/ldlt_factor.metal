@@ -36,9 +36,11 @@ kernel void factor_nodes(
     device float2* diagonal [[buffer(8)]], device float2* subdiag [[buffer(9)]],
     device uint* perms [[buffer(10)]], device uint* two [[buffer(11)]],
     device uint* status [[buffer(12)]], constant uint2& range [[buffer(14)]],
-    device FrontState* state [[buffer(15)]], uint tid [[thread_position_in_grid]]) {
+    device FrontState* state [[buffer(15)]], device const float* statics [[buffer(21)]],
+    uint tid [[thread_position_in_grid]]) {
     if (tid >= range.y)
         return;
+    float tiny = statics[0];
     uint s = ids[range.x + tid];
     Node node = nodes[s];
     uint m = node.nr, n = node.nc;
@@ -136,6 +138,10 @@ kernel void factor_nodes(
                     a[k * m + k] = d;
                     bumped++;
                 }
+            } else if (pivot_tiny(raw, tiny)) {
+                d = floor_pivot(raw, tiny);
+                a[k * m + k] = d;
+                bumped++;
             }
             diagonal[node.first + k] = d;
             for (uint i = k + 1; i < m; i++)
@@ -172,10 +178,11 @@ kernel void factor_nodes(
                     status[s] = PIVOT_TINY_2X2 | (k + 1);
                     return;
                 }
-                float2 d = pivot_dead(da) ? floor_pivot(da, pfloor) : da;
+                float2 d = pivot_dead(da) ? floor_pivot(da, pfloor)
+                         : pivot_tiny(da, tiny) ? floor_pivot(da, tiny) : da;
                 a[k * m + k] = d;
                 diagonal[node.first + k] = d;
-                bumped++;
+                bumped += uint(pivot_dead(da) || pivot_tiny(da, tiny));
                 for (uint i = k + 1; i < m; i++)
                     a[i * m + k] = cdiv(a[i * m + k], d);
                 for (uint i = k + 1; i < m; i++)
@@ -260,7 +267,7 @@ static uint take_pivot(device float2* a, uint m, uint n, uint k, uint first, dev
                        device float2* diagonal, device float2* subdiag, device uint* two,
                        device uint* status, uint s, uint lane, threadgroup float* maxima,
                        threadgroup uint* indices, threadgroup uint* choice, threadgroup uint* bad,
-                       uint sg, uint sl, uint simds, device FrontState* state) {
+                       uint sg, uint sl, uint simds, device FrontState* state, float tiny) {
     // Bunch-Kaufman search scans a column and (only if necessary) one row.
     // All candidate pivots remain inside the fully summed node columns.
     float cm = 0;
@@ -335,6 +342,13 @@ static uint take_pivot(device float2* a, uint m, uint n, uint k, uint first, dev
                 state[s].perturbed++;
             }
             threadgroup_barrier(mem_flags::mem_device);
+        } else if (pivot_tiny(raw, tiny)) {
+            d = floor_pivot(raw, tiny);
+            if (lane == 0) {
+                a[k * m + k] = d;
+                state[s].perturbed++;
+            }
+            threadgroup_barrier(mem_flags::mem_device);
         }
         if (lane == 0)
             diagonal[first + k] = d;
@@ -365,11 +379,13 @@ static uint take_pivot(device float2* a, uint m, uint n, uint k, uint first, dev
                     return 0;
                 }
                 d = floor_pivot(da, PIVOT_FLOOR * big);
+            } else if (pivot_tiny(da, tiny)) {
+                d = floor_pivot(da, tiny);
             }
             if (lane == 0) {
                 diagonal[first + k] = d;
                 a[k * m + k] = d;
-                state[s].perturbed++;
+                state[s].perturbed += uint(pivot_dead(da) || pivot_tiny(da, tiny));
             }
             threadgroup_barrier(mem_flags::mem_device);
             for (uint i = k + 1 + lane; i < m; i += PIVOT_THREADS)
@@ -419,6 +435,7 @@ kernel void factor_narrow(
     device float2* subdiag [[buffer(9)]], device uint* perms [[buffer(10)]],
     device uint* two [[buffer(11)]], device uint* status [[buffer(12)]],
     constant uint2& range [[buffer(14)]], device FrontState* state [[buffer(15)]],
+    device const float* statics [[buffer(21)]],
     uint group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]], uint sl [[thread_index_in_simdgroup]],
     uint simdw [[threads_per_simdgroup]]) {
@@ -434,7 +451,8 @@ kernel void factor_narrow(
     uint k = 0;
     while (k < n) {
         uint step = take_pivot(a, m, n, k, first, perms + first, diagonal, subdiag, two, status, s,
-                               lane, maxima, indices, choice, bad, sg, sl, simds, state);
+                               lane, maxima, indices, choice, bad, sg, sl, simds, state,
+                               statics[0]);
         if (!step)
             return;
         // Columns past this pivot stay current for the searches that follow;
@@ -555,10 +573,12 @@ kernel void factor_panel(
     device float2* subdiag [[buffer(9)]], device uint* perms [[buffer(10)]],
     device uint* two [[buffer(11)]], device uint* status [[buffer(12)]],
     constant uint2& range [[buffer(14)]], device FrontState* state [[buffer(15)]],
-    device float2* panels [[buffer(19)]], uint group [[threadgroup_position_in_grid]],
+    device float2* panels [[buffer(19)]], device const float* statics [[buffer(21)]],
+    uint group [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
     uint sl [[thread_index_in_simdgroup]], uint simdw [[threads_per_simdgroup]],
     uint width [[threads_per_threadgroup]]) {
+    float tiny = statics[0];
     uint s = ids[range.x + group];
     Node node = nodes[s];
     // Dispatched as wide as the pipeline allows rather than at a fixed width.
@@ -689,6 +709,13 @@ kernel void factor_panel(
                     state[s].perturbed++;
                 }
                 threadgroup_barrier(mem_flags::mem_device);
+            } else if (pivot_tiny(raw, tiny)) {
+                d = floor_pivot(raw, tiny);
+                if (lane == 0) {
+                    w[t * m + k] = d;
+                    state[s].perturbed++;
+                }
+                threadgroup_barrier(mem_flags::mem_device);
             }
             if (lane == 0)
                 diagonal[first + k] = d;
@@ -727,11 +754,13 @@ kernel void factor_panel(
                         return;
                     }
                     d = floor_pivot(da, PIVOT_FLOOR * big);
+                } else if (pivot_tiny(da, tiny)) {
+                    d = floor_pivot(da, tiny);
                 }
                 if (lane == 0) {
                     diagonal[first + k] = d;
                     w[t * m + k] = d;
-                    state[s].perturbed++;
+                    state[s].perturbed += uint(pivot_dead(da) || pivot_tiny(da, tiny));
                 }
                 threadgroup_barrier(mem_flags::mem_device);
                 for (uint i = k + 1 + lane; i < n; i += width) {
