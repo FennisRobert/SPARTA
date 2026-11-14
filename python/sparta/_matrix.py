@@ -116,6 +116,14 @@ def _canonical_matrix(a: sparse.spmatrix, triangle: str, path: Path) -> sparse.c
     if triangle == "full":
         if not _is_symmetric(a):
             raise ValueError("A must be complex-symmetric within sparta.EPS, not Hermitian; supply both triangles")
+    else:
+        # Lower storage reads the lower triangle only, so anything above the
+        # diagonal would be dropped without a trace.
+        above = sparse.triu(a, 1).count_nonzero()
+        if above:
+            raise ValueError(f"triangle='lower' but A has {above} nonzero entries above the diagonal, "
+                             "which would be ignored; pass only the lower triangle, or the whole "
+                             "matrix with triangle='full'")
     return sparse.tril(a, format="csc")
 
 

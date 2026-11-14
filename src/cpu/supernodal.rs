@@ -111,6 +111,22 @@ struct Store {
 unsafe impl Send for Store {}
 unsafe impl Sync for Store {}
 
+/// The real half of a complex factorization, finished before the complex
+/// half starts; see `RealPart` in `mod.rs`.
+///
+/// `real[id]` marks the nodes it factored. Its store holds their factors, and
+/// for every other node the real parts of its entries plus every update the
+/// real nodes sent it, all in this store's layout.
+#[derive(Clone, Copy)]
+pub(super) struct Split<'a> {
+    pub real: &'a [bool],
+    pub factors: &'a [R],
+    pub diagonal: &'a [R],
+    pub subdiag: &'a [R],
+    pub perms: &'a [usize],
+    pub two: &'a [bool],
+}
+
 /// Factor every node of `plan` supernodally. Returns the pivots perturbed.
 ///
 /// `layout` is the solver's [`Layout`] and `schedule` its level order. The
@@ -119,6 +135,12 @@ unsafe impl Sync for Store {}
 /// the matrix entries in analyzed CSC order. Nodes borrow per-front buffers
 /// from `workers`. `machine` lets a node alone in its level thread its BLAS
 /// calls across the whole machine; `report` collects the profile.
+///
+/// With `split`, the nodes it marks real are not factored, nor is their block
+/// of `factors` written: their factor stays in the split's store and only
+/// their pivots are copied. Every other node starts from its store's real accumulation
+/// plus the imaginary parts of its entries. `schedule` must then hold only
+/// the nodes not marked.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn factor_all(
     plan: &Analysis,
@@ -134,6 +156,7 @@ pub(super) fn factor_all(
     workers: &Mutex<Vec<Worker>>,
     machine: bool,
     report: &mut Report,
+    split: Option<Split<'_>>,
 ) -> Result<u64> {
     let store = Store {
         tiny,
@@ -146,19 +169,51 @@ pub(super) fn factor_all(
     // Every node's columns, cleared and holding their original entries, before
     // any descendant adds to them.
     let clock = Report::clock();
-    plan.nodes.par_iter().try_for_each(|node| {
+    plan.nodes.par_iter().enumerate().try_for_each(|(id, node)| {
         // The whole `Store`, which is `Sync`, rather than its pointer field.
         let store = &store;
         let (m, n) = (node.nr as usize, node.nc as usize);
+        let base = node.loffset as usize;
         // SAFETY: each node's block is its own.
-        let panel = unsafe { std::slice::from_raw_parts_mut(store.factors.add(node.loffset as usize), m * n) };
-        panel.fill(C::from_re(0.0));
-        for entry in &plan.entries[node.entries as usize..(node.entries + node.nentries) as usize] {
+        let panel = unsafe { std::slice::from_raw_parts_mut(store.factors.add(base), m * n) };
+        let entries = &plan.entries[node.entries as usize..(node.entries + node.nentries) as usize];
+        let Some(split) = split else {
+            panel.fill(C::from_re(0.0));
+            for entry in entries {
+                let (r, c) = (entry.position as usize / m, entry.position as usize % m);
+                if c >= n || r < c {
+                    return Err(Error::Invalid("supernodal entry outside its node's columns".into()));
+                }
+                panel[r * n + c] = values[entry.source as usize];
+            }
+            return Ok(());
+        };
+        if split.real[id] {
+            // The factor itself stays in the real store, where the solve
+            // reads it; only the pivots, which every solve step reads by
+            // column, are copied.
+            let first = node.first as usize;
+            // SAFETY: each node's pivot metadata is its own.
+            unsafe {
+                for k in first..first + n {
+                    *store.diagonal.add(k) = C::from_re(split.diagonal[k]);
+                    *store.subdiag.add(k) = C::from_re(split.subdiag[k]);
+                    *store.perms.add(k) = split.perms[k];
+                    *store.two.add(k) = split.two[k];
+                }
+            }
+            return Ok(());
+        }
+        for (slot, &v) in panel.iter_mut().zip(&split.factors[base..base + m * n]) {
+            *slot = C::from_re(v);
+        }
+        for entry in entries {
             let (r, c) = (entry.position as usize / m, entry.position as usize % m);
             if c >= n || r < c {
                 return Err(Error::Invalid("supernodal entry outside its node's columns".into()));
             }
-            panel[r * n + c] = values[entry.source as usize];
+            let v = values[entry.source as usize];
+            panel[r * n + c] += v - C::from_re(v.re());
         }
         Ok(())
     })?;
@@ -244,11 +299,13 @@ unsafe fn node(
         node: id as usize,
         pivot: pivot as u32 + 1,
         reason,
+        unknown: None,
     };
     let nonfinite = || Error::Pivot {
         node: id as usize,
         pivot: n as u32,
         reason: PivotFailure::NonFinite,
+        unknown: None,
     };
     let Worker { scratch, report, sn } = worker;
     let small = m <= plan.config.small_front_rows as usize || !dense::available();

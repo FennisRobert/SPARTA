@@ -70,6 +70,45 @@ EMerge systems, and the frontal workspace is not allocated. The factor comes
 out in the multifrontal layout, so the solve, refinement and pivot reporting
 are shared. LU and the hybrid's column-major solvers stay multifrontal.
 
+### Real subtrees of a complex LDLᵀ
+
+A complex system whose imaginary parts are confined to a few unknowns, such
+as port and boundary unknowns in an FEM model, has a mostly real factor. A
+node's `L` block is real when none of its own entries, and none of any
+descendant's, has a nonzero imaginary part: every update it receives then
+comes from real nodes. Those nodes form whole subtrees, found at every
+factorization from the values (`real_nodes` in `mod.rs`), so the ordering,
+the fill and the plan do not change.
+
+The complex copies (`cpu_z`, `cpu_c`) keep a `RealPart` from the real copy of
+the same precision (`cpu_d`, `cpu_s`). It runs first: the supernodal
+factorization over the real parts of every entry, restricted to the real
+nodes, in its own real factor store. That leaves each complex node's block
+holding the real parts of its entries plus every update the real nodes sent
+it. The complex half starts each complex node from that block plus the
+imaginary parts of its entries and factors only the complex nodes. Real
+nodes' `L` blocks stay in the real store, and the solve multiplies them into
+the complex right-hand sides as real matrices: a row-major block of `r`
+complex columns is a block of `2r` real ones (`solve.rs`, `Block::Real`).
+Only the pivots are copied into the complex store.
+
+Measured on EMerge systems, complex128, M4 Pro, where 0.4-1.6% of unknowns
+touch a complex entry. Factor times are a cold first factorization:
+
+| System | real share of factor flops | factor | peak memory |
+|---|---|---|---|
+| em_m1 | 36% | 0.143 → 0.126 s | |
+| em_m2 | 90% | 0.040 → 0.030 s | |
+| em_bandcond | 92% | 0.407 → 0.222 s | 2.49 → 1.79 GB |
+| em_m4 | 43% | 2.85 → 2.07 s | 7.57 → 6.64 GB |
+
+The real half's dense work runs about four times faster than in complex
+arithmetic. What keeps the overall gain smaller is the scatter of updates
+into ancestors, which is bandwidth-bound and only halves, and the top of the
+tree, which every complex unknown reaches and which stays complex. Moving the
+complex unknowns later in the ordering keeps more of the tree real, but on
+these systems the extra fill costs more than it saves.
+
 ## Shared architecture
 
 Analysis, ordering, supernodes, child scatter maps, level order and reusable
@@ -166,6 +205,30 @@ not bitwise arithmetic order or GPU scheduling.
 
 `SPARTA_CPU_DUMP=1` prints one line per level of a CPU factorization: depth,
 `seq` or `par`, front count, wall seconds, GFLOP and the first front's rows.
+
+## Sparse right-hand sides and projections
+
+`sparse.rs` serves `Solver::solve_sparse` and `Solver::solve_projected`
+(`W^T A^-1 B`) on `LDL^T` factors.
+
+- **The reach.** A column of `B` with nonzeros in a few unknowns has
+  `y = L^-1 P^T b` zero outside the fronts on the paths from those unknowns'
+  fronts to the root. Columns are grouped eight at a time by their first
+  permuted unknown, which nested dissection makes a proxy for their subtree.
+- **The sweep.** Each group runs the full solve's elimination over the
+  group's reach in level order: `Solver::eliminate`, factored out of
+  `forward_node`, so real-split blocks, 2x2 pivots and BLAS behave
+  identically. Values are held only for the reach's pivot rows.
+- **The projection.** It is `(L^-1 P^T W)^T D^-1 (L^-1 P^T B)` for the plain
+  transpose: one `gemm_tn` per front two groups share. With `W = B` one
+  triangle of group pairs is formed and written to both places, so `Z` is
+  exactly symmetric.
+- **`solve_sparse`.** It scatters the reaches into the permuted block and
+  finishes with the full diagonal and backward sweeps.
+
+The reach comes from the analysis, which is valid because pivots never leave
+their front. Delayed pivoting would have to update it. LU and the GPU take
+the dense route in `crate::Solver`.
 
 ## Precision and settings
 

@@ -75,6 +75,20 @@ pub struct Config {
     /// factor layout, same solve either way. `false` is the multifrontal
     /// route. LU, the hybrid's CPU share and Vulkan ignore it.
     pub supernodal: bool,
+    /// Factor the real parts of a complex `LDL^T` in real arithmetic, on by
+    /// default. When only some entries have an imaginary part, as with port
+    /// and boundary unknowns in an FEM model, every subtree of the elimination
+    /// tree with no such entry has a real factor; those nodes are factored and
+    /// stored in real arithmetic, which is about four times cheaper, and the
+    /// rest in complex. Which nodes are real is read from the values at each
+    /// factorization, so the ordering and the fill do not change. On the CPU it
+    /// needs `supernodal` (`src/cpu/README.md`). On Metal the real fronts run
+    /// on a real copy of the `LDL^T` kernels; that does not always pay there,
+    /// so the solver times its second factorization without the split and
+    /// its third with it, and keeps the faster (`RealSplit` in
+    /// `src/gpu/mod.rs`). Real input, LU, the hybrid factorization and Vulkan
+    /// ignore it.
+    pub real_split: bool,
     /// Static pivoting threshold for `LDL^T`, relative to the largest entry
     /// of the matrix. A 1x1 pivot smaller than `static_pivot * max|a_ij|` is
     /// replaced by a pivot of that size and the same phase, and counted in
@@ -212,6 +226,7 @@ impl Config {
             cpu_block_rows: 96,
             cpu_blas_min_rows: 64,
             supernodal: true,
+            real_split: true,
             static_pivot: from_env("SPARTA_STATIC_PIVOT", 1e-12),
             nemin: 16,
             small_front_rows: profile.small_front_rows,

@@ -10,6 +10,7 @@ Rust stays the single source of truth and the two cannot drift apart.
 from __future__ import annotations
 from dataclasses import dataclass, fields, replace
 import warnings
+from ._options import _warn_unused
 
 from ._sparta import (_presets, _settings, _profile_save, _profile_load,
                       _profile_delete, _profile_list, _profile_path)
@@ -50,6 +51,15 @@ class Config:
         fronts keep only the lower half of their trailing blocks. Same pivoting
         and solve as the multifrontal route (False), less memory, faster. LU
         ignores it.
+    real_split : bool
+        Factor the real part of a complex LDLT in real arithmetic (default
+        True). When only some entries have an imaginary part, such as port and
+        boundary unknowns in an FEM model, every branch of the elimination tree
+        without one is factored and stored as real numbers, which is faster and
+        uses less memory. The ordering and the solution are unchanged. On the
+        CPU it needs supernodal. On the GPU it does not always pay, so the
+        solver times one factorization with it and one without and keeps the
+        faster. Real matrices, LU and hybrid_cpu ignore it.
     static_pivot : float
         LDLT static pivoting threshold, relative to the matrix's largest entry
         (default 1e-12). A pivot smaller than this is raised to it and counted
@@ -119,6 +129,7 @@ class Config:
     cpu_block_rows: int
     cpu_blas_min_rows: int
     supernodal: bool
+    real_split: bool
     static_pivot: float
     threads: int
 
@@ -133,11 +144,13 @@ class Config:
         return cls(**_settings(preset=name))
 
     def with_(self, **changes) -> Config:
-        """Return a copy with the named fields replaced."""
-        unknown = set(changes) - {f.name for f in fields(self)}
-        if unknown:
-            raise ValueError(f"unknown setting(s): {', '.join(sorted(unknown))}")
-        return replace(self, **changes)
+        """Return a copy with the named fields replaced.
+
+        Names that are not settings are ignored with an UnusedSettingWarning.
+        """
+        known = {f.name for f in fields(self)}
+        _warn_unused('Config.with_()', {k: v for k, v in changes.items() if k not in known})
+        return replace(self, **{k: v for k, v in changes.items() if k in known})
 
     def to_dict(self) -> dict:
         """Return the settings as keyword arguments for :func:`sparta.analyze`."""

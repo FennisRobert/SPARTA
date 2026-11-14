@@ -1,5 +1,6 @@
 //! The CPU factors behind the Python solver.
 use crate::values;
+use numpy::PyArray1;
 use pyo3::prelude::*;
 use sparta::Solver;
 
@@ -27,6 +28,34 @@ impl PyCpuFactor {
     /// contiguous per right-hand side, which is the layout the bridge copies.
     fn solve_many<'py>(&mut self, py: Python<'py>, rhs: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         values::solve_many(py, &mut self.solver, rhs)
+    }
+    /// Solve the sparse columns `(ptr, rows, values)` of length `n`; returns
+    /// an (ncols, n) block, one solution per row.
+    fn solve_sparse<'py>(
+        &mut self,
+        py: Python<'py>,
+        n: usize,
+        ptr: &Bound<'py, PyArray1<usize>>,
+        rows: &Bound<'py, PyArray1<usize>>,
+        values: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        values::solve_sparse(py, &mut self.solver, n, ptr, rows, values)
+    }
+    /// `W^T A^-1 B` for sparse `B = (ptr, rows, values)` and `W` the same
+    /// way, or `B` itself when `w` is None; returns a (B columns, W columns)
+    /// block.
+    #[pyo3(signature = (n, ptr, rows, values, w=None))]
+    #[allow(clippy::type_complexity)]
+    fn project<'py>(
+        &mut self,
+        py: Python<'py>,
+        n: usize,
+        ptr: &Bound<'py, PyArray1<usize>>,
+        rows: &Bound<'py, PyArray1<usize>>,
+        values: &Bound<'py, PyAny>,
+        w: Option<(Bound<'py, PyArray1<usize>>, Bound<'py, PyArray1<usize>>, Bound<'py, PyAny>)>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        values::project(py, &mut self.solver, n, ptr, rows, values, w)
     }
     /// Numerical factorization duration in seconds (CPU wall time or GPU commands).
     #[getter]

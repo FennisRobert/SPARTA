@@ -4,7 +4,7 @@
 //! value types and choose the numerics from it: on the CPU, the copy of the
 //! backend compiled for that type; on the GPU, single precision only.
 use crate::scalar::{Scalar, ScalarKind};
-use crate::{cpu_c, cpu_d, cpu_s, cpu_z, gpu, Analysis, Complex32, Complex64, Device, Error, Result};
+use crate::{cpu_c, cpu_d, cpu_s, cpu_z, gpu, Analysis, Complex32, Complex64, Device, Error, Result, SparseColumns};
 use std::any::TypeId;
 
 /// Reusable factors. `Config::force_cpu` selects the Rust CPU numerics.
@@ -138,6 +138,26 @@ impl Solver {
     /// right-hand side may be solved against real factors; a real one against
     /// complex factors is refused, since its solution is complex.
     pub fn solve_values<T: Scalar>(&mut self, b: &[T], nrhs: usize) -> Result<Vec<T>> {
+        self.check_rhs::<T>()?;
+        match &mut self.backend {
+            // The GPU factors are complex64 in both cases.
+            Backend::Gpu(s) => {
+                let x = s.solve_many(&convert::<T, Complex32>(b), nrhs)?;
+                Ok(convert(&x))
+            }
+            Backend::Cpu(cpu) => match cpu {
+                Cpu::Z(s) => s.solve_many(&convert(b), nrhs).map(|x| convert(&x)),
+                Cpu::C(s) => s.solve_many(&convert(b), nrhs).map(|x| convert(&x)),
+                Cpu::D(s) => solve_real(b, nrhs, |b, k| s.solve_many(b, k)),
+                Cpu::S(s) => solve_real(b, nrhs, |b, k| s.solve_many(b, k)),
+                Cpu::Idle(_) | Cpu::Gone => Err(Error::Invalid("no CPU factors".into())),
+            },
+        }
+    }
+
+    /// Refuse a right-hand side of type `T` that does not fit the factors:
+    /// none yet, another precision, or real against complex factors.
+    fn check_rhs<T: Scalar>(&self) -> Result<()> {
         let Some(kind) = self.factored else {
             return Err(Error::Invalid(
                 "successful factorization required before solve".into(),
@@ -155,20 +175,82 @@ impl Solver {
                 T::KIND
             )));
         }
-        match &mut self.backend {
-            // The GPU factors are complex64 in both cases.
-            Backend::Gpu(s) => {
-                let x = s.solve_many(&convert::<T, Complex32>(b), nrhs)?;
-                Ok(convert(&x))
+        Ok(())
+    }
+
+    /// Solve sparse right-hand sides: `A^-1 B` for the columns of `b`, `n`
+    /// values per column end to end, as [`Solver::solve_values`] returns them.
+    ///
+    /// The answer is the one `solve_values` gives for the same columns made
+    /// dense. On CPU `LDL^T` factors it is faster: each column's forward sweep
+    /// visits only the part of the factor its nonzeros connect to. Elsewhere
+    /// (the GPU, the hybrid factorization, LU) the columns are solved dense.
+    ///
+    /// Arguments:
+    /// - `b`: the right-hand sides; precision rules as for `solve_values`.
+    pub fn solve_sparse<T: Scalar>(&mut self, b: &SparseColumns<'_, T>) -> Result<Vec<T>> {
+        self.check_rhs::<T>()?;
+        self.check_dimension(b)?;
+        if let Backend::Cpu(cpu) = &self.backend {
+            match sparse_cpu(cpu, b, None, false) {
+                Err(Error::Unsupported(_)) => {}
+                other => return other,
             }
-            Backend::Cpu(cpu) => match cpu {
-                Cpu::Z(s) => s.solve_many(&convert(b), nrhs).map(|x| convert(&x)),
-                Cpu::C(s) => s.solve_many(&convert(b), nrhs).map(|x| convert(&x)),
-                Cpu::D(s) => solve_real(b, nrhs, |b, k| s.solve_many(b, k)),
-                Cpu::S(s) => solve_real(b, nrhs, |b, k| s.solve_many(b, k)),
-                Cpu::Idle(_) | Cpu::Gone => Err(Error::Invalid("no CPU factors".into())),
-            },
         }
+        self.solve_values(&b.dense(), b.ncols())
+    }
+
+    /// The projection `W^T A^-1 B`, `w.ncols()` rows by `b.ncols()` columns,
+    /// column-major: entry `(i, j)` is column `i` of `w` applied to the
+    /// solution for column `j` of `b`. The transpose is plain, never
+    /// conjugated, as everywhere in SPARTA.
+    ///
+    /// With `w` = `None` it projects on `b` itself, `B^T A^-1 B`: the port
+    /// matrix of a frequency-domain model whose columns of `b` are the port
+    /// excitations, and the result is then exactly symmetric.
+    ///
+    /// On CPU `LDL^T` factors no solution is formed at all: two forward
+    /// sweeps restricted to the columns' reach, and one small product per
+    /// front they share. Elsewhere it is [`Solver::solve_sparse`] followed by
+    /// the projection, the same answer.
+    ///
+    /// Arguments:
+    /// - `b`: the right-hand sides.
+    /// - `w`: the columns to project on, of the same type and dimension, or
+    ///   `None` for `b`.
+    pub fn solve_projected<T: Scalar>(
+        &mut self,
+        b: &SparseColumns<'_, T>,
+        w: Option<&SparseColumns<'_, T>>,
+    ) -> Result<Vec<T>> {
+        self.check_rhs::<T>()?;
+        self.check_dimension(b)?;
+        if let Some(w) = w {
+            self.check_dimension(w)?;
+        }
+        if let Backend::Cpu(cpu) = &self.backend {
+            match sparse_cpu(cpu, b, Some(w), true) {
+                Err(Error::Unsupported(_)) => {}
+                other => return other,
+            }
+        }
+        let x = self.solve_values(&b.dense(), b.ncols())?;
+        Ok(w.unwrap_or(b).project(&x, b.ncols()))
+    }
+
+    /// Refuse sparse columns whose length is not the matrix dimension.
+    fn check_dimension<T: Scalar>(&self, b: &SparseColumns<'_, T>) -> Result<()> {
+        let n = match &self.backend {
+            Backend::Gpu(s) => s.n(),
+            Backend::Cpu(cpu) => each_cpu!(cpu, s => s.n(), return Err(Error::Invalid("no CPU factors".into()))),
+        };
+        if b.n() != n {
+            return Err(Error::Invalid(format!(
+                "sparse columns of length {} do not fit a matrix of dimension {n}",
+                b.n()
+            )));
+        }
+        Ok(())
     }
 
     /// Value type of the latest successful factorization, or `None` before one.
@@ -309,6 +391,99 @@ fn factor_cpu<T: Scalar>(cpu: &mut Cpu, values: &[T]) -> Result<()> {
         Cpu::D(s) => s.factor(cast(values)),
         Cpu::S(s) => s.factor(cast(values)),
         Cpu::Idle(_) | Cpu::Gone => unreachable!("allocated above"),
+    }
+}
+
+/// [`Solver::solve_sparse`] (`project` false) or
+/// [`Solver::solve_projected`] on the CPU factors `cpu` holds.
+/// `Error::Unsupported` means these factors take the dense route.
+///
+/// Arguments:
+/// - `b`: the right-hand sides.
+/// - `w`: for a projection, the columns to project on, `None` for `b`.
+/// - `project`: whether to project.
+fn sparse_cpu<T: Scalar>(
+    cpu: &Cpu,
+    b: &SparseColumns<'_, T>,
+    w: Option<Option<&SparseColumns<'_, T>>>,
+    project: bool,
+) -> Result<Vec<T>> {
+    // In the factors' own complex type, as `solve_values` converts.
+    macro_rules! complex {
+        ($s:expr, $c:ty, $m:ident) => {{
+            let bv: Vec<$c> = convert(b.values());
+            let bc = $m::Columns { ptr: b.ptr(), rows: b.rows(), values: &bv };
+            let x = if project {
+                let wv: Option<Vec<$c>> = w.flatten().map(|w| convert(w.values()));
+                let wc = w.flatten().zip(wv.as_deref()).map(|(w, v)| $m::Columns { ptr: w.ptr(), rows: w.rows(), values: v });
+                $s.project(bc, wc)?
+            } else {
+                $s.solve_sparse(bc)?
+            };
+            Ok(convert(&x))
+        }};
+    }
+    // Real factors: a complex `b` or `w` goes as its real and imaginary parts.
+    macro_rules! real {
+        ($s:expr, $r:ty, $m:ident) => {{
+            let split = |c: &SparseColumns<'_, T>| -> (Vec<usize>, Vec<usize>, Vec<$r>) {
+                if !T::KIND.is_complex() {
+                    return (c.ptr().to_vec(), c.rows().to_vec(), convert(c.values()));
+                }
+                let k = c.ncols();
+                let mut ptr = c.ptr().to_vec();
+                ptr.extend(c.ptr()[1..].iter().map(|&p| p + c.rows().len()));
+                let mut rows = c.rows().to_vec();
+                rows.extend_from_slice(c.rows());
+                let mut values: Vec<$r> = c.values().iter().map(|v| v.re_f64() as $r).collect();
+                values.extend(c.values().iter().map(|v| v.to_c64().im as $r));
+                debug_assert_eq!(ptr.len(), 2 * k + 1);
+                (ptr, rows, values)
+            };
+            let (bp, br, bv) = split(b);
+            let bc = $m::Columns { ptr: &bp, rows: &br, values: &bv };
+            let (p, n) = (b.ncols(), b.n());
+            if !project {
+                let x = $s.solve_sparse(bc)?;
+                if !T::KIND.is_complex() {
+                    return Ok(convert(&x));
+                }
+                // Columns `0..p` are the real parts' solutions, `p..2p` the
+                // imaginary parts'.
+                let mut out = Vec::with_capacity(n * p);
+                for j in 0..p {
+                    let (re, im) = (&x[j * n..(j + 1) * n], &x[(p + j) * n..(p + j + 1) * n]);
+                    out.extend(re.iter().zip(im).map(|(&r, &i)| T::from_c64(Complex64::new(r as f64, i as f64))));
+                }
+                return Ok(out);
+            }
+            let wsplit = w.flatten().map(split);
+            let wc = wsplit.as_ref().map(|(p, r, v)| $m::Columns { ptr: p, rows: r, values: v });
+            let z = $s.project(bc, wc)?;
+            if !T::KIND.is_complex() {
+                return Ok(convert(&z));
+            }
+            // `(Wr + i Wi)^T A^-1 (Br + i Bi)` from the four real blocks of
+            // the `2q` by `2p` projection.
+            let q = w.flatten().map_or(p, |w| w.ncols());
+            let at = |i: usize, j: usize| z[j * 2 * q + i] as f64;
+            let mut out = Vec::with_capacity(q * p);
+            for j in 0..p {
+                for i in 0..q {
+                    let re = at(i, j) - at(q + i, p + j);
+                    let im = at(i, p + j) + at(q + i, j);
+                    out.push(T::from_c64(Complex64::new(re, im)));
+                }
+            }
+            Ok(out)
+        }};
+    }
+    match cpu {
+        Cpu::Z(s) => complex!(s, Complex64, cpu_z),
+        Cpu::C(s) => complex!(s, Complex32, cpu_c),
+        Cpu::D(s) => real!(s, f64, cpu_d),
+        Cpu::S(s) => real!(s, f32, cpu_s),
+        Cpu::Idle(_) | Cpu::Gone => Err(Error::Invalid("no CPU factors".into())),
     }
 }
 

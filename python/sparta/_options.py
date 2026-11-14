@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import warnings
 
 import numpy as np
 
@@ -12,6 +13,23 @@ from ._types import MatrixType, Ordering
 #: fastest start on the 887k-unknown EMerge sweep (M4 Pro, LDL^T), where the
 #: settled split runs 1.37x faster than the GPU alone.
 HYBRID_SHARE = 0.3
+
+
+class UnusedSettingWarning(UserWarning):
+    """A keyword argument SPARTA does not know was ignored.
+
+    analyze(), factorize() and Config.with_() accept any keyword, so settings
+    written for another SPARTA version, or shared with another solver, never
+    stop a run. Silence it with warnings.filterwarnings('ignore',
+    category=sparta.UnusedSettingWarning).
+    """
+
+
+def _warn_unused(where: str, unused: dict, stacklevel: int = 3) -> None:
+    """Warn once that the keywords in `unused` were ignored by `where`."""
+    if unused:
+        warnings.warn(f"{where} ignored unknown setting(s): {', '.join(sorted(unused))}",
+                      UnusedSettingWarning, stacklevel=stacklevel)
 
 
 def _hybrid_share(hybrid: bool | float) -> float:
@@ -80,6 +98,7 @@ class _Options:
     cpu_block_rows: int | None
     cpu_blas_min_rows: int | None
     supernodal: bool | None
+    real_split: bool | None
     static_pivot: float | None
     threads: int | None
 
@@ -91,6 +110,9 @@ class _Options:
 
         if self.supernodal is not None and type(self.supernodal) is not bool:
             raise ValueError("supernodal must be None or a boolean")
+
+        if self.real_split is not None and type(self.real_split) is not bool:
+            raise ValueError("real_split must be None or a boolean")
 
         if not isinstance(self.hybrid_cpu, (int, float)) or not 0 <= self.hybrid_cpu < 1:
             raise ValueError("hybrid_cpu must be at least 0 and below 1")

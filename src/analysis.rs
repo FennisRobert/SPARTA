@@ -1182,6 +1182,7 @@ pub(crate) struct FrontState {
 // `dispatch_audit` and the analysis tests stay available everywhere.
 #[cfg(any(test, sparta_metal, sparta_vulkan))]
 #[cfg_attr(not(sparta_metal), allow(dead_code))]
+#[derive(Default)]
 pub(crate) struct DispatchPlan {
     pub ids: Vec<u32>,
     pub levels: Vec<DispatchLevel>,
@@ -1261,6 +1262,34 @@ impl Analysis {
             panel_elements: self.panel_elements,
             upper_elements: self.upper_elements,
         }
+    }
+    /// Whether each node is real: `real(source)` holds for every entry of
+    /// the node and of all its descendants, where `source` indexes the
+    /// analyzed CSC values.
+    ///
+    /// Such a node's factor is real, since every update it receives comes from
+    /// real descendants, so its front can be factored in real arithmetic; see
+    /// `Config::real_split`.
+    pub(crate) fn real_nodes(&self, real: impl Fn(usize) -> bool + Sync) -> Vec<bool> {
+        use rayon::prelude::*;
+        let mut nodes: Vec<bool> = self
+            .nodes
+            .par_iter()
+            .map(|node| {
+                self.entries[node.entries as usize..(node.entries + node.nentries) as usize]
+                    .iter()
+                    .all(|e| real(e.source as usize))
+            })
+            .collect();
+        // Every level after its children's.
+        for level in &self.levels {
+            for &id in level {
+                let node = self.nodes[id as usize];
+                let children = &self.children[node.children as usize..(node.children + node.count) as usize];
+                nodes[id as usize] &= children.iter().all(|c| nodes[c.node as usize]);
+            }
+        }
+        nodes
     }
     #[cfg(any(test, sparta_metal, sparta_vulkan))]
     pub(crate) fn dispatch_plan(&self) -> DispatchPlan {

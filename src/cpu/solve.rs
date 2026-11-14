@@ -13,14 +13,14 @@
 //! factor column contiguously.
 use super::dense::{self, Threading};
 use super::Scalar;
-use super::{block, div, finite, Solver, C};
+use super::{block, div, finite, RealHalf, Solver, C, R};
 use crate::{Error, Kind, Result};
 use rayon::prelude::*;
 
 /// The permuted right-hand sides, `nrhs` values per unknown, as a pointer the
 /// nodes of one level write through concurrently.
 #[derive(Clone, Copy)]
-struct Rows(*mut C);
+pub(super) struct Rows(pub(super) *mut C);
 // SAFETY: `Rows` carries no access rights of its own. Within a level each node
 // writes only its own pivot rows and reads its own and its ancestors' rows,
 // none of which another node of the same level writes; see the callers.
@@ -59,7 +59,7 @@ const GEMM_RHS: usize = 4;
 const GEMM_MIN: usize = 4096;
 
 /// Whether a trailing product over `elements` factor values goes to GEMM.
-fn gemm(r: usize, elements: usize) -> bool {
+pub(super) fn gemm(r: usize, elements: usize) -> bool {
     cfg!(any(sparta_accelerate, sparta_blas)) && r >= GEMM_RHS && elements >= GEMM_MIN
 }
 
@@ -98,7 +98,64 @@ fn dot(acc: &mut [C], l: &[C], z: &[C]) {
     }
 }
 
+/// A node's `L` block: complex, or real when the factorization's real half
+/// left it in its own store (`Solver::mask`).
+#[derive(Clone, Copy)]
+enum Block<'a> {
+    Complex(&'a [C]),
+    Real(&'a [R]),
+}
+
+/// Values of the real type per value of `C`: two in the complex copies.
+const WIDE: usize = std::mem::size_of::<C>() / std::mem::size_of::<R>();
+
+/// `values` as `WIDE` times as many real numbers: a row-major block of `r`
+/// complex columns is the same block with `2 r` real ones, which a real
+/// matrix multiplies from the left in real arithmetic.
+fn reals(values: &[C]) -> &[R] {
+    // SAFETY: `C` is `R` or `num_complex::Complex<R>`, which is `repr(C)`
+    // with the real part first, so the memory is `WIDE` contiguous `R`s each.
+    unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), values.len() * WIDE) }
+}
+
+/// [`reals`], to write.
+fn reals_mut(values: &mut [C]) -> &mut [R] {
+    // SAFETY: as for `reals`.
+    unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast(), values.len() * WIDE) }
+}
+
+/// [`dot`] with a real `l`.
+#[inline]
+fn dot_real(acc: &mut [C], l: &[R], z: &[C]) {
+    let r = acc.len();
+    for (&lj, row) in l.iter().zip(z.chunks_exact(r)) {
+        for (a, &zc) in acc.iter_mut().zip(row) {
+            *a -= zc * lj;
+        }
+    }
+}
+
+/// [`axpy`] with a real `l`.
+#[inline]
+fn axpy_real(t: &mut [C], l: &[R], y: &[C]) {
+    for (row, &li) in t.chunks_exact_mut(y.len()).zip(l) {
+        for (tc, &yc) in row.iter_mut().zip(y) {
+            *tc -= yc * li;
+        }
+    }
+}
+
 impl Solver {
+    /// Node `id`'s `nr` by `nc` block of `L`, row-major, wherever it is stored.
+    fn block(&self, id: usize) -> Block<'_> {
+        let node = self.plan.nodes[id];
+        let range = node.loffset as usize..(node.loffset + node.nr * node.nc) as usize;
+        match &self.real {
+            Some(part) if self.mask.get(id) == Some(&true) => Block::Real(&part.factors()[range]),
+            _ => Block::Complex(&self.factors[range]),
+        }
+    }
+
     /// Solve column-major `b` containing `nrhs` right-hand sides.
     pub(crate) fn solve_many(&self, b: &[C], nrhs: usize) -> Result<Vec<C>> {
         self.pool.run(|| self.solve_here(b, nrhs))
@@ -128,27 +185,50 @@ impl Solver {
                     *slot = b[c * n + old as usize];
                 }
             });
-        let rows = Rows(x.as_mut_ptr());
-        // Rayon owns the parallelism, as in the factorization: the GEMMs run
-        // one per task, on the calling thread.
-        let blas = gemm(r, usize::MAX);
+        self.with_caller_blas(gemm(r, usize::MAX), || {
+            let rows = Rows(x.as_mut_ptr());
+            // SAFETY: each sweep keeps to the per-level discipline `Rows` states.
+            unsafe {
+                self.forward(rows, r);
+                self.finish_sweeps(rows, r);
+            }
+        });
+        self.unpermute(&x, r)
+    }
+
+    /// Run `work` with the dense library single-threaded on each pool thread
+    /// when `blas` is set: Rayon owns the parallelism, as in the
+    /// factorization, so the GEMMs run one per task on the calling thread.
+    pub(super) fn with_caller_blas<T>(&self, blas: bool, work: impl FnOnce() -> T) -> T {
         if blas {
             dense::set_global_threading(Threading::Caller);
             rayon::broadcast(|_| dense::set_threading(Threading::Caller));
         }
-        // SAFETY: each sweep keeps to the per-level discipline `Rows` states.
-        unsafe {
-            self.forward(rows, r);
-            if self.plan.kind == Kind::Ldlt {
-                self.diagonal_solve(rows, r);
-            }
-            self.backward(rows, r);
-        }
+        let out = work();
         if blas {
             dense::set_global_threading(Threading::Machine);
             rayon::broadcast(|_| dense::set_threading(Threading::Machine));
         }
-        let mut out = vec![C::from_re(0.0); b.len()];
+        out
+    }
+
+    /// Everything after the forward sweep: `D z = y` on LDL^T, then the
+    /// backward sweep.
+    ///
+    /// # Safety
+    /// As for [`Solver::forward`].
+    pub(super) unsafe fn finish_sweeps(&self, x: Rows, r: usize) {
+        if self.plan.kind == Kind::Ldlt {
+            self.diagonal_solve(x, r);
+        }
+        self.backward(x, r);
+    }
+
+    /// The permuted row-major block `x`, `r` values per unknown, back in the
+    /// caller's ordering as `r` columns end to end. Fails on a nonfinite value.
+    pub(super) fn unpermute(&self, x: &[C], r: usize) -> Result<Vec<C>> {
+        let (n, perm) = (self.plan.n, &self.plan.perm);
+        let mut out = vec![C::from_re(0.0); n * r];
         out.par_chunks_mut(n).enumerate().for_each(|(c, column)| {
             for (row, &old) in x.chunks_exact(r).zip(perm.iter()) {
                 column[old as usize] = row[c];
@@ -192,7 +272,6 @@ impl Solver {
         let (m, n, first) = (node.nr as usize, node.nc as usize, node.first as usize);
         let rows = &plan.rows[node.rows as usize..node.rows as usize + m];
         let perm = &self.perms[first..first + n];
-        let l = &self.factors[node.loffset as usize..node.loffset as usize + n * m];
         let zero = C::from_re(0.0);
         // The front's right-hand side by front position: its own pivot rows,
         // which no other node of this level touches, plus every child's update.
@@ -210,14 +289,42 @@ impl Solver {
                 }
             }
         }
-        let mut y = vec![zero; n * r];
+        let (y, t) = self.eliminate(id, w, r);
+        let lu = plan.kind == Kind::Lu;
+        for (k, value) in y.chunks_exact(r).enumerate() {
+            let g = if lu { rows[k] } else { rows[perm[k]] };
+            x.row(g as usize, r).copy_from_slice(value);
+        }
+        t
+    }
+
+    /// Eliminate node `id`'s pivots from its gathered right-hand side and
+    /// return the solved pivot rows and the trailing update.
+    ///
+    /// Arguments:
+    /// - `id`: the node.
+    /// - `w`: the front's right-hand side, `nr` rows of `r` values in front
+    ///   order: its own pivot rows plus every child's update.
+    /// - `r`: values per row.
+    ///
+    /// Returns `y`, `nc` rows in pivot order, and the update, `nr - nc` rows
+    /// in front order, for the parent.
+    pub(super) fn eliminate(&self, id: usize, mut w: Vec<C>, r: usize) -> (Vec<C>, Vec<C>) {
+        let node = self.plan.nodes[id];
+        let (m, n, first) = (node.nr as usize, node.nc as usize, node.first as usize);
+        let perm = &self.perms[first..first + n];
+        let block = self.block(id);
+        let mut y = vec![C::from_re(0.0); n * r];
         for (k, slot) in y.chunks_exact_mut(r).enumerate() {
             slot.copy_from_slice(&w[perm[k] * r..perm[k] * r + r]);
         }
         // L is row-major (`Solver::rowmajor`): row `i` holds `L[i][0..nc]`.
         for i in 1..n {
             let (before, at) = y.split_at_mut(i * r);
-            dot(&mut at[..r], &l[i * n..i * n + i], before);
+            match block {
+                Block::Complex(l) => dot(&mut at[..r], &l[i * n..i * n + i], before),
+                Block::Real(l) => dot_real(&mut at[..r], &l[i * n..i * n + i], before),
+            }
         }
         let mut t = w.split_off(n * r);
         let tail = m - n;
@@ -227,11 +334,24 @@ impl Solver {
             let step = if n * tail >= SPLIT { (SPLIT / n).max(64) } else { tail };
             let update = |b: usize, part: &mut [C]| {
                 let (i0, count) = (n + b * step, part.len() / r);
-                if gemm(r, n * count) {
-                    dense::gemm_nn(count, r, n, &l[i0 * n..], n, &y, r, part, r);
-                } else {
-                    for (i, acc) in part.chunks_exact_mut(r).enumerate() {
-                        dot(acc, &l[(i0 + i) * n..(i0 + i + 1) * n], &y);
+                match block {
+                    Block::Complex(l) if gemm(r, n * count) => {
+                        dense::gemm_nn(count, r, n, &l[i0 * n..], n, &y, r, part, r)
+                    }
+                    Block::Complex(l) => {
+                        for (i, acc) in part.chunks_exact_mut(r).enumerate() {
+                            dot(acc, &l[(i0 + i) * n..(i0 + i + 1) * n], &y);
+                        }
+                    }
+                    // Real `L` times the complex block as `WIDE r` real columns.
+                    Block::Real(l) if gemm(WIDE * r, n * count) => {
+                        let w = WIDE * r;
+                        RealHalf::gemm_nn(count, w, n, &l[i0 * n..], n, reals(&y), w, reals_mut(part), w)
+                    }
+                    Block::Real(l) => {
+                        for (i, acc) in part.chunks_exact_mut(r).enumerate() {
+                            dot_real(acc, &l[(i0 + i) * n..(i0 + i + 1) * n], &y);
+                        }
                     }
                 }
             };
@@ -241,12 +361,7 @@ impl Solver {
                 update(0, &mut t);
             }
         }
-        let lu = plan.kind == Kind::Lu;
-        for (k, value) in y.chunks_exact(r).enumerate() {
-            let g = if lu { rows[k] } else { rows[perm[k]] };
-            x.row(g as usize, r).copy_from_slice(value);
-        }
-        t
+        (y, t)
     }
 
     /// `D z = y` for every LDL^T pivot, 1x1 and 2x2 blocks alike.
@@ -304,7 +419,7 @@ impl Solver {
         let rows = &plan.rows[node.rows as usize..node.rows as usize + m];
         let perm = &self.perms[first..first + n];
         let lu = plan.kind == Kind::Lu;
-        let l = &self.factors[node.loffset as usize..node.loffset as usize + n * m];
+        let block = self.block(id);
         let tail = m - n;
         let own = |k: usize| (if lu { rows[k] } else { rows[perm[k]] }) as usize;
         // The node's pivots then its trailing rows, in front order, so one
@@ -338,7 +453,28 @@ impl Solver {
                 } else {
                     update(0, head);
                 }
-            } else {
+            } else if let Block::Real(l) = block {
+                // `head -= L21^T z` with real `L21`: the complex blocks as
+                // `WIDE r` real columns, and the transpose left to GEMM.
+                let step = if n * tail >= SPLIT { (SPLIT / tail).max(64) } else { n };
+                let w = WIDE * r;
+                let update = |b: usize, part: &mut [C]| {
+                    let (k0, count) = (b * step, part.len() / r);
+                    if gemm(w, count * tail) {
+                        RealHalf::gemm_tn(count, w, tail, &l[n * n + k0..], n, reals(z), w, reals_mut(part), w);
+                    } else {
+                        for j in 0..tail {
+                            let row = &l[(n + j) * n + k0..(n + j) * n + k0 + count];
+                            axpy_real(part, row, &z[j * r..(j + 1) * r]);
+                        }
+                    }
+                };
+                if step < n {
+                    head.par_chunks_mut(step * r).enumerate().for_each(|(b, part)| update(b, part));
+                } else {
+                    update(0, head);
+                }
+            } else if let Block::Complex(l) = block {
                 // `head -= L21^T z`: every trailing factor row scales into the
                 // pivots, a block of pivot columns per task. GEMM wants the
                 // right-hand sides as rows, `head^T -= z^T L21`.
@@ -371,6 +507,9 @@ impl Solver {
             }
         }
         if lu {
+            let Block::Complex(l) = block else {
+                unreachable!("only LDL^T has a real half")
+            };
             // U11 sits above L11's diagonal, row `k` of U in factor row `k`.
             for k in (0..n).rev() {
                 let (upto, after) = head.split_at_mut((k + 1) * r);
@@ -385,7 +524,10 @@ impl Solver {
             // every earlier pivot.
             for j in (1..n).rev() {
                 let (before, from) = head.split_at_mut(j * r);
-                axpy(before, &l[j * n..j * n + j], &from[..r]);
+                match block {
+                    Block::Complex(l) => axpy(before, &l[j * n..j * n + j], &from[..r]),
+                    Block::Real(l) => axpy_real(before, &l[j * n..j * n + j], &from[..r]),
+                }
             }
         }
         for (k, value) in head.chunks_exact(r).enumerate() {

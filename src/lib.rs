@@ -15,12 +15,14 @@ mod config;
 // copy is plain code over a concrete type: `cpu_z` complex128, `cpu_c`
 // complex64, `cpu_d` float64 and `cpu_s` float32. Each reads `C`, its value
 // type, and `R`, the real type of its precision, from the `cpu_types!` defined
-// just before it. The complex64 copy is also the CPU half of the hybrid
+// just before it; `RealHalf` is the real copy of the same precision, which
+// factors the real subtrees of a complex LDL^T. The complex64 copy is also the CPU half of the hybrid
 // factorization, whose results go straight into the GPU's buffers.
 macro_rules! cpu_types {
     () => {
         pub(crate) type R = f64;
         pub(crate) type C = num_complex::Complex64;
+        pub(crate) type RealHalf = crate::cpu_d::RealPart;
     };
 }
 #[path = "cpu/mod.rs"]
@@ -29,6 +31,7 @@ macro_rules! cpu_types {
     () => {
         pub(crate) type R = f32;
         pub(crate) type C = num_complex::Complex32;
+        pub(crate) type RealHalf = crate::cpu_s::RealPart;
     };
 }
 #[path = "cpu/mod.rs"]
@@ -38,6 +41,7 @@ macro_rules! cpu_types {
     () => {
         pub(crate) type R = f64;
         pub(crate) type C = f64;
+        pub(crate) type RealHalf = crate::cpu_d::RealPart;
     };
 }
 #[path = "cpu/mod.rs"]
@@ -47,6 +51,7 @@ macro_rules! cpu_types {
     () => {
         pub(crate) type R = f32;
         pub(crate) type C = f32;
+        pub(crate) type RealHalf = crate::cpu_s::RealPart;
     };
 }
 #[path = "cpu/mod.rs"]
@@ -63,6 +68,7 @@ mod scalar;
 pub mod profiles;
 pub mod settings;
 mod solver;
+mod sparse;
 #[doc(hidden)]
 // Public so examples/colcount_bench.rs can time the symbolic internals.
 // Not part of the supported API surface.
@@ -79,6 +85,7 @@ pub use scalar::{Scalar, ScalarKind};
 /// Standalone Rust ordering API and tuning options.
 pub use scalpel;
 pub use solver::Solver;
+pub use sparse::SparseColumns;
 pub use symbolic::OrderingMethod;
 /// Why a front's pivot search gave up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,19 +126,64 @@ pub enum Error {
         node: usize,
         pivot: u32,
         reason: PivotFailure,
+        /// The unknown whose pivot failed, in the caller's numbering (its row
+        /// and column of the input matrix), when the solver could tell.
+        unknown: Option<usize>,
     },
+}
+impl Error {
+    /// `self` with the unknown of a pivot failure filled in by `locate`,
+    /// which maps the failing node and its 1-based front column to the
+    /// caller's index.
+    ///
+    /// Arguments:
+    /// - `locate`: given `(node, pivot)`, the caller's index, if known.
+    pub(crate) fn located(self, locate: impl FnOnce(usize, u32) -> Option<usize>) -> Self {
+        match self {
+            Self::Pivot { node, pivot, reason, unknown: None } => {
+                Self::Pivot { node, pivot, reason, unknown: locate(node, pivot) }
+            }
+            other => other,
+        }
+    }
+}
+impl PivotFailure {
+    /// What the failure means for the matrix and what to try, in plain words.
+    pub fn advice(self) -> &'static str {
+        match self {
+            Self::ZeroColumn => {
+                "The matrix is singular: this unknown's equation is zero or a combination of \
+                 others, for example an unconstrained unknown, a missing boundary condition or \
+                 a frequency at a resonance."
+            }
+            Self::NonFinite => {
+                "A value overflowed during elimination. Rescale the matrix, or factor in \
+                 complex128 on the CPU, whose range is far larger."
+            }
+            Self::TinyTwoByTwo => {
+                "The matrix is singular or too ill-conditioned for this precision. Factoring in \
+                 complex128 on the CPU may succeed."
+            }
+            Self::ChildFailed => "",
+        }
+    }
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Pivot {
-                node,
-                pivot,
-                reason,
-            } => {
-                write!(f, "front {node} failed at column {pivot}: {reason}")
+            Self::Pivot { node, pivot, reason, unknown } => {
+                match unknown {
+                    Some(u) => write!(f, "factorization failed at unknown {u} (front {node}, column {pivot}): {reason}")?,
+                    None => write!(f, "factorization failed in front {node} at column {pivot}: {reason}")?,
+                }
+                match reason.advice() {
+                    "" => Ok(()),
+                    advice => write!(f, ". {advice}"),
+                }
             }
-            _ => write!(f, "{self:?}"),
+            Self::Invalid(m) => write!(f, "invalid input: {m}"),
+            Self::Unsupported(m) => write!(f, "unsupported: {m}"),
+            Self::Device(m) => write!(f, "GPU error: {m}"),
         }
     }
 }

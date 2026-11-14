@@ -76,11 +76,17 @@ class GoalApiTests(unittest.TestCase):
             np.testing.assert_allclose(f.solve(np.ones(2)), .25)
 
     def test_documented_signatures(self):
-        """Public operations explain every named argument and accept no catch-all kwargs."""
+        """Public operations explain every named argument.
+
+        Only the settings calls take catch-all keywords, which they ignore
+        with an UnusedSettingWarning; the solves stay strict.
+        """
         import inspect
-        for function in (sparta.analyze, sparta.Solver.factorize, sparta.Solver.solve, sparta.Solver.solve_many):
+        settings_calls = (sparta.analyze, sparta.Solver.factorize)
+        for function in settings_calls + (sparta.Solver.solve, sparta.Solver.solve_many):
             for name, parameter in inspect.signature(function).parameters.items():
-                self.assertNotEqual(parameter.kind, inspect.Parameter.VAR_KEYWORD)
+                if function not in settings_calls:
+                    self.assertNotEqual(parameter.kind, inspect.Parameter.VAR_KEYWORD)
                 if name != 'self':
                     self.assertIn(name, function.__doc__)
         for name in ('Settings', 'Analysis', 'Factor', 'lu', 'ldlt', 'solve'):

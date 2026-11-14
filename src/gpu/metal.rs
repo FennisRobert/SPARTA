@@ -41,6 +41,21 @@ extern "C" {
         error: *mut u8,
         cap: usize,
     ) -> i32;
+    fn sparta_v1_set_real_plan(
+        context: *mut c_void,
+        ids: *const c_void,
+        ids_bytes: usize,
+        tiles: *const c_void,
+        tiles_bytes: usize,
+        schur: *const c_void,
+        schur_bytes: usize,
+        levels: *const u32,
+        level_count: u32,
+        steps: *const u32,
+        step_count: u32,
+        error: *mut u8,
+        cap: usize,
+    ) -> i32;
     fn sparta_v1_buffer(context: *mut c_void, index: u32, length: *mut usize) -> *mut c_void;
     fn sparta_v1_factor_start(
         context: *mut c_void,
@@ -72,6 +87,11 @@ extern "C" {
         cap: usize,
     ) -> i32;
 }
+/// Whether a context for `plan` builds the real copy of the `LDL^T` kernels
+/// that `Config::real_split` factors real fronts with.
+pub(crate) fn real_split(plan: &Analysis) -> bool {
+    plan.kind == crate::Kind::Ldlt && plan.config.real_split
+}
 pub(crate) fn available() -> bool {
     unsafe { sparta_v1_available() != 0 }
 }
@@ -85,8 +105,8 @@ pub(crate) struct Context(Option<NonNull<c_void>>);
 impl Context {
     pub(super) fn new(plan: &Analysis) -> Result<Self> {
         let dispatch = plan.dispatch_plan();
-        let mut data = [std::ptr::null::<c_void>(); 22];
-        let mut lengths = [0usize; 22];
+        let mut data = [std::ptr::null::<c_void>(); 23];
+        let mut lengths = [0usize; 23];
         macro_rules! buffer {
             ($i:expr, $slice:expr) => {{
                 data[$i] = $slice.as_ptr().cast();
@@ -117,6 +137,9 @@ impl Context {
         lengths[20] = plan.upper_elements * 8;
         // The absolute static-pivoting threshold; see `set_static_pivot`.
         lengths[21] = 4;
+        // One word per node, nonzero for a front the real kernels factor; see
+        // `set_real_plan`. Created zero, so every front starts complex.
+        lengths[22] = plan.nodes.len() * 4;
         // Sizes are bounded by the device's own reported limits inside
         // create; only host-side arithmetic overflow is rejected here.
         lengths
@@ -135,6 +158,8 @@ impl Context {
             plan.config.schur_chunk,
             // SPARTA_LOWER: LDL^T trailing blocks kept lower only.
             u32::from(plan.kind == crate::Kind::Ldlt && plan.config.supernodal),
+            // Build the real copy of the LDL^T factor kernels.
+            u32::from(real_split(plan)),
         ];
         let raw = unsafe {
             sparta_v1_create(
@@ -156,9 +181,13 @@ impl Context {
                 error.len(),
             )
         };
-        NonNull::new(raw)
+        let mut context = NonNull::new(raw)
             .map(|handle| Self(Some(handle)))
-            .ok_or_else(|| message(&error))
+            .ok_or_else(|| message(&error))?;
+        // Metal does not promise zeroed buffers, and the complex assembly
+        // reads these flags on every factorization.
+        context.set_real_flags(None)?;
+        Ok(context)
     }
     pub(super) fn run(
         &mut self,
@@ -227,6 +256,52 @@ impl Context {
             )
         };
         if ok == 0 { Err(message(&error)) } else { Ok(()) }
+    }
+    /// Install the fronts the real copy of the `LDL^T` kernels factors, or
+    /// remove them with `None`.
+    ///
+    /// The real plan runs on every level next to the factor plan, which must
+    /// then hold the other fronts, and the flags of [`Context::set_real_flags`]
+    /// must mark the real plan's fronts. The context must have been created
+    /// with [`real_split`] true.
+    pub(super) fn set_real_plan(&mut self, plan: Option<&crate::analysis::DispatchPlan>) -> Result<()> {
+        let handle = self.handle()?;
+        let mut error = [0u8; 4096];
+        let empty = crate::analysis::DispatchPlan::default();
+        let table = plan.unwrap_or(&empty);
+        // SAFETY: the slices outlive the call, which copies them.
+        let ok = unsafe {
+            sparta_v1_set_real_plan(
+                handle.as_ptr(),
+                table.ids.as_ptr().cast(),
+                std::mem::size_of_val(table.ids.as_slice()),
+                table.tiles.as_ptr().cast(),
+                std::mem::size_of_val(table.tiles.as_slice()),
+                table.schur.as_ptr().cast(),
+                std::mem::size_of_val(table.schur.as_slice()),
+                table.levels.as_ptr().cast(),
+                table.levels.len() as u32,
+                table.steps.as_ptr().cast(),
+                table.steps.len() as u32,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if ok == 0 { Err(message(&error)) } else { Ok(()) }
+    }
+    /// Mark the fronts the next factorization runs on the real kernels, or
+    /// none. The complex assembly reads these flags from buffer 22 to widen a
+    /// real child's contribution block, so they must be cleared before a
+    /// factorization on the full plan.
+    pub(super) fn set_real_flags(&mut self, real: Option<&[bool]>) -> Result<()> {
+        // SAFETY: no command is in flight between factorizations, and buffer
+        // 22 holds one u32 per node.
+        let flags = unsafe { self.buffer::<u32>(22)? };
+        match real {
+            Some(real) => flags.iter_mut().zip(real).for_each(|(f, &r)| *f = u32::from(r)),
+            None => flags.fill(0),
+        }
+        Ok(())
     }
     /// Host view of device buffer `index` as elements of `T`.
     ///

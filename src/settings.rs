@@ -57,7 +57,7 @@ impl From<bool> for Value {
 }
 
 /// Every setting name, in the order the Python `Config` lists them.
-pub const NAMES: [&str; 26] = [
+pub const NAMES: [&str; 27] = [
     "ordering",
     "max_front",
     "nemin",
@@ -81,6 +81,7 @@ pub const NAMES: [&str; 26] = [
     "cpu_block_rows",
     "cpu_blas_min_rows",
     "supernodal",
+    "real_split",
     "static_pivot",
     "hybrid_cpu",
     "threads",
@@ -114,6 +115,7 @@ impl Config {
             "cpu_block_rows" => int(self.cpu_block_rows as u64),
             "cpu_blas_min_rows" => int(self.cpu_blas_min_rows as u64),
             "supernodal" => Some(Value::Bool(self.supernodal)),
+            "real_split" => Some(Value::Bool(self.real_split)),
             "static_pivot" => Some(Value::Float(self.static_pivot)),
             "hybrid_cpu" => Some(Value::Float(self.hybrid_cpu)),
             "threads" => int(self.threads as u64),
@@ -177,6 +179,12 @@ impl Config {
             "cpu_blas_min_rows" => self.cpu_blas_min_rows = size()?,
             "supernodal" => {
                 self.supernodal = match value {
+                    Value::Bool(v) => v,
+                    _ => return Err(wrong()),
+                }
+            }
+            "real_split" => {
+                self.real_split = match value {
                     Value::Bool(v) => v,
                     _ => return Err(wrong()),
                 }

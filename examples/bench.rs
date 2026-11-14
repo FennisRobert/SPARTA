@@ -33,6 +33,7 @@ fn main() {
     let mut supernodal = true;
     let mut lu = false;
     let mut single = false;
+    let mut real_split = true;
     let mut nrhs = 1usize;
     let mut paths = Vec::new();
     let mut generate = Vec::new();
@@ -48,6 +49,8 @@ fn main() {
             }
             "--force-cpu" | "--force_cpu" => force_cpu = true,
             "--multifrontal" => supernodal = false,
+            // Factor every front complex; see Config::real_split.
+            "--no-real-split" => real_split = false,
             "--lu" => lu = true,
             // With --force-cpu: factor in complex64, the hybrid's CPU precision.
             "--single" => single = true,
@@ -64,7 +67,7 @@ fn main() {
         }
     }
     if paths.is_empty() && generate.is_empty() {
-        eprintln!("usage: bench [--max-front N] [--skip-solve] [--nrhs K] [--force-cpu [--single]] [--multifrontal] [--lu] [--curl-curl K] FILE...");
+        eprintln!("usage: bench [--max-front N] [--skip-solve] [--nrhs K] [--force-cpu [--single]] [--multifrontal] [--no-real-split] [--lu] [--curl-curl K] FILE...");
         std::process::exit(2);
     }
 
@@ -106,6 +109,7 @@ fn main() {
     let config = sparta::Config {
         force_cpu,
         supernodal,
+        real_split,
         max_front: (max_front != usize::MAX).then_some(max_front),
         ..sparta::Config::default()
     };

@@ -62,10 +62,16 @@ pub struct Solver {
     plan: Analysis,
     /// Supernode count, kept because `plan.nodes` is gone.
     nodes: usize,
+    /// Each node's first permuted column and fully summed column count, kept
+    /// to name the unknown of a pivot failure.
+    columns: Vec<(u32, u32)>,
     context: backend::Context,
     /// CPU subtrees factored alongside the GPU, when `Config::hybrid_cpu` asks.
     #[cfg(sparta_metal)]
     hybrid: Option<hybrid::Hybrid>,
+    /// Real fronts factored in real arithmetic, when `Config::real_split` asks.
+    #[cfg(sparta_metal)]
+    split: Option<RealSplit>,
     valid: bool,
     device_seconds: f64,
     perturbed: u64,
@@ -94,33 +100,48 @@ impl Solver {
         // Only Metal has a hybrid path; other backends ignore `hybrid_cpu`.
         #[cfg(sparta_metal)]
         let hybrid = hybrid::Hybrid::new(plan, &mut context)?;
+        // Not combined with the hybrid factorization, whose factor plan is the
+        // GPU's share and is rebuilt as it rebalances.
+        #[cfg(sparta_metal)]
+        let split = (hybrid.is_none() && metal::real_split(plan)).then(|| RealSplit::new(plan));
         let mut runtime = plan.runtime_only();
         // This solver is on the GPU whatever the analysis was last asked to
         // report for, so its copy of the config says so.
         runtime.config.force_cpu = false;
         Ok(Self {
             nodes: plan.nodes.len(),
+            columns: plan.nodes.iter().map(|n| (n.first, n.nc)).collect(),
             plan: runtime,
             context,
             #[cfg(sparta_metal)]
             hybrid,
+            #[cfg(sparta_metal)]
+            split,
             valid: false,
             device_seconds: 0.0,
             perturbed: 0,
         })
     }
+    /// The matrix dimension.
+    pub(crate) fn n(&self) -> usize {
+        self.plan.n
+    }
     pub fn factor(&mut self, values: &[Complex32]) -> Result<()> {
         self.valid = false;
         self.device_seconds = 0.0;
         self.perturbed = 0;
-        if values.len() != self.plan.nnz
-            || values
-                .iter()
-                .any(|v| !v.re.is_finite() || !v.im.is_finite())
-        {
-            return Err(Error::Invalid(
-                "finite complex64 values must match analyzed CSC pattern".into(),
-            ));
+        if values.len() != self.plan.nnz {
+            return Err(Error::Invalid(format!(
+                "expected {} matrix values for the analyzed pattern, got {}",
+                self.plan.nnz,
+                values.len()
+            )));
+        }
+        if let Some(at) = values.iter().position(|v| !v.re.is_finite() || !v.im.is_finite()) {
+            return Err(Error::Invalid(format!(
+                "matrix value {at} is not finite in complex64; values above about 3.4e38 \
+                 overflow it, so rescale the matrix or factor in complex128 on the CPU"
+            )));
         }
         // Static pivoting is relative to the whole matrix; see
         // `Config::static_pivot`. LU kernels never read it.
@@ -136,13 +157,35 @@ impl Solver {
         let hybrid = self.hybrid.as_mut();
         #[cfg(not(sparta_metal))]
         let hybrid: Option<&mut ()> = None;
+        #[cfg(sparta_metal)]
+        let split = match self.split.as_mut() {
+            Some(split) => split.prepare(&mut self.context, values)?,
+            None => false,
+        };
+        #[cfg(not(sparta_metal))]
+        let split = false;
         self.device_seconds = match hybrid {
             #[cfg(sparta_metal)]
             Some(h) => h.factor(&mut self.context, values, &mut status, &mut perturbed)?,
+            #[cfg(sparta_metal)]
+            _ if split => {
+                self.context.factor_start(Some(values), 0, u32::MAX)?;
+                self.context.factor_finish(&mut status, &mut perturbed)?
+            }
             _ => self.context.run(values, None, 1, &mut status, &mut perturbed)?,
         };
+        let _ = split;
         self.perturbed = perturbed;
-        if let Some((node, &code)) = status.iter().enumerate().find(|(_, v)| **v != 0) {
+        #[cfg(sparta_metal)]
+        if let Some(split) = self.split.as_mut() {
+            if status.iter().all(|&v| v == 0) {
+                split.record(self.device_seconds);
+            }
+        }
+        // A failure propagates to every ancestor as ChildFailed, so report
+        // the front where it started.
+        let started = status.iter().enumerate().find(|(_, v)| **v != 0 && **v != 0xffff_ffff);
+        if let Some((node, &code)) = started.or_else(|| status.iter().enumerate().find(|(_, v)| **v != 0)) {
             // Mirrors the status encoding in kernels.metal.
             let (reason, pivot) = match code {
                 0xffff_ffff => (PivotFailure::ChildFailed, 0),
@@ -156,14 +199,30 @@ impl Solver {
                     (reason, code & 0x00ff_ffff)
                 }
             };
-            return Err(Error::Pivot {
-                node,
-                pivot,
-                reason,
-            });
+            return Err(Error::Pivot { node, pivot, reason, unknown: self.unknown(node, pivot) });
         }
         self.valid = true;
         Ok(())
+    }
+    /// The caller's index of the unknown at 1-based column `pivot` of
+    /// `node`, after the interchanges the factorization recorded, or `None`
+    /// when the column is outside the node. Reads the pivot order back from
+    /// the device on Metal; elsewhere it names the column before interchanges.
+    fn unknown(&self, node: usize, pivot: u32) -> Option<usize> {
+        let &(first, nc) = self.columns.get(node)?;
+        let (first, nc) = (first as usize, nc as usize);
+        let k = (pivot as usize).checked_sub(1).filter(|&k| k < nc)?;
+        #[allow(unused_mut)]
+        let mut local = k;
+        #[cfg(sparta_metal)]
+        if self.plan.kind == crate::Kind::Ldlt {
+            // SAFETY: the factorization has finished, so nothing writes the
+            // pivot order, which holds one u32 per column.
+            if let Ok(perms) = unsafe { self.context.buffer::<u32>(10) } {
+                local = perms.get(first + k).map(|&l| l as usize).filter(|&l| l < nc).unwrap_or(k);
+            }
+        }
+        self.plan.perm.get(first + local).map(|&p| p as usize)
     }
     /// Solve for `nrhs` right-hand sides at once.
     ///
@@ -216,6 +275,10 @@ impl Solver {
     /// building the next one, when the two would otherwise overlap.
     pub fn destroy(&mut self) {
         self.context.release();
+        #[cfg(sparta_metal)]
+        {
+            self.split = None;
+        }
         self.plan.release();
         self.valid = false;
         self.device_seconds = 0.0;
@@ -262,5 +325,123 @@ impl Solver {
     /// no meaning alone.
     pub fn pivot_range(&self) -> Option<(f64, f64)> {
         self.valid.then(|| self.context.pivot_range()).flatten()
+    }
+}
+
+/// `Config::real_split` on the GPU.
+///
+/// The fronts whose values and descendants are all real are factored by the
+/// real copy of the `LDL^T` kernels, a quarter of the arithmetic and half the
+/// traffic of the complex ones. Which fronts those are depends on the values,
+/// so it is decided at every factorization, and the two dispatch plans are
+/// rebuilt only when it changes: across a frequency sweep the complex entries
+/// stay where they are.
+///
+/// Unlike on the CPU, the split does not always pay here. A level holding
+/// both kinds of front is dispatched twice, once per copy of the kernels, and
+/// its serial panel steps run one copy after the other. Whether the
+/// arithmetic saved outweighs that depends on where the real fronts sit in
+/// the tree and how large they are, which no flop count predicts: measured on
+/// four EMerge systems, a 92% real share gained 1.26x, a 43% share 1.19x, and
+/// a 90% share on a small system lost 5%. So the solver measures instead. See
+/// [`Trial`].
+#[cfg(sparta_metal)]
+struct RealSplit {
+    /// The analysis without its row lists and child maps, which the masks
+    /// and the dispatch plans do not read.
+    plan: Analysis,
+    /// The real fronts of the installed plans; empty when none is installed.
+    real: Vec<bool>,
+    trial: Trial,
+}
+
+/// Where the timing comparison of the split stands.
+///
+/// The device time of a factorization is measured by the GPU itself, so one
+/// sample of each choice is enough. The first factorization uses the split
+/// and is not judged: it is the first use of the real pipelines and of the
+/// storage, and was 7% slower than the later ones on the largest system. The
+/// second runs without the split and the third with it, and the faster one is
+/// kept for every factorization after, the split only when it is at least
+/// [`MARGIN`] faster. A change of the real fronts starts the trial again.
+#[cfg(sparta_metal)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Trial {
+    /// Next: with the split, not judged.
+    Warm,
+    /// Next: without the split.
+    Without,
+    /// Next: with the split, against this many seconds without.
+    With(f64),
+    /// Settled on using the split or not.
+    Decided(bool),
+}
+
+/// Fraction the split must save to be kept. Run-to-run spread of the device
+/// time on these systems is about 1%, and a tie is better without the split,
+/// which then dispatches each level once.
+#[cfg(sparta_metal)]
+const MARGIN: f64 = 0.02;
+
+#[cfg(sparta_metal)]
+impl RealSplit {
+    /// Keep what the split reads of `plan`.
+    fn new(plan: &Analysis) -> Self {
+        let mut plan = plan.clone();
+        plan.rows = Vec::new();
+        plan.maps = Vec::new();
+        Self { plan, real: Vec::new(), trial: Trial::Warm }
+    }
+    /// Install the plans for `values` in `context` and return whether this
+    /// factorization uses the split. Without it, the factorization runs on
+    /// the full plan exactly as it would with `real_split` off.
+    ///
+    /// Arguments:
+    /// - `context`: the device context; no command may be in flight.
+    /// - `values`: the matrix values in the analyzed CSC order.
+    fn prepare(&mut self, context: &mut backend::Context, values: &[Complex32]) -> Result<bool> {
+        let real = self.plan.real_nodes(|s| values[s].im == 0.0);
+        let any = real.iter().any(|&r| r);
+        if real != self.real {
+            if any {
+                let complex: Vec<bool> = real.iter().map(|&r| !r).collect();
+                context.set_factor_plan(&self.plan.dispatch_plan_for(Some(&complex)))?;
+                context.set_real_plan(Some(&self.plan.dispatch_plan_for(Some(&real))))?;
+            } else {
+                context.set_real_plan(None)?;
+            }
+            self.real = real;
+            self.trial = Trial::Warm;
+        }
+        let using = any
+            && match self.trial {
+                Trial::Warm | Trial::With(_) => true,
+                Trial::Without => false,
+                Trial::Decided(on) => on,
+            };
+        context.set_real_flags(using.then_some(self.real.as_slice()))?;
+        Ok(using)
+    }
+    /// Advance the trial with the device seconds of the factorization that
+    /// [`RealSplit::prepare`] last set up. Call only after it succeeded.
+    fn record(&mut self, seconds: f64) {
+        if !self.real.iter().any(|&r| r) {
+            return;
+        }
+        self.trial = match self.trial {
+            Trial::Warm => Trial::Without,
+            Trial::Without => Trial::With(seconds),
+            Trial::With(without) => {
+                let on = seconds < (1.0 - MARGIN) * without;
+                if crate::profile::enabled() {
+                    eprintln!(
+                        "SPARTA_PROFILE  real_split: {seconds:.4}s with, {without:.4}s without -> {}",
+                        if on { "kept" } else { "dropped" }
+                    );
+                }
+                Trial::Decided(on)
+            }
+            decided => decided,
+        };
     }
 }

@@ -3,6 +3,28 @@ from dataclasses import dataclass
 import math
 from typing import Literal
 
+
+class AccuracyWarning(UserWarning):
+    """A solve returned an answer SPARTA cannot vouch for.
+
+    Raised as a warning, not an error, because the answer may still be worth
+    having, for example as a preconditioner. The message says how far the
+    answer is off and the most likely reason. To stop on it instead, turn it
+    into an error with warnings.simplefilter('error', sparta.AccuracyWarning).
+    """
+
+
+class UnsupportedMatrixWarning(AccuracyWarning):
+    """The matrix is of a kind SPARTA does not handle yet.
+
+    SPARTA is built for FEM systems such as curl-curl and Helmholtz problems,
+    whose diagonal entries are nonzero. A matrix with zero or negligible
+    diagonal entries, as in saddle-point, Lagrange-multiplier or mixed
+    formulations, needs pivots taken across fronts, which SPARTA does not do
+    yet, so its factors may be inaccurate or fail. Issued by factorize(),
+    before any solve. A subclass of AccuracyWarning, so one filter covers both.
+    """
+
 # float32 resolution. A pivot this far below the largest one carries no
 # significant bits relative to it.
 EPSILON = 1.1920929e-7

@@ -11,17 +11,18 @@ EPS: float = 1e-10
 from ._sparta import gpu_available, blas_library, __version__
 from . import _blas  # loads the CPU solver's BLAS; see _blas.py
 from ._types import Ordering, MatrixType, Path, Backend
-from ._options import _Options, _hybrid_share
+from ._options import _Options, _hybrid_share, _warn_unused, UnusedSettingWarning
 from ._config import Config, presets, profiles
 from ._optimize import optimize, Optimization, Progress
 from ._solver import Solver
 from ._refinement import RefinementReport, RefinementStatus
-from ._quality import FactorQuality
+from ._quality import FactorQuality, AccuracyWarning, UnsupportedMatrixWarning
 
 __all__ = ['EPS', '__version__', 'analyze', 'Solver', 'Config', 'presets',
            'profiles', 'optimize', 'Optimization', 'Progress',
            'Ordering', 'MatrixType', 'Path', 'Backend',
-           'gpu_available', 'blas_library', 'RefinementReport', 'RefinementStatus', 'FactorQuality']
+           'gpu_available', 'blas_library', 'RefinementReport', 'RefinementStatus', 'FactorQuality', 'AccuracyWarning', 'UnsupportedMatrixWarning',
+           'UnusedSettingWarning']
 
 
 def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
@@ -45,8 +46,9 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
             cpu_panel: int | None = None,
             cpu_block_rows: int | None = None, cpu_blas_min_rows: int | None = None,
             supernodal: bool | None = None,
+            real_split: bool | None = None,
             static_pivot: float | None = None,
-            threads: int | None = None) -> Solver:
+            threads: int | None = None, **unused) -> Solver:
     """Analyze a matrix pattern on CPU and return an unfactorized Solver.
 
     Parameters
@@ -79,6 +81,16 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
         the GPU the fronts keep only the lower half of their trailing blocks.
         Same pivoting, same solve. False is the multifrontal route. LU ignores
         it. None uses the config's setting, which is True by default.
+    real_split : bool or None, default None
+        Factor the real part of a complex LDLT in real arithmetic. When only
+        some entries have an imaginary part, such as port and boundary unknowns
+        in an FEM model, every branch of the elimination tree without one is
+        factored and stored as real numbers, which is faster and uses less
+        memory. The ordering and the solution are unchanged. On the CPU it
+        needs supernodal. On the GPU it does not always pay, so the solver
+        times one factorization with it and one without and keeps the faster.
+        Real matrices, LU and hybrid_cpu ignore it. None uses the
+        config's setting, which is True by default.
     static_pivot : float or None, default None
         LDLT static pivoting threshold, relative to the matrix's largest entry.
         A pivot smaller than this is raised to it and counted in
@@ -94,6 +106,10 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
         a pool of its own and keeps Accelerate from threading past it. The
         SPARTA_NUM_THREADS environment variable, when set to a positive count,
         overrides this. None uses the config's threads, or 0 without a config.
+    **unused
+        Any other keyword is ignored with an UnusedSettingWarning, so settings
+        written for another SPARTA version or another solver never stop a run.
+        Values of known settings are still checked.
     config : Config, str or None, default None
         Every tuning setting at once, from Config.defaults(), Config.preset()
         or Config.load(). A string names a profile saved by sparta.optimize()
@@ -229,6 +245,9 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
         Call factorize() before solve(b) or solve_many(B). Factorization and solves
         use the selected CPU or Metal backend; analysis requires no GPU. Use on the creating thread only.
     """
+    # Unknown keywords never stop a run: settings written for another version
+    # or shared with another solver are ignored with a warning.
+    _warn_unused('sparta.analyze()', unused)
     # A Config supplies every tuning field at once. An explicit keyword still
     # wins, so a preset can be adjusted at the call site without rebuilding it.
     tuning = dict(nemin=nemin, small_front_rows=small_front_rows, imbalance=imbalance,
@@ -242,7 +261,7 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
                   hybrid_cpu=None if hybrid is None else _hybrid_share(hybrid),
                   cpu_panel=cpu_panel, cpu_block_rows=cpu_block_rows,
                   cpu_blas_min_rows=cpu_blas_min_rows, supernodal=supernodal,
-                  static_pivot=static_pivot, threads=threads)
+                  real_split=real_split, static_pivot=static_pivot, threads=threads)
     if config is not None:
         base = Config.resolve(config).to_dict()
         tuning = {name: base[name] if value is None else value

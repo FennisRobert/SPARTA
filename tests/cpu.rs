@@ -501,3 +501,79 @@ fn two_by_two_fallback_counts_only_real_perturbations() {
         }
     }
 }
+
+#[test]
+/// Supernodal LDLᵀ of a complex matrix whose complex entries cover only a
+/// patch, so the real subtrees are factored in real arithmetic, solves to the
+/// multifrontal answer: in both complex precisions, through the serial and
+/// blocked routes, and when refactoring moves the patch, removes it or makes
+/// everything complex.
+fn real_subtrees_of_a_complex_matrix() {
+    let side = 8;
+    let n = side * side * side;
+    // `patch(i)` says whether unknown `i` carries complex entries.
+    let grid = |patch: &dyn Fn(usize) -> bool| {
+        let mut a = vec![C::new(0.0, 0.0); n * n];
+        for i in 0..n {
+            let im = if patch(i) { 0.3 } else { 0.0 };
+            a[i * n + i] = C::new(if i % 3 == 0 { 0.01 } else { -2.5 + (i % 5) as f64 }, im);
+            for step in [1, side, side * side] {
+                let j = i + step;
+                let same_line = step != 1 || i / side == j / side;
+                let same_plane = step != side || i / (side * side) == j / (side * side);
+                if j < n && same_line && same_plane {
+                    let im = if patch(i) && patch(j) { 0.1 } else { 0.0 };
+                    let v = C::new(-1.0 + 0.1 * (i % 7) as f64, im);
+                    a[i * n + j] = v;
+                    a[j * n + i] = v;
+                }
+            }
+        }
+        a
+    };
+    let x = side;
+    let patches: [&dyn Fn(usize) -> bool; 4] = [
+        &|i| i % x == 0 && (i / x) % x < 3,
+        &|i| i >= n - 2 * x,
+        &|_| false,
+        &|_| true,
+    ];
+    let expected: Vec<_> = (0..n).map(|i| C::new((i as f64 * 0.37).sin(), (i as f64).cos())).collect();
+    for (small, nemin) in [(1, 4), (1000, 8)] {
+        // Every patch, refactoring one solver, against a fresh multifrontal one.
+        let config = |supernodal| Config {
+            force_cpu: true,
+            supernodal,
+            small_front_rows: small,
+            nemin,
+            cpu_block_rows: 5,
+            cpu_blas_min_rows: 1,
+            ..Config::default()
+        };
+        let (p, _) = plan(&grid(patches[3]), n, Kind::Ldlt, &config(true), false);
+        let mut sn = Solver::new(p).unwrap();
+        for patch in patches {
+            let a = grid(patch);
+            let b = product(&a, n, &expected);
+            // Every grid entry has a nonzero real part, so the pattern, and
+            // with it the plan, is the same for every patch.
+            let (p, values) = plan(&a, n, Kind::Ldlt, &config(false), false);
+            let mut multi = Solver::new(p).unwrap();
+            multi.factor_c128(&values).unwrap();
+            sn.factor_c128(&values).unwrap();
+            let want = multi.solve_many_c128(&b, 1).unwrap();
+            let got = sn.solve_many_c128(&b, 1).unwrap();
+            close(&want, &expected, 1e-9);
+            close(&got, &want, 1e-11);
+            assert_eq!(sn.perturbed_pivots(), multi.perturbed_pivots());
+            // Complex64 through the same plan.
+            let single: Vec<sparta::Complex32> =
+                values.iter().map(|v| sparta::Complex32::new(v.re as f32, v.im as f32)).collect();
+            sn.factor_values(&single).unwrap();
+            let b32: Vec<sparta::Complex32> = b.iter().map(|v| sparta::Complex32::new(v.re as f32, v.im as f32)).collect();
+            let got32 = sn.solve_values(&b32, 1).unwrap();
+            let got32: Vec<C> = got32.iter().map(|v| C::new(v.re as f64, v.im as f64)).collect();
+            close(&got32, &want, 1e-3);
+        }
+    }
+}

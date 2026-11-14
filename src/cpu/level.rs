@@ -199,6 +199,7 @@ impl Shared {
                 node: id as usize,
                 pivot: pivot as u32 + 1,
                 reason,
+                unknown: None,
             });
         let (bumped, stored, written) = (front.bumped, front.stored, front.finite);
         result?;
@@ -282,6 +283,7 @@ impl Shared {
                 node: id as usize,
                 pivot: n as u32,
                 reason: crate::PivotFailure::NonFinite,
+                unknown: None,
             });
         }
         report.stop(Phase::Store, clock);

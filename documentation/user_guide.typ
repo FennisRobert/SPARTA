@@ -455,7 +455,7 @@ Rust and no compiler. One wheel works for every Python from 3.9 up, on Apple
 Silicon only:
 
 #code(```sh
-pip install sparta_solver-0.3.5-cp39-abi3-macosx_11_0_arm64.whl
+pip install sparta_solver-0.3.6-cp39-abi3-macosx_11_0_arm64.whl
 ```)
 
 == Checking the installation
@@ -669,12 +669,86 @@ solver.factor_values(&new_values)?;
 solver.factorize(matrix=A_next)
 ```)
 
+*Only a few numbers from the solution*, such as a port matrix: see
+@ports.
+
 *A new pattern:* start again from the analysis. In Python, `factorize` does
 this itself: given a matrix with a different pattern, or a different size, it
 analyzes again with the same settings and then factors. `solver.reanalyses`
 counts how often that happened. Each one costs a full analysis and new factor
 memory, so a count that keeps rising in a loop means the pattern is not stable
 between calls, for example because explicit zeros come and go.
+
+== Port matrices and sparse right-hand sides <ports>
+
+In a frequency sweep you often need only a few numbers from each solution:
+the port matrix of the model, or the field at a few chosen unknowns. SPARTA
+computes those directly.
+
+- *B, what you excite:* an $n times p$ sparse matrix with one column per
+  excitation, such as one port. Each column is nonzero only on that port's
+  unknowns.
+- *W, what you measure:* an $n times q$ sparse matrix with one column per
+  quantity, each a weighted sum of unknowns.
+
+The result is $W^T A^(-1) B$, a small $q times p$ matrix: entry $(i, j)$ is
+measurement $i$ when column $j$ of B is excited. The transpose is plain,
+never conjugated. With $W = B$ it is the port matrix $B^T A^(-1) B$. With one
+column per chosen unknown it gives the solution's values there.
+
+#code(```python
+X = solver.solve_many(B)              # B may be SciPy sparse: the full solution, faster
+Z = solver.solve_many(B, project=B)   # the p x p port matrix
+V = solver.solve_many(B, project=W)   # W^T A^-1 B, q x p
+v = solver.solve(b, project=W)        # one right-hand side: W^T x
+```)
+#code(```rust
+use sparta::SparseColumns;
+// CSC arrays, numbered as the matrix: column j has rows[ptr[j]..ptr[j+1]].
+let b = SparseColumns::new(n, &ptr, &rows, &values)?;
+let x = solver.solve_sparse(&b)?;              // n values per column, end to end
+let z = solver.solve_projected(&b, None)?;     // B^T A^-1 B, p x p, column-major
+let v = solver.solve_projected(&b, Some(&w))?; // W^T A^-1 B, q x p, column-major
+```)
+
+*How it runs.* On CPU $L D L^T$ factors, a column of B only reaches the
+fronts on the path from its unknowns to the root of the elimination tree. A
+projection needs that part alone: it forms no solution, does no backward
+sweep and builds no $n times p$ block. On the GPU, the hybrid factorization
+and LU, SPARTA solves as usual and projects the solution, so the answer is
+the same, just not faster. In Python, `solver.diagnostics()['solve_route']`
+says which way the latest solve went.
+
+*Accuracy.* In Python the fast route is taken only when no pivot was
+perturbed. A sparse solve without `project` checks its residual and refines
+on the usual route if needed. A fast projection forms no solution, so it
+has no refinement report. On a symmetric matrix, `project=B` is exactly
+symmetric on every route.
+
+*What it saves*, on the CPU (M4 Pro, complex128) with ports of six unknowns:
+
+#table(
+  columns: 5,
+  [*System*], [*Ports*], [*Solve, then project*], [*Projected directly*], [*With the factorization*],
+  [109k unknowns], [4], [0.030 s], [0.010 s], [1.06× faster],
+  [109k unknowns], [100], [0.363 s], [0.028 s], [2.0× faster],
+  [887k unknowns], [20], [0.782 s], [0.126 s], [1.13× faster],
+  [887k unknowns], [100], [7.64 s], [0.20 s], [2.5× faster],
+)
+
+The more ports, the more it pays; with a handful the factorization dominates.
+
+*Coming from a dedicated port-matrix API.* Where other solvers offer
+`port_matrix(B)` and `solve_sparse(B)` as separate calls:
+- `port_matrix(B)` is `solve_many(B, project=B)` here, or
+  `solve_projected(&b, None)` in Rust.
+- `solve_sparse(B)` is `solve_many(B)` with a sparse B, or `solve_sparse(&b)`
+  in Rust.
+- A query of how far a column reaches into the factors isn't needed: SPARTA
+  picks the route itself.
+
+These work on every factorization and take a separate W as well. C, Julia
+and MATLAB don't expose them yet.
 
 == Freeing memory
 
@@ -915,6 +989,12 @@ solver = sparta.analyze(A, config=config)
   [`sparta.presets()`], [Every preset name with a one-line summary.],
 )
 
+*Unknown keywords.* `analyze`, `factorize` and `Config.with_` ignore a
+keyword they do not know, with a `sparta.UnusedSettingWarning`, so settings
+written for another SPARTA version never stop a run. `factorize` silently
+ignores settings that only `analyze` can apply, such as `nemin`, so one
+settings dict can go to both calls.
+
 *Which value wins.* A keyword argument overrides the same setting in
 `config`. One exception: `max_front` has a default of its own, `None`, and
 passing it does not override the config. To remove a config's front limit,
@@ -1141,6 +1221,7 @@ Types are given in a language-neutral form. `uint32` is `u32` in Rust and
   [`hybrid_cpu`], [float64], [`0.0`], [Share of the work the CPU does alongside the GPU (Metal only).],
   [`lu_diag_threshold`], [float64], [`0.0`], [LU only. How strongly to prefer the diagonal as pivot.],
   [`supernodal`], [bool], [`True`], [LDLT only. Supernodal factorization: no frontal matrices on the CPU, half-size trailing blocks on the GPU. Faster and less memory; `False` is the multifrontal route. Ignored by LU and Vulkan.],
+  [`real_split`], [bool], [`True`], [Complex LDLT. Factors the parts of the matrix that have no imaginary entries in real arithmetic, which is faster. Same ordering and same answer. On the CPU it needs `supernodal` and also saves memory. On the GPU the solver times one factorization with it and one without and keeps the faster.],
   [`static_pivot`], [float64], [`1e-12`], [LDLT only. Pivots smaller than this, relative to the largest matrix entry, are raised to it. `0` replaces exact zeros only. Ignored by LU and Vulkan.],
   table.cell(colspan: 4)[*CPU backend*],
   [`cpu_panel`], [uint64], [`32`], [Pivots per panel before an update.],

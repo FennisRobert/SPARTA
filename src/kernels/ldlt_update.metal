@@ -10,13 +10,13 @@
 // Folds the block diagonal into one row of the factor panel. Reads the paired
 // column straight from device memory, which keeps the staged panel to the two
 // arrays actually consumed by the inner product.
-static float2 fold_diagonal(device const float2* row, uint first, uint k, device const uint* two,
+static T fold_diagonal(device const T* row, uint first, uint k, device const uint* two,
                             device const float2* diagonal, device const float2* subdiag) {
     if (two[first + k])
-        return mul(row[k], diagonal[first + k]) + mul(row[k + 1], subdiag[first + k]);
+        return mul(row[k], narrow(diagonal[first + k])) + mul(row[k + 1], narrow(subdiag[first + k]));
     if (k > 0 && two[first + k - 1])
-        return mul(row[k - 1], subdiag[first + k - 1]) + mul(row[k], diagonal[first + k]);
-    return mul(row[k], diagonal[first + k]);
+        return mul(row[k - 1], narrow(subdiag[first + k - 1])) + mul(row[k], narrow(diagonal[first + k]));
+    return mul(row[k], narrow(diagonal[first + k]));
 }
 
 // Deferred rank-`width` update of the fully summed columns past the panel.
@@ -45,16 +45,16 @@ kernel void update_strip(
         atomic_load_explicit(status + s, memory_order_relaxed) != 0)
         return;
     uint m = node.nr, first = node.first;
-    device float2* a = fronts + node.offset;
+    device T* a = (device T*)(fronts + node.offset);
     // The row operand spans STRIP_ROWS rows and the column operand only 16, so
     // the two stages are separate loops rather than one fused pass: the column
     // block is staged once for four row blocks' worth of output.
-    threadgroup float2 w[STRIP_ROWS][SCHUR_CHUNK], lj[16][SCHUR_CHUNK];
+    threadgroup T w[STRIP_ROWS][SCHUR_CHUNK], lj[16][SCHUR_CHUNK];
     uint rowbase = job.row * STRIP_ROWS, colbase = job.col * 16;
     uint linear = lane.y * 16 + lane.x;
-    float2 acc[STRIP_BLOCK];
+    T acc[STRIP_BLOCK];
     for (uint d = 0; d < STRIP_BLOCK; d++)
-        acc[d] = float2(0);
+        acc[d] = T(0);
     for (uint c0 = st.start; c0 < end;) {
         uint width = min((uint)SCHUR_CHUNK, end - c0);
         if (c0 + width < end && two[first + c0 + width - 1])
@@ -62,15 +62,15 @@ kernel void update_strip(
         for (uint idx = linear; idx < STRIP_ROWS * width; idx += 256) {
             uint r = idx / width, c = idx - r * width, ri = rowbase + r;
             w[r][c] = ri < m ? fold_diagonal(a + ri * m, first, c0 + c, two, diagonal, subdiag)
-                             : float2(0);
+                             : T(0);
         }
         for (uint idx = linear; idx < 16 * width; idx += 256) {
             uint r = idx / width, c = idx - r * width, rj = colbase + r;
-            lj[r][c] = rj < m ? a[rj * m + c0 + c] : float2(0);
+            lj[r][c] = rj < m ? a[rj * m + c0 + c] : T(0);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint c = 0; c < width; c++) {
-            float2 lv = lj[lane.x][c];
+            T lv = lj[lane.x][c];
             for (uint d = 0; d < STRIP_BLOCK; d++)
                 acc[d] -= mul(w[STRIP_BLOCK * lane.y + d][c], lv);
         }
@@ -86,8 +86,8 @@ kernel void update_strip(
         uint i = rowbase + STRIP_BLOCK * lane.y + d;
         if (i >= m || j > i)
             continue;
-        float2 v = a[i * m + j] + acc[d];
-        if (!all(isfinite(v)))
+        T v = a[i * m + j] + acc[d];
+        if (!finite(v))
             atomic_store_explicit(status + s, 0xfffffffeu, memory_order_relaxed);
         a[i * m + j] = v;
         // The mirror is worth writing only where something reads it. Rows
@@ -120,6 +120,7 @@ kernel void update_strip(
 // real and imaginary parts staged separately and the imaginary part of the
 // row operand staged negated as well, since the units only add:
 //   re += Wr Lr^T + (-Wi) Li^T,   im += Wr Li^T + Wi Lr^T.
+// The real copy stages and multiplies the real parts alone.
 // Staging, the chunk loop and the 2x2 rule are those of the scalar kernel
 // below, which remains for the geometries this one does not cover.
 kernel void update_schur(
@@ -137,9 +138,12 @@ kernel void update_schur(
     if (st.next <= st.panel || atomic_load_explicit(status + s, memory_order_relaxed) != 0)
         return;
     uint m = node.nr, base = node.nc, first = node.first;
-    device float2* a = fronts + node.offset;
-    threadgroup float wr[SCHUR_TILE][SCHUR_CHUNK], wi[SCHUR_TILE][SCHUR_CHUNK],
-        wn[SCHUR_TILE][SCHUR_CHUNK], lr[SCHUR_TILE][SCHUR_CHUNK], li[SCHUR_TILE][SCHUR_CHUNK];
+    device T* a = (device T*)(fronts + node.offset);
+    threadgroup float wr[SCHUR_TILE][SCHUR_CHUNK], lr[SCHUR_TILE][SCHUR_CHUNK];
+#if !SPARTA_REAL
+    threadgroup float wi[SCHUR_TILE][SCHUR_CHUNK], wn[SCHUR_TILE][SCHUR_CHUNK],
+        li[SCHUR_TILE][SCHUR_CHUNK];
+#endif
     // One 8 x 8 result block per simdgroup at a time, real then imaginary.
     threadgroup float out[8][2][64];
     uint rowbase = base + job.row * SCHUR_TILE, colbase = base + job.col * SCHUR_TILE;
@@ -152,7 +156,9 @@ kernel void update_schur(
 #pragma unroll
     for (uint b = 0; b < 8; b++) {
         cr[b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+#if !SPARTA_REAL
         ci[b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+#endif
     }
     for (uint c0 = st.panel; c0 < st.next;) {
         uint width = min((uint)SCHUR_CHUNK, st.next - c0);
@@ -163,33 +169,44 @@ kernel void update_schur(
         for (uint idx = linear; idx < SCHUR_TILE * padded; idx += 256) {
             uint r = idx / padded, c = idx - r * padded, k = c0 + c;
             uint ri = rowbase + r, rj = colbase + r;
-            float2 wv = c < width && ri < m ? fold_diagonal(a + ri * m, first, k, two, diagonal, subdiag)
-                                             : float2(0);
-            float2 lv = c < width && rj < m ? a[rj * m + k] : float2(0);
+            T wv = c < width && ri < m ? fold_diagonal(a + ri * m, first, k, two, diagonal, subdiag)
+                                       : T(0);
+            T lv = c < width && rj < m ? a[rj * m + k] : T(0);
+#if SPARTA_REAL
+            wr[r][c] = wv;
+            lr[r][c] = lv;
+#else
             wr[r][c] = wv.x;
             wi[r][c] = wv.y;
             wn[r][c] = -wv.y;
             lr[r][c] = lv.x;
             li[r][c] = lv.y;
+#endif
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (rowlive) {
             for (uint k8 = 0; k8 < padded; k8 += 8) {
-                simdgroup_float8x8 ar, ai, an;
+                simdgroup_float8x8 ar;
                 simdgroup_load(ar, &wr[8 * sg][k8], SCHUR_CHUNK);
+#if !SPARTA_REAL
+                simdgroup_float8x8 ai, an;
                 simdgroup_load(ai, &wi[8 * sg][k8], SCHUR_CHUNK);
                 simdgroup_load(an, &wn[8 * sg][k8], SCHUR_CHUNK);
+#endif
 #pragma unroll
                 for (uint b = 0; b < 8; b++) {
                     if ((diag && b > sg) || colbase + 8 * b >= m)
                         continue;
-                    simdgroup_float8x8 br, bi;
+                    simdgroup_float8x8 br;
                     simdgroup_load(br, &lr[8 * b][k8], SCHUR_CHUNK, ulong2(0, 0), true);
-                    simdgroup_load(bi, &li[8 * b][k8], SCHUR_CHUNK, ulong2(0, 0), true);
                     simdgroup_multiply_accumulate(cr[b], ar, br, cr[b]);
+#if !SPARTA_REAL
+                    simdgroup_float8x8 bi;
+                    simdgroup_load(bi, &li[8 * b][k8], SCHUR_CHUNK, ulong2(0, 0), true);
                     simdgroup_multiply_accumulate(cr[b], an, bi, cr[b]);
                     simdgroup_multiply_accumulate(ci[b], ar, bi, ci[b]);
                     simdgroup_multiply_accumulate(ci[b], ai, br, ci[b]);
+#endif
                 }
             }
         }
@@ -203,14 +220,20 @@ kernel void update_schur(
         if ((diag && b > sg) || colbase + 8 * b >= m)
             continue;
         simdgroup_store(cr[b], &out[sg][0][0], 8);
+#if !SPARTA_REAL
         simdgroup_store(ci[b], &out[sg][1][0], 8);
+#endif
         simdgroup_barrier(mem_flags::mem_threadgroup);
         for (uint e = sl; e < 64; e += 32) {
             uint i = rowbase + 8 * sg + e / 8, j = colbase + 8 * b + e % 8;
             if (i >= m || j > i)
                 continue;
-            float2 v = a[i * m + j] - float2(out[sg][0][e], out[sg][1][e]);
-            if (!all(isfinite(v)))
+#if SPARTA_REAL
+            T v = a[i * m + j] - out[sg][0][e];
+#else
+            T v = a[i * m + j] - float2(out[sg][0][e], out[sg][1][e]);
+#endif
+            if (!finite(v))
                 atomic_store_explicit(status + s, 0xfffffffeu, memory_order_relaxed);
             a[i * m + j] = v;
             if (!SPARTA_LOWER)
@@ -234,13 +257,13 @@ kernel void update_schur(
     if (st.next <= st.panel || atomic_load_explicit(status + s, memory_order_relaxed) != 0)
         return;
     uint m = node.nr, base = node.nc, first = node.first;
-    device float2* a = fronts + node.offset;
+    device T* a = (device T*)(fronts + node.offset);
     // Each thread owns a SCHUR_BLOCK x SCHUR_BLOCK register block, so one pass
     // over the staged panel feeds BLOCK^2 multiply-adds from 2*BLOCK
     // threadgroup reads. That ratio is what decides this kernel: at 2x2 it is
     // one complex multiply-add per staged operand read, and the inner loop
     // spends its time on threadgroup traffic rather than arithmetic.
-    threadgroup float2 w[SCHUR_TILE][SCHUR_CHUNK], lj[SCHUR_TILE][SCHUR_CHUNK];
+    threadgroup T w[SCHUR_TILE][SCHUR_CHUNK], lj[SCHUR_TILE][SCHUR_CHUNK];
     uint rowbase = base + job.row * SCHUR_TILE, colbase = base + job.col * SCHUR_TILE;
     uint linear = lane.y * 16 + lane.x;
     // The tile is a 4 x 4 grid of SUB x SUB blocks, sixteen threads each, so
@@ -257,10 +280,10 @@ kernel void update_schur(
     uint mycol = SUB * (block & 15) + SCHUR_BLOCK * (within % 4);
     bool idle = (job.row == job.col && linear / 16 >= 10) ||
                 rowbase + SUB * (block >> 4) >= m || colbase + SUB * (block & 15) >= m;
-    float2 acc[SCHUR_BLOCK][SCHUR_BLOCK];
+    T acc[SCHUR_BLOCK][SCHUR_BLOCK];
     for (uint di = 0; di < SCHUR_BLOCK; di++)
         for (uint dj = 0; dj < SCHUR_BLOCK; dj++)
-            acc[di][dj] = float2(0);
+            acc[di][dj] = T(0);
     for (uint c0 = st.panel; c0 < st.next;) {
         uint width = min((uint)SCHUR_CHUNK, st.next - c0);
         // Never split a 2x2 pivot across chunks; its two columns must be
@@ -271,12 +294,12 @@ kernel void update_schur(
             uint r = idx / width, c = idx - r * width, k = c0 + c;
             uint ri = rowbase + r, rj = colbase + r;
             w[r][c] =
-                ri < m ? fold_diagonal(a + ri * m, first, k, two, diagonal, subdiag) : float2(0);
-            lj[r][c] = rj < m ? a[rj * m + k] : float2(0);
+                ri < m ? fold_diagonal(a + ri * m, first, k, two, diagonal, subdiag) : T(0);
+            lj[r][c] = rj < m ? a[rj * m + k] : T(0);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint c = 0; c < (idle ? 0u : width); c++) {
-            float2 wv[SCHUR_BLOCK], lv[SCHUR_BLOCK];
+            T wv[SCHUR_BLOCK], lv[SCHUR_BLOCK];
             for (uint d = 0; d < SCHUR_BLOCK; d++) {
                 wv[d] = w[myrow + d][c];
                 lv[d] = lj[mycol + d][c];
@@ -293,8 +316,8 @@ kernel void update_schur(
             uint i = rowbase + myrow + di, j = colbase + mycol + dj;
             if (idle || i >= m || j > i)
                 continue;
-            float2 v = a[i * m + j] + acc[di][dj];
-            if (!all(isfinite(v)))
+            T v = a[i * m + j] + acc[di][dj];
+            if (!finite(v))
                 atomic_store_explicit(status + s, 0xfffffffeu, memory_order_relaxed);
             a[i * m + j] = v;
             a[j * m + i] = v;

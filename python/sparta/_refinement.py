@@ -239,8 +239,10 @@ def _refine_block(a: csc_matrix | csr_matrix, b: np.ndarray,
     # The size of the last correction accepted, relative to the solution it was
     # applied to. See RefinementReport.estimated_relative_error.
     correction = [float('nan')]*k
-    # Only the columns that have not settled stay in the batch.
+    # Only the columns that have not settled stay in the batch, each with its
+    # own residual: the first correction must not carry the settled ones.
     active = every[best > rtol]
+    r = r[:, active]
     limit = UNBOUNDED_CEILING if steps < 0 else steps
     for step in range(1, limit + 1):
         if not active.size:

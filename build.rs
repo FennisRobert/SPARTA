@@ -31,6 +31,12 @@ const KERNELS: &[&str] = &[
     "lu_solve",
 ];
 
+/// The files of [`KERNELS`] the real copy of the shader is built from: the
+/// `LDL^T` factorization, which `Config::real_split` runs in real arithmetic
+/// for the fronts whose values are all real. Every other file is fenced off
+/// with `#if !SPARTA_REAL`, so the same source string serves both copies.
+const REAL_KERNELS: &[&str] = &["common", "assembly", "ldlt_factor", "ldlt_update"];
+
 /// `src/kernels/vulkan/*.comp` and the kernels each one holds. Every kernel is
 /// its own SPIR-V module, compiled from its file with `-DKERNEL_<name>`.
 const VULKAN_KERNELS: &[(&str, &[&str])] = &[
@@ -163,7 +169,12 @@ fn build_metal(out: &Path) {
         .iter()
         .map(|file| {
             let path = format!("src/kernels/{file}.metal");
-            fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+            let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            if REAL_KERNELS.contains(file) {
+                text
+            } else {
+                format!("#if !SPARTA_REAL\n{text}\n#endif")
+            }
         })
         .collect::<Vec<_>>()
         .join("\n");

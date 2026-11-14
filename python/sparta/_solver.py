@@ -4,15 +4,54 @@ from dataclasses import asdict, replace
 import math
 import sys
 import time
+import warnings
 import numpy as np
 from scipy import sparse
 from ._sparta import _Analysis, _Factor, _CpuFactor, device as _device
 from ._types import Ordering, MatrixType, Path
-from ._options import _Options, _hybrid_share
+from ._options import _Options, _hybrid_share, _warn_unused
 from ._matrix import _prepare_matrix, _validate_choices, _gpu_values, _value_gather, VALUE_TYPES
 from ._scaling import _equilibrate
-from ._refinement import RefinementReport, _Operator, _Transposed, _refine_block
-from ._quality import FactorQuality
+from ._refinement import RefinementReport, RefinementStatus, _Operator, _Transposed, _refine_block
+from ._quality import FactorQuality, AccuracyWarning, UnsupportedMatrixWarning
+
+
+def _negligible_diagonal(a: sparse.csc_matrix) -> int:
+    """Count diagonal entries of a that are zero, missing, or at most 1e-12
+    times the largest entry of their own row and column.
+
+    Relative to the row and column rather than the whole matrix, so a badly
+    scaled matrix with a healthy diagonal is not mistaken for one with zeros.
+    Works for lower-triangle and full storage alike.
+    """
+    m = abs(a)
+    near = np.maximum(m.max(axis=0).toarray().ravel(), m.max(axis=1).toarray().ravel())
+    return int(np.count_nonzero(np.abs(a.diagonal()) <= 1e-12 * near))
+
+
+def _warn_unsupported(a: sparse.csc_matrix) -> None:
+    """Warn with an UnsupportedMatrixWarning when a has zero or negligible
+    diagonal entries, which SPARTA cannot yet factor reliably.
+
+    a: the validated matrix about to be factored.
+    """
+    zeros = _negligible_diagonal(a)
+    if zeros:
+        warnings.warn(f'A has {zeros} zero or negligible diagonal entries. SPARTA is built for FEM '
+                      'systems such as curl-curl and Helmholtz problems, whose diagonal is nonzero, '
+                      'and cannot yet factor matrices like this one reliably (saddle-point, '
+                      'Lagrange-multiplier or mixed formulations): it does not pivot across fronts, '
+                      'which they need. The result may be inaccurate or the factorization may fail; '
+                      'a small value on those diagonal entries usually avoids it.',
+                      UnsupportedMatrixWarning, stacklevel=3)
+
+
+def _same_columns(w: sparse.csc_matrix, b: np.ndarray | sparse.spmatrix) -> bool:
+    """Whether the projection w holds exactly the columns of b."""
+    if np.shape(b) != w.shape:
+        return False
+    other = sparse.csc_matrix(b)
+    return other.nnz == w.nnz and (other != w).nnz == 0
 
 
 def _symbolic(a: sparse.csc_matrix, path: Path, options: _Options) -> _Analysis:
@@ -43,6 +82,7 @@ def _symbolic(a: sparse.csc_matrix, path: Path, options: _Options) -> _Analysis:
                      cpu_panel=options.cpu_panel, cpu_block_rows=options.cpu_block_rows,
                      cpu_blas_min_rows=options.cpu_blas_min_rows,
                      supernodal=options.supernodal,
+                     real_split=options.real_split,
                      static_pivot=options.static_pivot,
                      threads=options.threads)
 
@@ -64,6 +104,12 @@ def _reader(matrix: sparse.spmatrix, a: sparse.csc_matrix, triangle: str,
     c = matrix.tocsc()
     # Copies: tocsc() returns the caller's own arrays for CSC input.
     return gather, (c.shape, c.indptr.copy(), c.indices.copy())
+
+
+def _analysis_settings() -> frozenset[str]:
+    """Keywords of sparta.analyze(), which factorize() accepts and ignores."""
+    import inspect
+    return frozenset(inspect.signature(sys.modules['sparta'].analyze).parameters) - {'matrix'}
 
 
 class Solver:
@@ -118,8 +164,7 @@ class Solver:
                   max_front: int | None = None, equilibrate: bool | None = None,
                   refinement_steps: int | None = None, refinement_rtol: float | None = None,
                   refinement_minimize: bool | None = None, verbose: bool | None = None,
-                  supernodal: bool | None = None,
-                  static_pivot: float | None = None) -> Solver:
+                  **unused) -> Solver:
         """Factor a matrix and return this solver; reuse storage while the backend is unchanged.
 
         Parameters
@@ -177,10 +222,12 @@ class Solver:
         verbose : bool or None
             Print bounded per-solve summaries to stderr; None keeps current setting.
             Extra CPU residual evaluation is performed when enabled.
-        supernodal, static_pivot : bool or None, float or None
-            Accepted and ignored, so that one set of settings can be passed to
-            both analyze() and factorize(). Both are fixed when the matrix is
-            analyzed; set them in analyze().
+        **unused
+            Any other keyword. A setting analyze() takes but factorize() cannot
+            change, such as nemin, supernodal, static_pivot or config, is
+            ignored silently: it was fixed when the matrix was analyzed, and
+            this lets one set of settings go to both calls. Any other name is
+            ignored with an UnusedSettingWarning.
 
         Raises
         ------
@@ -196,7 +243,8 @@ class Solver:
             Input validation failures preserve old factors too.
         """
         self._live()
-        del supernodal, static_pivot  # Chosen in analyze(); see the docstring.
+        _warn_unused('Solver.factorize()',
+                     {name: v for name, v in unused.items() if name not in _analysis_settings()})
         updates = dict(force_cpu=force_cpu,
                        hybrid_cpu=None if hybrid is None else _hybrid_share(hybrid),
                        verbose=verbose, safe_mode=safe_mode, ordering=ordering, mtype=mtype, triangle=triangle, max_front=max_front,
@@ -214,6 +262,7 @@ class Solver:
         if requested not in (Path.AUTO, self.path):
             raise ValueError('Changing path requires new analysis')
         a, changed = self._validated(matrix, options.safe_mode)
+        _warn_unsupported(a)
         # A new pattern needs a new plan. Built before anything is released, so
         # an analysis failure leaves the old factors usable.
         analysis = _symbolic(a, self.path, options) if changed else self._analysis
@@ -263,6 +312,12 @@ class Solver:
         self._row_scale, self._column_scale = left, right
         self._residual_matrix = residual_matrix
         self._refinement_reports = ()
+        if options.refinement_steps == 0 and self._unusable():
+            # Without refinement no solve measures a residual, so this is the
+            # only point where the failure can be reported.
+            warnings.warn('the factors do not approximate the matrix (pivot ratio '
+                          f'{self.quality.pivot_ratio:.1e}); solves will be inaccurate. '
+                          + self._likely_cause(), AccuracyWarning, stacklevel=2)
         return self
 
     def _validated(self, matrix: sparse.spmatrix | None, safe: bool = True) -> tuple[sparse.csc_matrix, bool]:
@@ -329,19 +384,35 @@ class Solver:
             return _equilibrate(a, a.data, self.path == Path.LDLT)
         return a.data, None, None
 
-    def solve(self, b: np.ndarray) -> np.ndarray:
+    def solve(self, b: np.ndarray | sparse.spmatrix, project: np.ndarray | sparse.spmatrix | None = None) -> np.ndarray:
         """Solve A x = b using existing factors.
 
-        b : ndarray, shape (n,)
-            Finite float32, float64, complex64 or complex128 RHS vector.
-        Returns a vector of shape (n,), real when the matrix and b are both
-        real and complex otherwise. Refinement and force_cpu return double
-        precision; otherwise precision follows the wider matrix/RHS dtype.
-        Raises ValueError if factorize has not succeeded or b has invalid shape/type.
-        Inspect refinement_reports: an unconverged best iterate can be returned.
+        b : ndarray of shape (n,), or a SciPy sparse matrix of shape (n, 1)
+            Finite float32, float64, complex64 or complex128 right-hand side.
+            A sparse b that touches few unknowns, such as a port excitation,
+            is solved faster on CPU LDLT factors; the answer is the same.
+        project : ndarray or SciPy sparse matrix of shape (n, q), optional
+            Return W^T x for this W instead of x itself: q weighted sums of the
+            solution, for example the port voltages or the values at chosen
+            unknowns. Plain transpose, never conjugated. See solve_many.
+        Returns x, a vector of shape (n,), or W^T x, of shape (q,), real when the
+        matrix, b and W are all real and complex otherwise. Refinement and
+        force_cpu return double precision; otherwise precision follows the wider
+        matrix/RHS dtype.
+        Raises ValueError if factorize has not succeeded or b or W has an invalid
+        shape or type. Inspect refinement_reports: an unconverged best iterate can
+        be returned, with an AccuracyWarning.
         """
+        if sparse.issparse(b):
+            if b.ndim != 2 or b.shape[1] != 1:
+                raise ValueError('a sparse RHS for solve must have shape (n, 1); use solve_many for more columns')
+            return self.solve_many(b, project=project)[:, 0]
+        if project is not None:
+            # One column through the block route, which owns projections.
+            return self.solve_many(np.asarray(b)[:, None] if np.ndim(b) == 1 else b, project=project)[:, 0]
         started = time.perf_counter() if self._options.verbose else 0.0
         result = self._solve_vector(b)
+        self._route = 'dense'
         if self._options.verbose:
             self._print_summary(np.asarray(b)[:, None], result[:, None], time.perf_counter() - started)
         return result
@@ -360,27 +431,69 @@ class Solver:
                 single=not self._options.force_cpu,
             )
             self._refinement_reports = reports
+            self._warn_accuracy(reports)
             return result[:, 0]
         result = self._solve_scaled(b)
         return result.astype(self._result_dtype(b.dtype), copy=False)
 
-    def solve_many(self, b: np.ndarray) -> np.ndarray:
+    def solve_many(self, b: np.ndarray | sparse.spmatrix, project: np.ndarray | sparse.spmatrix | None = None) -> np.ndarray:
         """Solve A X = B using existing factors.
 
-        b : ndarray, shape (n, nrhs)
-            Finite real or complex RHS columns. Rows are matrix unknowns, not ports.
-        Returns an array with the same shape, real when the matrix and b are
-        both real and complex otherwise; refinement_reports contains one report
-        per column.
-        Zero-column arrays are accepted only after successful factorization.
+        b : ndarray or SciPy sparse matrix of shape (n, nrhs)
+            Finite real or complex RHS columns. Rows are matrix unknowns, not
+            ports. A sparse B whose columns touch few unknowns, such as port
+            excitations, is solved faster on CPU LDLT factors: each column only
+            visits the part of the factors its nonzeros connect to. The answer,
+            its refinement and its warnings are those of the dense route.
+        project : ndarray or SciPy sparse matrix of shape (n, q), optional
+            Return W^T X for this W, of shape (q, nrhs), instead of X. Entry
+            (i, j) is column i of W applied to the solution for column j of B,
+            with the plain transpose, never conjugated. project=B gives the port
+            matrix B^T A^-1 B of a frequency-domain model whose columns of B are
+            the port excitations. With a sparse B and W on CPU LDLT factors
+            whose pivots were not perturbed, no solution is formed at all, which
+            is much faster than solving and projecting, and refinement_reports
+            is then empty, since there is no solution to measure. Everywhere
+            else the solution is refined as usual and then projected.
+        Returns X with the shape of b, or W^T X, real when the matrix, B and W
+        are all real and complex otherwise; refinement_reports contains one
+        report per column of B. Zero-column arrays are accepted only after
+        successful factorization.
         """
         started = time.perf_counter() if self._options.verbose else 0.0
         self._require_factor()
+        w = None if project is None else self._projection(project)
+        self._route = 'dense'
+        # Whether W is B itself: then W^T A^-1 B is formed exactly symmetric.
+        same = w is not None and (project is b or _same_columns(w, b))
+        if sparse.issparse(b):
+            bs = self._sparse_rhs(b)
+            if bs.shape[1] and self._sparse_route_available():
+                result = self._solve_sparse(bs, w, same)
+                if result is not None:
+                    return result
+            b = bs.toarray()
+        x = self._solve_dense_many(b, started if project is None else None)
+        if w is None:
+            return x
+        z = np.asarray(w.T @ x)
+        if same and self.path == Path.LDLT:
+            # B^T A^-1 B of a symmetric matrix is symmetric; the fast route
+            # forms it exactly so, and so does this one.
+            z = (z + z.T) / 2
+        return z.astype(np.result_type(x.dtype, w.dtype), copy=False)
+
+    def _solve_dense_many(self, b: np.ndarray, started: float | None) -> np.ndarray:
+        """Solve the dense block b by the usual route, refined when enabled.
+
+        started is the time the solve began, for the verbose summary, or None
+        to print none (a projection has no solution to summarize).
+        """
         b = self._validate_rhs(b, dimensions=2)
         self._refinement_reports = ()
         if b.shape[1] == 0:
             result = np.empty(b.shape, dtype=self._result_dtype(b.dtype))
-            if self._options.verbose:
+            if self._options.verbose and started is not None:
                 self._print_summary(b, result, time.perf_counter() - started)
             return result
 
@@ -397,9 +510,143 @@ class Solver:
                 single=not self._options.force_cpu,
             )
             self._refinement_reports = reports
-        if self._options.verbose:
+            self._warn_accuracy(reports)
+        if self._options.verbose and started is not None:
             self._print_summary(b, result, time.perf_counter() - started)
         return result
+
+    def _sparse_rhs(self, b: sparse.spmatrix) -> sparse.csc_matrix:
+        """b as finite sorted CSC with n rows, promoted to complex against a
+        complex matrix like a dense right-hand side."""
+        if b.ndim != 2 or b.shape[0] != self.n:
+            raise ValueError('RHS must have n rows and match solve/solve_many dimensions')
+        c = sparse.csc_matrix(b)
+        if c.dtype not in VALUE_TYPES or not np.isfinite(c.data).all():
+            raise ValueError('RHS must contain finite real or complex floating-point values')
+        if np.iscomplexobj(self._a.data) and not np.iscomplexobj(c.data):
+            c = c.astype(np.complex64 if c.dtype == np.float32 else np.complex128)
+        c.sum_duplicates()
+        return c
+
+    def _projection(self, w: np.ndarray | sparse.spmatrix) -> sparse.csc_matrix:
+        """W for project=, as finite sorted CSC of shape (n, q); a 1-D array is one column."""
+        if not sparse.issparse(w):
+            w = np.asarray(w)
+            if w.ndim == 1:
+                w = w[:, None]
+        if w.ndim != 2 or w.shape[0] != self.n:
+            raise ValueError('project must have n rows: an (n, q) array or sparse matrix')
+        c = sparse.csc_matrix(w)
+        if c.dtype not in VALUE_TYPES or not np.isfinite(c.data).all():
+            raise ValueError('project must contain finite real or complex floating-point values')
+        c.sum_duplicates()
+        return c
+
+    def _sparse_route_available(self) -> bool:
+        """Whether the factors can solve sparse columns directly: CPU LDLT
+        factors whose pivots were not perturbed, or refinement switched off."""
+        native = self._native
+        return (isinstance(native, _CpuFactor) and self.path == Path.LDLT
+                and (native.perturbed_pivots == 0 or self._options.refinement_steps == 0))
+
+    def _solve_sparse(self, b: sparse.csc_matrix, w: sparse.csc_matrix | None,
+                      same: bool) -> np.ndarray | None:
+        """X, or W^T X, for sparse b straight from the CPU factors.
+
+        b: the right-hand sides; w: the projection or None; same: whether w is
+        b itself, which halves the work and makes the result exactly
+        symmetric. Returns None when a solve's residual shows it needs
+        refinement, so the caller takes the dense route instead.
+        """
+        native = self._native
+        complex_ = (np.iscomplexobj(self._a.data) or np.iscomplexobj(b.data)
+                    or (w is not None and np.iscomplexobj(w.data)))
+        dtype = np.complex128 if complex_ else np.float64
+        # Factors of R A C: X = C (RAC)^-1 R B, and W^T X = (C W)^T (RAC)^-1 (R B).
+        bs = b if self._row_scale is None else sparse.diags(self._row_scale) @ b
+
+        def _arrays(c: sparse.spmatrix) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            c = sparse.csc_matrix(c)
+            return (np.ascontiguousarray(c.indptr, dtype=np.uintp),
+                    np.ascontiguousarray(c.indices, dtype=np.uintp),
+                    np.ascontiguousarray(c.data, dtype=dtype))
+
+        if w is not None:
+            projection = None
+            if not same:
+                ws = w if self._column_scale is None else sparse.diags(self._column_scale) @ w
+                projection = _arrays(ws)
+            z = np.asarray(native.project(self.n, *_arrays(bs), projection)).T
+            self._refinement_reports = ()
+            self._route = 'sparse'
+            return z.astype(self._result_dtype(np.dtype(dtype)), copy=False)
+        x = np.asarray(native.solve_sparse(self.n, *_arrays(bs))).T
+        if self._column_scale is not None:
+            x = x * self._column_scale[:, None]
+        reports = ()
+        if self._residual_matrix is not None:
+            # One residual per column confirms what refinement would have:
+            # the CPU factors in double precision normally meet the target
+            # outright. If not, the dense route refines from scratch.
+            dense_b = b.toarray()
+            residual = dense_b - self._residual_matrix @ x
+            size = np.linalg.norm(dense_b, axis=0)
+            measured = np.linalg.norm(residual, axis=0) / np.where(size > 0, size, 1.0)
+            if not (measured <= self._options.refinement_rtol).all():
+                return None
+            reports = tuple(RefinementReport(RefinementStatus.CONVERGED, 0, float(r), float(r), (float(r),), math.nan)
+                            for r in measured)
+        self._refinement_reports = reports
+        self._route = 'sparse'
+        return x.astype(self._result_dtype(np.dtype(dtype)), copy=False)
+
+    def _unusable(self) -> bool:
+        """Whether the quality verdict of the new factors is 'unusable'. A
+        backend that cannot report one is taken at its word."""
+        try:
+            return self.quality.verdict == 'unusable'
+        except AttributeError:
+            return False
+
+    def _warn_accuracy(self, reports: tuple[RefinementReport, ...]) -> None:
+        """Warn with an AccuracyWarning when refinement left any column short
+        of refinement_rtol, saying by how much and why it probably happened.
+
+        reports: the refinement reports of the solve just finished.
+        """
+        short = [r for r in reports if r.status.value not in ('converged', 'unrefined')]
+        if not short:
+            return
+        worst = max(short, key=lambda r: r.relative_residual if math.isfinite(r.relative_residual) else math.inf)
+        columns = f'{len(short)} of {len(reports)} right-hand sides' if len(reports) > 1 else 'the solve'
+        message = (f'{columns} did not reach the requested accuracy: relative residual '
+                   f'{worst.relative_residual:.1e} against refinement_rtol '
+                   f'{self._options.refinement_rtol:.0e} (refinement {worst.status.value} after '
+                   f'{worst.corrections} corrections). ')
+        warnings.warn(message + self._likely_cause(), AccuracyWarning, stacklevel=3)
+
+    def _likely_cause(self) -> str:
+        """The most likely reason the factors are inaccurate, and what to try."""
+        native = self._require_factor()
+        perturbed = native.perturbed_pivots
+        single = not self._options.force_cpu
+        zeros = _negligible_diagonal(self._a)
+        parts = []
+        if perturbed:
+            parts.append(f'The factorization replaced {perturbed} pivot(s) that were zero or too '
+                         'small to divide by, so the factors are of a perturbed matrix.')
+        if perturbed and zeros:
+            parts.append(f'The matrix has {zeros} zero or negligible diagonal entries. SPARTA chooses pivots '
+                         'within one front at a time, so a zero diagonal entry whose pivot partner '
+                         'was ordered into another front cannot be eliminated exactly; this happens '
+                         'with saddle-point and mixed formulations. A small value on those diagonal '
+                         'entries (regularization) usually avoids it.')
+        else:
+            parts.append('The matrix is probably singular, or too ill-conditioned for '
+                         f'{"single" if single else "double"} precision.')
+        if single:
+            parts.append('Factoring in complex128 on the CPU (force_cpu=True) may reach the accuracy.')
+        return ' '.join(parts)
 
     def _result_dtype(self, rhs: np.dtype) -> np.dtype:
         """Return the dtype a solve with a right-hand side of dtype rhs returns.
@@ -574,6 +821,9 @@ class Solver:
             'factorized': self._native is not None,
             'reanalyses': self._reanalyses,
             'refinement_reports': [asdict(report) for report in self.refinement_reports],
+            # How the latest solve ran: 'sparse' straight from the factors for
+            # sparse right-hand sides, or 'dense'.
+            'solve_route': getattr(self, '_route', None),
         }
 
 

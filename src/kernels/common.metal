@@ -76,6 +76,67 @@ float2 cdiv(float2 a, float2 b) {
     float d = b.y + b.x * r;
     return float2((a.x * r + a.y) / d, (a.y * r - a.x) / d);
 }
+// The working scalar of the LDL^T factor kernels: what a front, its panel
+// workspace and its contribution block hold. The source is compiled twice, the
+// second time with SPARTA_REAL set, and that copy runs the fronts whose values
+// are all real (Config::real_split). A real front occupies the first half of
+// its complex slot, so every offset stays in complex elements and is applied
+// before the pointer is cast to `T`.
+//
+// Everything outside the fronts keeps its complex layout in both copies --
+// the input values, the block diagonal and the factor store -- so the solve
+// and the hybrid hand-over never see a real front. `narrow` and `widen` are
+// the only ways across. Scalar to vector conversion is implicit in Metal and
+// replicates the scalar, so a real value written to complex storage without
+// `widen` would silently become (v, v).
+//
+// The second copy includes only common, assembly, ldlt_factor and
+// ldlt_update; build.rs fences the other files off.
+#ifndef SPARTA_REAL
+#define SPARTA_REAL 0
+#endif
+#if SPARTA_REAL
+typedef float T;
+#else
+typedef float2 T;
+#endif
+float mul(float a, float b) {
+    return a * b;
+}
+float mag(float a) {
+    return abs(a);
+}
+float cdiv(float a, float b) {
+    return a / b;
+}
+static T narrow(float2 v) {
+#if SPARTA_REAL
+    return v.x;
+#else
+    return v;
+#endif
+}
+static float2 widen(T v) {
+#if SPARTA_REAL
+    return float2(v, 0);
+#else
+    return v;
+#endif
+}
+// The working scalar holding the real number `v`.
+static T from_real(float v) {
+#if SPARTA_REAL
+    return v;
+#else
+    return float2(v, 0);
+#endif
+}
+static bool finite(float2 v) {
+    return all(isfinite(v));
+}
+static bool finite(float v) {
+    return isfinite(v);
+}
 // Upper bound on SIMD groups in one threadgroup, sizing every reduction's
 // scratch. 1024 threads is the Metal maximum and 32 the Apple SIMD width, so a
 // threadgroup never holds more than this many SIMD groups however wide the host
@@ -119,12 +180,12 @@ float2 cdiv(float2 a, float2 b) {
 // Replacement for a pivot that has genuinely died, keeping its phase when it has
 // one so the perturbation scales the original entry rather than pointing
 // somewhere new. `dead` is only ever reached from a previously fatal branch.
-static float2 floor_pivot(float2 d, float floor) {
+static T floor_pivot(T d, float floor) {
     float v = mag(d);
-    return v > 0 ? d * (floor / v) : float2(floor, 0);
+    return v > 0 ? d * (floor / v) : from_real(floor);
 }
 // A pivot the factorization cannot divide by at all.
-static bool pivot_dead(float2 d) {
+static bool pivot_dead(T d) {
     return !(mag(d) > 0);
 }
 // Static pivoting (Config::static_pivot). `tiny` is absolute: the setting times
@@ -133,7 +194,7 @@ static bool pivot_dead(float2 d) {
 // it by floor_pivot, keeping its phase. Unlike PIVOT_FLOOR this is relative to
 // the original matrix, so it stays far below every legitimate pivot (1e-12 by
 // default) and catches only pivots that would otherwise blow up the factor.
-static bool pivot_tiny(float2 d, float tiny) {
+static bool pivot_tiny(T d, float tiny) {
     float v = mag(d);
     return v > 0 && v < tiny;
 }
@@ -228,7 +289,7 @@ static void reduce_argmax(float v, uint idx, threadgroup float* fs, threadgroup 
 // to barely moves it. Do not re-widen this loop expecting a numerical change;
 // the reason it is narrow is that the cadence above must not be able to reach
 // it. It is also the cheaper sweep, m*n rather than m*m.
-static float front_scale(device const float2* a, uint m, uint n, uint lane, uint threads,
+static float front_scale(device const T* a, uint m, uint n, uint lane, uint threads,
                          threadgroup float* scratch, uint sg, uint sl, uint simds) {
     float big = 0;
     for (uint idx = lane; idx < m * n; idx += threads) {

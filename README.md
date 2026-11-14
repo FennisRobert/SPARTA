@@ -75,7 +75,8 @@ SPARTA can be used from **Rust**, **Python**, and **C or C++**.
 
 10. [Building from source](#building-from-source)
 11. [Development](#development)
-12. [Credits and licence](#credits-and-licence)
+12. [Contributing](#contributing)
+13. [Credits and licence](#credits-and-licence)
 
 # Getting started
 
@@ -241,7 +242,7 @@ pip downloads its build helper (maturin), NumPy and SciPy from PyPI.
 no compiler, no source code needed.
 
 ```sh
-pip install sparta_solver-0.3.5-cp39-abi3-macosx_11_0_arm64.whl
+pip install sparta_solver-0.3.6-cp39-abi3-macosx_11_0_arm64.whl
 ```
 
 One wheel works for every Python from 3.9 up, on Apple Silicon only. To make a
@@ -596,6 +597,90 @@ sparta_solve_many(solver, b, x, nrhs);        /* complex b, columns end to end a
 sparta_solve_many_real(solver, b, x, nrhs);   /* real b against real factors */
 ```
 
+### Port matrices and sparse right-hand sides
+
+In a frequency sweep you often don't need the full solution, only a few
+numbers taken from it: the port matrix of the model, or the field at a few
+chosen unknowns. SPARTA computes those directly.
+
+- **B: what you excite.** An `n × p` sparse matrix with one column per
+  excitation, such as one port. Each column is nonzero only on the unknowns of
+  that port.
+- **W: what you measure.** An `n × q` sparse matrix with one column per
+  quantity, each a weighted sum of unknowns.
+
+The result is `Wᵀ A⁻¹ B`, a small `q × p` matrix. Entry `(i, j)` is
+measurement `i` when column `j` of B is excited. The transpose is plain,
+never conjugated. With `W = B` it is the port matrix `Bᵀ A⁻¹ B`. With one
+column per chosen unknown (a 1 in its row) it gives the values of the
+solution there.
+
+**Python**
+
+```python
+X = F.solve_many(B)              # B may be SciPy sparse: the full n x p solution, faster
+Z = F.solve_many(B, project=B)   # the p x p port matrix B^T A^-1 B
+V = F.solve_many(B, project=W)   # W^T A^-1 B, q x p
+v = F.solve(b, project=W)        # one right-hand side: W^T x, length q
+```
+
+**Rust**
+
+```rust
+use sparta::SparseColumns;
+// CSC arrays, numbered as the matrix: column j has rows[ptr[j]..ptr[j+1]].
+let b = SparseColumns::new(n, &ptr, &rows, &values)?;
+let x = solver.solve_sparse(&b)?;              // n values per column, end to end
+let z = solver.solve_projected(&b, None)?;     // B^T A^-1 B, p x p, column-major
+let v = solver.solve_projected(&b, Some(&w))?; // W^T A^-1 B, q x p, column-major
+```
+
+**How it runs.** On CPU `LDLᵀ` factors, a column of B only reaches the part of
+the factorization connected to its nonzeros: the fronts on the path from its
+unknowns to the root of the elimination tree. A projection then needs that
+part alone. It forms no solution at all, does no backward sweep, and never
+builds an `n × p` block. Everywhere else (the GPU, the hybrid factorization,
+LU) SPARTA solves as usual and projects the solution, so the answer is the
+same, just not faster. `F.diagnostics()['solve_route']` says which way the
+latest solve went: `'sparse'` or `'dense'`.
+
+**Accuracy.** Projections are as trustworthy as an ordinary solve:
+- **CPU factors:** in Python the fast route is taken only when no pivot was
+  perturbed, and SPARTA's double-precision factors then need no refinement.
+- **Sparse solve without `project`:** it measures its residual and refines on
+  the usual route if that falls short of `refinement_rtol`. Reports and
+  warnings are exactly those of a dense solve.
+- **Fast projection:** it forms no solution, so `refinement_reports` is empty.
+- **Exact symmetry:** `project=B` on a symmetric matrix returns an exactly
+  symmetric result on every route.
+
+**What it saves.** Measured on the CPU (M4 Pro, complex128), with ports of six
+unknowns each:
+
+| System | Ports | `B.T @ solve_many(B)` | `solve_many(B, project=B)` | Speedup | Including the factorization |
+|---|---|---|---|---|---|
+| 109k unknowns | 4 | 0.030 s | 0.010 s | 3× | 1.06× |
+| 109k unknowns | 100 | 0.363 s | 0.028 s | 13× | 2.0× |
+| 887k unknowns | 20 | 0.782 s | 0.126 s | 6× | 1.13× |
+| 887k unknowns | 100 | 7.64 s | 0.20 s | 38× | 2.5× |
+
+The more ports, the more it pays. With a handful of ports the factorization
+dominates either way.
+
+**Coming from a dedicated port-matrix API.** Some solvers offer
+`port_matrix(B)`, `solve_sparse(B)` and a "reach" query as separate calls. In
+SPARTA:
+
+| Elsewhere | SPARTA |
+|---|---|
+| `port_matrix(B)` | `solve_many(B, project=B)`; Rust `solve_projected(&b, None)` |
+| `solve_sparse(B)` | `solve_many(B)` with a sparse B; Rust `solve_sparse(&b)` |
+| A reach query, to decide whether the sparse route pays | Not needed: SPARTA chooses the route, and `diagnostics()['solve_route']` reports it |
+
+Unlike such calls, these work on every factorization (GPU and LU included).
+They also take a separate `W` as well as `B`. C, Julia and MATLAB don't expose
+them yet.
+
 ## Configuration
 
 Most users need no settings at all: the defaults are measured, and the ones
@@ -629,7 +714,9 @@ F = sparta.analyze(A, config=config)    # keyword arguments still override the c
 
 The solve-behaviour settings, `force_cpu` and `hybrid` can also be passed to
 `factorize`, to change them for an existing solver. Everything else is fixed
-when the matrix is analyzed.
+when the matrix is analyzed, and `factorize` ignores it, so one settings dict
+can go to both calls. An unknown keyword never stops a run: `analyze`,
+`factorize` and `Config.with_` ignore it with a `sparta.UnusedSettingWarning`.
 
 **C:** fill a `sparta_config` with `sparta_config_default` or
 `sparta_config_preset`, change fields, and pass it to `sparta_analyze`.
@@ -666,6 +753,7 @@ double, and `enum` is one of the named choices.
 | `hybrid_cpu` | float64 | `0.0` | Share of the work the CPU does alongside the GPU; `hybrid=True` in Python. Metal only. |
 | `lu_diag_threshold` | float64 | `0.0` | LU only. How strongly to prefer the diagonal as pivot. |
 | `supernodal` | bool | `True` | LDLT only. Supernodal factorization: no frontal matrices on the CPU, half-size trailing blocks on the GPU. Faster and less memory; `False` is the multifrontal route. Ignored by LU and Vulkan. |
+| `real_split` | bool | `True` | Complex LDLT. Factors the parts of the matrix that have no imaginary entries in real arithmetic, which is faster. Same ordering and same answer. On the CPU it needs `supernodal` and also saves memory. On the GPU the solver times one factorization with it and one without and keeps the faster. |
 | `static_pivot` | float64 | `1e-12` | LDLT only. Pivots smaller than this, relative to the largest matrix entry, are raised to it. `0` replaces exact zeros only. Ignored by LU and Vulkan. |
 | **CPU backend** (Python and Rust) | | | |
 | `cpu_panel` | uint64 | `32` | Pivots per panel before an update. |
@@ -990,6 +1078,24 @@ for r in F.refinement_reports:
 `estimated_relative_error` estimates the error in x itself, which is usually
 the number you actually care about.
 
+SPARTA is built for FEM systems such as curl-curl and Helmholtz problems,
+whose diagonal is nonzero. A matrix with zero diagonal entries (saddle-point,
+Lagrange-multiplier or mixed formulations) is not supported yet: `factorize()`
+issues a `sparta.UnsupportedMatrixWarning`, because such a matrix can come out
+inaccurate or fail even when well conditioned.
+
+When refinement does not reach `refinement_rtol`, the solve also issues a
+`sparta.AccuracyWarning`. It says how far off the answer is and why that most
+likely happened: a singular or ill-conditioned matrix, or zero diagonal
+entries whose pivot partner sits in another front, which SPARTA cannot pivot
+across. Turn it into an error with
+`warnings.simplefilter('error', sparta.AccuracyWarning)`.
+
+A singular matrix fails `factorize()` with an error that names the unknown, in
+your numbering, whose pivot broke down, for example `factorization failed at
+unknown 40 ...: zero column (rank deficient). The matrix is singular...`. The
+same text reaches Rust (`Error::Pivot`'s `unknown`), C and Julia.
+
 To check an answer yourself, compute the residual in double precision:
 
 ```python
@@ -1252,6 +1358,14 @@ examples/            benchmark and analysis programs
 tools/               converters, accuracy benchmarks, matrix sync
 tests/               Rust tests and the Python GPU suite
 ```
+
+## Contributing
+
+This repository does not accept pull requests. It is published from a private
+development repository, so changes made here cannot be merged back. To request
+a feature or report a problem, open an
+[issue](https://github.com/FennisRobert/SPARTA/issues) or start a
+[discussion](https://github.com/FennisRobert/SPARTA/discussions).
 
 ## Credits and licence
 

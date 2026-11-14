@@ -152,3 +152,69 @@ fn factors_and_solves_on_the_gpu() {
         assert!(r < 1e-4, "{name}: relative residual {r:.3e}");
     }
 }
+
+#[test]
+/// `Config::real_split` on the GPU: fronts with all-real values run on the
+/// real copy of the LDL^T kernels and hand their contribution blocks to
+/// complex parents. Patches of complex entries in different places of a
+/// curl-curl grid put the boundary between the two at the leaves, in the
+/// middle of the tree and at the root, through every front route. Each patch
+/// is factored four times on one solver, which runs both arms of the timing
+/// trial that decides whether to keep the split and then its decision, and
+/// every factorization must solve as accurately as with the split off.
+fn real_fronts_hand_over_to_complex_ones() {
+    if !sparta::gpu_available() {
+        return;
+    }
+    let (n, ptr, rows, values) = sparta_matgen::curl_curl(&[8, 8, 8], 1.0, 0.1);
+    let side = 8 * 8;
+    let patches: [&dyn Fn(usize) -> bool; 4] = [
+        &|i| i < side / 2,
+        &|i| i >= n - side,
+        &|_| false,
+        &|_| true,
+    ];
+    let b: Vec<Complex32> = (0..n)
+        .map(|i| Complex32::new(1.0 + (i % 7) as f32, (i % 3) as f32 - 1.0))
+        .collect();
+    let routes = [
+        Config::default(),
+        // Every front wide: the panel route alone.
+        Config { small_front_rows: 1, narrow_cols: 1, ..Config::default() },
+        // Every front on the serial small-front route.
+        Config { small_front_rows: 100_000, ..Config::default() },
+    ];
+    for (route, config) in routes.into_iter().enumerate() {
+        let plan = Analysis::ldlt(n, &ptr, &rows, &config).unwrap();
+        let mut split = Solver::new(plan.clone()).unwrap();
+        let off = Config { real_split: false, ..config.clone() };
+        let mut whole = Solver::new(Analysis::ldlt(n, &ptr, &rows, &off).unwrap()).unwrap();
+        for (p, patch) in patches.iter().enumerate() {
+            // A complex entry only between two patch unknowns, as at a port.
+            let mut col = 0;
+            let lower: Vec<Complex32> = values
+                .iter()
+                .enumerate()
+                .map(|(k, v)| {
+                    while ptr[col + 1] <= k {
+                        col += 1;
+                    }
+                    let im = if patch(rows[k]) && patch(col) { v.im as f32 } else { 0.0 };
+                    Complex32::new(v.re as f32, im)
+                })
+                .collect();
+            whole.factor(&lower).unwrap();
+            let want = whole.solve(&b).unwrap();
+            for rep in 0..4 {
+                split
+                    .factor(&lower)
+                    .unwrap_or_else(|e| panic!("route {route} patch {p} rep {rep}: {e}"));
+                let x = split.solve(&b).unwrap();
+                let r = residual(&ptr, &rows, &lower, true, &x, &b);
+                assert!(r < 1e-4, "route {route} patch {p} rep {rep}: residual {r:.3e}");
+                let gap = residual(&ptr, &rows, &lower, true, &x, &b) - residual(&ptr, &rows, &lower, true, &want, &b);
+                assert!(gap.abs() < 1e-4, "route {route} patch {p} rep {rep}: {gap:.3e} from the unsplit residual");
+            }
+        }
+    }
+}

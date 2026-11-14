@@ -42,7 +42,7 @@ All numeric tolerances below are dimensionless.
 | `ordering` | `None` | Fill-reducing ordering. `Ordering.SCALPEL` is the only one; `None` takes it from `config`. Other enum choices are reserved. |
 | `mtype` | `MatrixType.AUTO` | Declared mathematical structure; see routing table. Declarations are checked. |
 | `path` | `Path.AUTO` | Automatic routing or explicit LU/LDLT. An override must be mathematically compatible with the matrix. |
-| `triangle` | `"full"` | Full storage reads both triangles. `"lower"` uses only the lower triangle and interprets it as transpose-symmetric; only LDLT supports it. |
+| `triangle` | `"full"` | Full storage reads both triangles. `"lower"` uses only the lower triangle and interprets it as transpose-symmetric; only LDLT supports it. With `"lower"`, a matrix that has nonzero entries above the diagonal raises ValueError instead of having them ignored. |
 | `max_front` | `None` | Optional positive maximum front size in rows. Analysis fails if exceeded. None means no user cap, not unlimited GPU memory. |
 | `equilibrate` | `False` | Balance row/column magnitudes before converting factors to complex64. Adds CPU work and memory. Recomputed on each factorization. Not always faster or more accurate. |
 | `refinement_steps` | `-1` | Correction solves per RHS after the initial solve: `-1` for as many as `refinement_rtol` needs (ceiling 50), `0` to disable refinement, positive for a hard cap that also stops early at the target. Refinement retains the original matrix in complex128. |
@@ -71,8 +71,12 @@ keep the current value. Numerical options (`equilibrate`, `refinement_steps`,
 `refinement_rtol`, `refinement_minimize`) can change and persist. Analysis options
 (`ordering`, `mtype`, `path`, `triangle`, `max_front`) can be repeated unchanged,
 so `factorize(**settings)` works. Changing them requires a new analyze call.
-`supernodal` and `static_pivot` are accepted and ignored, for the same reason:
-both are fixed by analyze.
+Any other keyword is accepted. A setting that `analyze()` takes, such as
+`nemin`, `supernodal`, `static_pivot` or `config`, is ignored silently, since
+analysis fixed it. Any other name is ignored with a `sparta.UnusedSettingWarning`.
+`analyze()` and `Config.with_()` likewise ignore unknown names with that warning,
+so settings written for another SPARTA version never stop a run. Values of known
+settings are still validated.
 `Path.AUTO` also accepts the already selected path; it does not reselect it.
 
 Invalid input/options preserve an existing factorization. A failure during GPU
@@ -81,7 +85,7 @@ factorization clears old refinement reports. Refactorization is performed even
 when only refinement options change; configure those options before factorizing
 when avoiding unnecessary work matters.
 
-## F.solve(b) → x and F.solve_many(B) → X
+## F.solve(b, project=None) → x and F.solve_many(B, project=None) → X
 
 `solve` takes one finite vector of length n. `solve_many` takes an `(n, nrhs)` array
 with RHS vectors in **columns**, not rows. Both accept float32/float64/complex64/
@@ -92,6 +96,34 @@ rather than one sweep each, and refinement corrects them together, with columns
 leaving the batch as they converge. A bare eight-column block measured 4x-6x
 faster than eight separate solves. Results are unchanged beyond the usual
 float-atomic nondeterminism.
+
+**Sparse right-hand sides.** `b` may also be a SciPy sparse matrix: shape
+`(n, 1)` for `solve`, `(n, nrhs)` for `solve_many`. The result is the same
+dense solution. On CPU LDLT factors it is computed faster: each column only
+visits the part of the factors its nonzeros connect to. The solve then checks
+its own residual and refines on the usual route if that falls short, so
+`refinement_reports` and `AccuracyWarning` behave exactly as for a dense
+right-hand side.
+
+**Projections.** `project=W`, an `(n, q)` array or sparse matrix, returns
+`W.T @ X` instead of `X`: shape `(q, nrhs)` from `solve_many`, `(q,)` from
+`solve`. The transpose is plain, never conjugated. A 1-D `W` is one column.
+- `project=B` gives the port matrix `B.T @ A⁻¹ @ B` of a frequency-domain
+  model whose columns of `B` are the port excitations. On a symmetric
+  matrix it is exactly symmetric on every route.
+- With a sparse `B` and `W` on CPU LDLT factors whose pivots were not
+  perturbed (or with `refinement_steps=0`), no solution is formed at all.
+  Two forward sweeps restricted to the columns' reach, and one small product
+  per front they share, replace the full solve. `refinement_reports` is then
+  empty, since there is no solution to measure.
+- Elsewhere (GPU, hybrid, LU, perturbed pivots) the solution is refined as
+  usual and then projected: the same answer, with the usual reports and
+  warnings.
+
+`F.diagnostics()['solve_route']` reports which way the latest solve went,
+`'sparse'` or `'dense'`. See "Port matrices and sparse right-hand sides" in
+the README for measured gains, and for how `port_matrix(B)` and
+`solve_sparse(B)` calls from other solvers map onto these.
 
 An unconverged refinement returns its best accepted finite iterate. Inspect:
 
@@ -106,6 +138,57 @@ Reports contain the initial and final relative residual, attempted correction
 count, residual history, and a `converged` property. History can include a rejected
 final correction. An invalid initial numerical result raises FloatingPointError.
 A small residual does not guarantee a small field-vector or S-parameter error.
+
+## When something goes wrong
+
+SPARTA either solves accurately, raises an error that says why, or warns.
+
+- **Matrices with zero diagonal entries are not supported yet** and give a
+  `sparta.UnsupportedMatrixWarning` from `factorize()`, before any solve.
+  SPARTA is built for FEM systems such as curl-curl and Helmholtz problems,
+  whose diagonal is nonzero. Saddle-point, Lagrange-multiplier and mixed
+  formulations put zeros on the diagonal, and factoring those needs pivots
+  taken across fronts, which SPARTA does not do yet. Some still solve; others
+  come out inaccurate or fail, even when well conditioned. The warning counts
+  diagonal entries that are zero, missing, or below 1e-12 times the largest
+  entry in their row and column, so a badly scaled matrix does not trigger it.
+  It is a subclass of `AccuracyWarning`.
+- **Bad input raises ValueError or TypeError** before anything is factored:
+  - an empty or non-square matrix, or one that is not a SciPy sparse matrix;
+  - NaN or inf values, including a NaN in only the imaginary part;
+  - on the GPU, values beyond the complex64 range (about 3.4e38);
+  - a right-hand side of the wrong length or with NaN;
+  - a declared symmetry the matrix does not have;
+  - entries above the diagonal with `triangle="lower"`.
+- **A singular matrix raises RuntimeError naming the unknown**, in your own
+  numbering, whose pivot failed. The message says what that means. For
+  example, `factorization failed at unknown 40 (front 0, column 1): zero column
+  (rank deficient). The matrix is singular: this unknown's equation is zero or
+  a combination of others...`. Typical causes are an unconstrained unknown, a
+  missing boundary condition, or a frequency at a resonance. Overflow and
+  precision breakdowns say so too, and suggest complex128 on the CPU.
+- **An inaccurate answer gives an `AccuracyWarning`.** This happens when
+  refinement could not reach `refinement_rtol`, or, with refinement off, when
+  the factors do not approximate the matrix. The warning gives the residual
+  reached, the number of perturbed pivots, and the most likely cause:
+  - a singular or ill-conditioned matrix, with a hint to try complex128 on the
+    CPU when the GPU was used;
+  - or zero diagonal entries whose pivot partner sits in another part of the
+    elimination tree. SPARTA chooses pivots within one front and does not delay
+    them to a later one, so saddle-point and mixed formulations with a zero
+    diagonal block can fail this way even when well conditioned. A small value
+    on those diagonal entries usually avoids it.
+
+  The answer is still returned, because it may be useful, for example as a
+  preconditioner. To stop instead:
+
+  ```python
+  import warnings
+  warnings.simplefilter('error', sparta.AccuracyWarning)
+  ```
+
+`tools/pathology_bench.py` checks all of this on a catalogue of over 50 broken,
+singular and hard matrices on every route (CPU, GPU, multifrontal, hybrid).
 
 ## Matrix types and factorization paths
 
@@ -352,6 +435,29 @@ LU ignores it.
 
 ```python
 solver = sparta.analyze(A, force_cpu=True, supernodal=False).factorize()  # multifrontal
+```
+
+`real_split`, on by default, factors the real part of a complex LDLT in real
+arithmetic on the CPU. In many FEM models only the port and boundary unknowns
+have complex entries. Every branch of the elimination tree that never meets
+one has a real factor, so it is factored and stored as real numbers. The rest
+stays complex. The ordering, the fill and the solution are unchanged. On the
+EMerge systems in `test_matrices` (M4 Pro, complex128) the factorization is
+1.1-1.8x faster and peak memory is 12-28% lower. On the CPU it needs
+`supernodal`. Real matrices, LU and `hybrid_cpu` ignore it.
+
+On the GPU the gain is smaller and not guaranteed. A level of the tree with
+both real and complex parts is processed twice, once for each, and on small
+systems that costs more than the real arithmetic saves. So the GPU solver
+decides by measuring. The first factorization uses the split, the second runs
+without it and the third with it, and every factorization after that uses
+whichever of the two was faster. The split is kept only if it saves at least
+2%. On the same systems (complex64) it was kept on the two largest, at 1.2x
+faster, and dropped on the two smaller ones. `SPARTA_PROFILE=1` prints the
+decision.
+
+```python
+solver = sparta.analyze(A, force_cpu=True, real_split=False).factorize()  # all complex
 ```
 `threads=n` runs the solver's analysis, factorization and solves on a pool of
 its own `n` threads instead of the process-wide pool that `RAYON_NUM_THREADS`

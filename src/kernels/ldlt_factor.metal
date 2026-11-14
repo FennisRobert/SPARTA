@@ -9,16 +9,16 @@
 //
 // Pivots are confined to the fully summed columns. A pivot that has died is
 // floored rather than failed on -- see the perturbation policy in common.
-void swap_pivot(device float2* a, uint m, uint p, uint q, device uint* perm) {
+void swap_pivot(device T* a, uint m, uint p, uint q, device uint* perm) {
     if (p == q)
         return;
     for (uint j = 0; j < m; j++) {
-        float2 t = a[p * m + j];
+        T t = a[p * m + j];
         a[p * m + j] = a[q * m + j];
         a[q * m + j] = t;
     }
     for (uint i = 0; i < m; i++) {
-        float2 t = a[i * m + p];
+        T t = a[i * m + p];
         a[i * m + p] = a[i * m + q];
         a[i * m + q] = t;
     }
@@ -37,18 +37,18 @@ kernel void factor_nodes(
     device uint* perms [[buffer(10)]], device uint* two [[buffer(11)]],
     device uint* status [[buffer(12)]], constant uint2& range [[buffer(14)]],
     device FrontState* state [[buffer(15)]], device const float* statics [[buffer(21)]],
-    uint tid [[thread_position_in_grid]]) {
+    device const uint* real [[buffer(22)]], uint tid [[thread_position_in_grid]]) {
     if (tid >= range.y)
         return;
     float tiny = statics[0];
     uint s = ids[range.x + tid];
     Node node = nodes[s];
     uint m = node.nr, n = node.nc;
-    device float2* a = fronts + node.offset;
+    device T* a = (device T*)(fronts + node.offset);
     device uint* perm = perms + node.first;
     status[s] = 0;
     for (uint i = 0; i < m * m; i++)
-        a[i] = float2(0);
+        a[i] = T(0);
     for (uint i = 0; i < n; i++) {
         perm[i] = i;
         two[node.first + i] = 0;
@@ -57,8 +57,8 @@ kernel void factor_nodes(
     for (uint e = 0; e < node.nentries; e++) {
         Entry entry = entries[node.entries + e];
         uint i = entry.position / m, j = entry.position % m;
-        a[i * m + j] = values[entry.source];
-        a[j * m + i] = values[entry.source];
+        a[i * m + j] = narrow(values[entry.source]);
+        a[j * m + i] = narrow(values[entry.source]);
     }
     for (uint c = 0; c < node.count; c++) {
         Child child = children[node.children + c];
@@ -68,13 +68,17 @@ kernel void factor_nodes(
             return;
         }
         uint tail = cn.nr - cn.nc;
-        // `soffset`/`sld` locate the block whether or not it was compacted.
-        // Only its lower triangle is kept (SPARTA_LOWER); this serial kernel
-        // works on the whole square, so it mirrors as it adds.
+        // child_block locates the block whether or not it was compacted, and
+        // a real child's is widened as in assemble_children. Only its lower
+        // triangle is kept (SPARTA_LOWER); this serial kernel works on the
+        // whole square, so it mirrors as it adds.
+        bool widened = !SPARTA_REAL && real[child.node] != 0;
+        device const T* source = child_block<T>(fronts, cn);
+        device const float* reals = child_block<float>(fronts, cn);
         for (uint i = 0; i < tail; i++)
             for (uint j = 0; j <= i; j++) {
                 uint mi = maps[child.map + i], mj = maps[child.map + j];
-                float2 v = fronts[cn.soffset + i * cn.sld + j];
+                T v = widened ? from_real(reals[i * cn.sld + j]) : source[i * cn.sld + j];
                 a[mi * m + mj] += v;
                 if (i != j)
                     a[mj * m + mi] += v;
@@ -125,7 +129,7 @@ kernel void factor_nodes(
         }
         if (md >= 0.6403882f * mo || k + 1 == n) {
             swap_pivot(a, m, k, pd, perm);
-            float2 raw = a[k * m + k], d = raw;
+            T raw = a[k * m + k], d = raw;
             if (pivot_dead(raw)) {
                 if (pfloor < 0) {
                     float big = 0;
@@ -143,12 +147,12 @@ kernel void factor_nodes(
                 a[k * m + k] = d;
                 bumped++;
             }
-            diagonal[node.first + k] = d;
+            diagonal[node.first + k] = widen(d);
             for (uint i = k + 1; i < m; i++)
                 a[i * m + k] = cdiv(a[i * m + k], d);
             for (uint i = k + 1; i < m; i++)
                 for (uint j = k + 1; j <= i; j++) {
-                    float2 v = a[i * m + j] - mul(mul(a[i * m + k], d), a[j * m + k]);
+                    T v = a[i * m + j] - mul(mul(a[i * m + k], d), a[j * m + k]);
                     a[i * m + j] = v;
                     a[j * m + i] = v;
                 }
@@ -157,11 +161,11 @@ kernel void factor_nodes(
             // po < qo, so swapping po with k cannot displace qo.
             swap_pivot(a, m, k, po, perm);
             swap_pivot(a, m, k + 1, qo, perm);
-            float2 da = a[k * m + k], db = a[(k + 1) * m + k], dc = a[(k + 1) * m + k + 1];
+            T da = a[k * m + k], db = a[(k + 1) * m + k], dc = a[(k + 1) * m + k + 1];
             float scale = max(mag(da), max(mag(db), mag(dc)));
-            float2 aa = da / scale, bb = db / scale, cc = dc / scale,
+            T aa = da / scale, bb = db / scale, cc = dc / scale,
                    det = mul(aa, cc) - mul(bb, bb);
-            if (!all(isfinite(det))) {
+            if (!finite(det)) {
                 status[s] = PIVOT_NONFINITE | (k + 1);
                 return;
             }
@@ -178,46 +182,46 @@ kernel void factor_nodes(
                     status[s] = PIVOT_TINY_2X2 | (k + 1);
                     return;
                 }
-                float2 d = pivot_dead(da) ? floor_pivot(da, pfloor)
+                T d = pivot_dead(da) ? floor_pivot(da, pfloor)
                          : pivot_tiny(da, tiny) ? floor_pivot(da, tiny) : da;
                 a[k * m + k] = d;
-                diagonal[node.first + k] = d;
+                diagonal[node.first + k] = widen(d);
                 bumped += uint(pivot_dead(da) || pivot_tiny(da, tiny));
                 for (uint i = k + 1; i < m; i++)
                     a[i * m + k] = cdiv(a[i * m + k], d);
                 for (uint i = k + 1; i < m; i++)
                     for (uint j = k + 1; j <= i; j++) {
-                        float2 v = a[i * m + j] - mul(mul(a[i * m + k], d), a[j * m + k]);
+                        T v = a[i * m + j] - mul(mul(a[i * m + k], d), a[j * m + k]);
                         a[i * m + j] = v;
                         a[j * m + i] = v;
                     }
                 k++;
                 continue;
             }
-            diagonal[node.first + k] = da;
-            diagonal[node.first + k + 1] = dc;
-            subdiag[node.first + k] = db;
+            diagonal[node.first + k] = widen(da);
+            diagonal[node.first + k + 1] = widen(dc);
+            subdiag[node.first + k] = widen(db);
             two[node.first + k] = 1;
             for (uint i = k + 2; i < m; i++) {
-                float2 x = a[i * m + k] / scale, y = a[i * m + k + 1] / scale;
+                T x = a[i * m + k] / scale, y = a[i * m + k + 1] / scale;
                 a[i * m + k] = cdiv(mul(x, cc) - mul(y, bb), det);
                 a[i * m + k + 1] = cdiv(mul(y, aa) - mul(x, bb), det);
             }
             for (uint i = k + 2; i < m; i++)
                 for (uint j = k + 2; j <= i; j++) {
-                    float2 li = a[i * m + k], ri = a[i * m + k + 1], lj = a[j * m + k],
+                    T li = a[i * m + k], ri = a[i * m + k + 1], lj = a[j * m + k],
                            rj = a[j * m + k + 1];
-                    float2 v = a[i * m + j] - mul(mul(li, da) + mul(ri, db), lj) -
+                    T v = a[i * m + j] - mul(mul(li, da) + mul(ri, db), lj) -
                                mul(mul(li, db) + mul(ri, dc), rj);
                     a[i * m + j] = v;
                     a[j * m + i] = v;
                 }
-            a[(k + 1) * m + k] = float2(0);
+            a[(k + 1) * m + k] = T(0);
             k += 2;
         }
     }
     for (uint i = 0; i < m * m; i++)
-        if (!all(isfinite(a[i]))) {
+        if (!finite(a[i])) {
             status[s] = 0xfffffffeu;
             return;
         }
@@ -227,7 +231,7 @@ kernel void factor_nodes(
 //
 // `threads` is the caller's threadgroup width: the narrow path runs at the
 // fixed PIVOT_THREADS, the wide path at whatever the host dispatched.
-void cooperative_swap(device float2* a, uint m, uint n, uint p, uint q, device uint* perm,
+void cooperative_swap(device T* a, uint m, uint n, uint p, uint q, device uint* perm,
                       uint lane, uint threads) {
     if (p != q) {
         // The row swap stops at the fully summed block. Past it lies U12, rows
@@ -239,13 +243,13 @@ void cooperative_swap(device float2* a, uint m, uint n, uint p, uint q, device u
         // moves L21, which factor_panel_tail and both update kernels do read --
         // and stays over every row.
         for (uint j = lane; j < n; j += threads) {
-            float2 t = a[p * m + j];
+            T t = a[p * m + j];
             a[p * m + j] = a[q * m + j];
             a[q * m + j] = t;
         }
         threadgroup_barrier(mem_flags::mem_device);
         for (uint i = lane; i < m; i += threads) {
-            float2 t = a[i * m + p];
+            T t = a[i * m + p];
             a[i * m + p] = a[i * m + q];
             a[i * m + q] = t;
         }
@@ -263,7 +267,7 @@ void cooperative_swap(device float2* a, uint m, uint n, uint p, uint q, device u
 // whole-front path for narrow ones, so both take the identical pivot sequence.
 // Every early return is group-uniform: the conditions are read from device
 // memory by all lanes after a barrier.
-static uint take_pivot(device float2* a, uint m, uint n, uint k, uint first, device uint* perm,
+static uint take_pivot(device T* a, uint m, uint n, uint k, uint first, device uint* perm,
                        device float2* diagonal, device float2* subdiag, device uint* two,
                        device uint* status, uint s, uint lane, threadgroup float* maxima,
                        threadgroup uint* indices, threadgroup uint* choice, threadgroup uint* bad,
@@ -328,7 +332,7 @@ static uint take_pivot(device float2* a, uint m, uint n, uint k, uint first, dev
     if (step == 2)
         cooperative_swap(a, m, n, k + 1, choice[2], perm, lane, PIVOT_THREADS);
     if (step == 1) {
-        float2 raw = a[k * m + k], d = raw;
+        T raw = a[k * m + k], d = raw;
         if (pivot_dead(raw)) {
             float big = front_scale(a, m, n, lane, PIVOT_THREADS, maxima, sg, sl, simds);
             if (big <= 0) {
@@ -351,14 +355,14 @@ static uint take_pivot(device float2* a, uint m, uint n, uint k, uint first, dev
             threadgroup_barrier(mem_flags::mem_device);
         }
         if (lane == 0)
-            diagonal[first + k] = d;
+            diagonal[first + k] = widen(d);
         for (uint i = k + 1 + lane; i < m; i += PIVOT_THREADS)
             a[i * m + k] = cdiv(a[i * m + k], d);
     } else {
-        float2 da = a[k * m + k], db = a[(k + 1) * m + k], dc = a[(k + 1) * m + k + 1];
+        T da = a[k * m + k], db = a[(k + 1) * m + k], dc = a[(k + 1) * m + k + 1];
         float scale = max(mag(da), max(mag(db), mag(dc)));
-        float2 aa = da / scale, bb = db / scale, cc = dc / scale, det = mul(aa, cc) - mul(bb, bb);
-        if (!all(isfinite(det))) {
+        T aa = da / scale, bb = db / scale, cc = dc / scale, det = mul(aa, cc) - mul(bb, bb);
+        if (!finite(det)) {
             if (lane == 0)
                 status[s] = PIVOT_NONFINITE | (k + 1);
             return 0;
@@ -370,7 +374,7 @@ static uint take_pivot(device float2* a, uint m, uint n, uint k, uint first, dev
             step = 1;
             // Reached only from what was a hard failure, so flooring here can
             // only improve on aborting the front.
-            float2 d = da;
+            T d = da;
             if (pivot_dead(da)) {
                 float big = front_scale(a, m, n, lane, PIVOT_THREADS, maxima, sg, sl, simds);
                 if (big <= 0) {
@@ -383,7 +387,7 @@ static uint take_pivot(device float2* a, uint m, uint n, uint k, uint first, dev
                 d = floor_pivot(da, tiny);
             }
             if (lane == 0) {
-                diagonal[first + k] = d;
+                diagonal[first + k] = widen(d);
                 a[k * m + k] = d;
                 state[s].perturbed += uint(pivot_dead(da) || pivot_tiny(da, tiny));
             }
@@ -392,13 +396,13 @@ static uint take_pivot(device float2* a, uint m, uint n, uint k, uint first, dev
                 a[i * m + k] = cdiv(a[i * m + k], d);
         } else {
             if (lane == 0) {
-                diagonal[first + k] = da;
-                diagonal[first + k + 1] = dc;
-                subdiag[first + k] = db;
+                diagonal[first + k] = widen(da);
+                diagonal[first + k + 1] = widen(dc);
+                subdiag[first + k] = widen(db);
                 two[first + k] = 1;
             }
             for (uint i = k + 2 + lane; i < m; i += PIVOT_THREADS) {
-                float2 x = a[i * m + k] / scale, y = a[i * m + k + 1] / scale;
+                T x = a[i * m + k] / scale, y = a[i * m + k + 1] / scale;
                 a[i * m + k] = cdiv(mul(x, cc) - mul(y, bb), det);
                 a[i * m + k + 1] = cdiv(mul(y, aa) - mul(x, bb), det);
             }
@@ -408,9 +412,9 @@ static uint take_pivot(device float2* a, uint m, uint n, uint k, uint first, dev
     // Multipliers may overflow even when there is no remaining trailing entry.
     uint invalid = 0;
     for (uint i = k + step + lane; i < m; i += PIVOT_THREADS) {
-        invalid |= uint(!all(isfinite(a[i * m + k])));
+        invalid |= uint(!finite(a[i * m + k]));
         if (step == 2)
-            invalid |= uint(!all(isfinite(a[i * m + k + 1])));
+            invalid |= uint(!finite(a[i * m + k + 1]));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (reduce_or(invalid, bad, sg, sl, simds)) {
@@ -419,7 +423,7 @@ static uint take_pivot(device float2* a, uint m, uint n, uint k, uint first, dev
         return 0;
     }
     if (lane == 0 && step == 2)
-        a[(k + 1) * m + k] = float2(0);
+        a[(k + 1) * m + k] = T(0);
     threadgroup_barrier(mem_flags::mem_device);
     return step;
 }
@@ -445,7 +449,7 @@ kernel void factor_narrow(
     uint simds = (PIVOT_THREADS + simdw - 1) / simdw;
     if (status[s] != 0)
         return; // Group-uniform: assembly already failed.
-    device float2* a = fronts + node.offset;
+    device T* a = (device T*)(fronts + node.offset);
     threadgroup float maxima[PIVOT_THREADS];
     threadgroup uint indices[PIVOT_THREADS], choice[3], bad[PIVOT_THREADS];
     uint k = 0;
@@ -457,16 +461,16 @@ kernel void factor_narrow(
             return;
         // Columns past this pivot stay current for the searches that follow;
         // columns at or past nc are the Schur complement and are left alone.
-        float2 da = diagonal[first + k], db = subdiag[first + k];
-        float2 dc = step == 2 ? diagonal[first + k + 1] : float2(0);
+        T da = narrow(diagonal[first + k]), db = narrow(subdiag[first + k]);
+        T dc = step == 2 ? narrow(diagonal[first + k + 1]) : T(0);
         for (uint j = k + step; j < n; j++) {
-            float2 lj = a[j * m + k], rj = step == 2 ? a[j * m + k + 1] : float2(0);
+            T lj = a[j * m + k], rj = step == 2 ? a[j * m + k + 1] : T(0);
             for (uint i = j + lane; i < m; i += PIVOT_THREADS) {
-                float2 li = a[i * m + k], v = a[i * m + j];
+                T li = a[i * m + k], v = a[i * m + j];
                 if (step == 1)
                     v -= mul(mul(li, da), lj);
                 else {
-                    float2 ri = a[i * m + k + 1];
+                    T ri = a[i * m + k + 1];
                     v -= mul(mul(li, da) + mul(ri, db), lj);
                     v -= mul(mul(li, db) + mul(ri, dc), rj);
                 }
@@ -499,18 +503,18 @@ kernel void factor_narrow(
 // uniformly stale means a symmetric swap is always consistent, and the deferred
 // rank-k update at panel close applies to every trailing column alike.
 // c[t] = (D * row)[t] over the panel's completed pivot blocks.
-static void apply_block_diagonal(threadgroup float2* out, threadgroup const float2* row, uint t,
+static void apply_block_diagonal(threadgroup T* out, threadgroup const T* row, uint t,
                                  uint first, uint p, device const uint* two,
                                  device const float2* diagonal, device const float2* subdiag,
                                  uint lane, uint threads) {
     for (uint i = lane; i < t; i += threads) {
         uint k = p + i;
         if (two[first + k])
-            out[i] = mul(row[i], diagonal[first + k]) + mul(row[i + 1], subdiag[first + k]);
+            out[i] = mul(row[i], narrow(diagonal[first + k])) + mul(row[i + 1], narrow(subdiag[first + k]));
         else if (i > 0 && two[first + k - 1])
-            out[i] = mul(row[i - 1], subdiag[first + k - 1]) + mul(row[i], diagonal[first + k]);
+            out[i] = mul(row[i - 1], narrow(subdiag[first + k - 1])) + mul(row[i], narrow(diagonal[first + k]));
         else
-            out[i] = mul(row[i], diagonal[first + k]);
+            out[i] = mul(row[i], narrow(diagonal[first + k]));
     }
 }
 // Brings column `col` of the front current with respect to the panel's pivots
@@ -529,10 +533,10 @@ static void apply_block_diagonal(threadgroup float2* out, threadgroup const floa
 // memory after the barrier. The lanes' results reduce to the same row whichever
 // lane scanned which, so the pivot sequence is unchanged.
 template <bool SEARCH>
-static void form_column(device const float2* a, device float2* w, uint m, uint count, uint dest,
+static void form_column(device const T* a, device T* w, uint m, uint count, uint dest,
                         uint col, uint k, uint first, uint p, device const uint* two,
                         device const float2* diagonal, device const float2* subdiag,
-                        threadgroup float2* rowbuf, threadgroup float2* coef, uint lane,
+                        threadgroup T* rowbuf, threadgroup T* coef, uint lane,
                         uint threads, uint rows, thread float* cm = nullptr,
                         thread uint* imax = nullptr) {
     for (uint i = lane; i < count; i += threads)
@@ -541,7 +545,7 @@ static void form_column(device const float2* a, device float2* w, uint m, uint c
     apply_block_diagonal(coef, rowbuf, count, first, p, two, diagonal, subdiag, lane, threads);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = k + lane; i < rows; i += threads) {
-        float2 v = a[i * m + col];
+        T v = a[i * m + col];
         for (uint t2 = 0; t2 < count; t2++)
             v -= mul(w[t2 * m + i], coef[t2]);
         w[dest * m + i] = v;
@@ -557,11 +561,11 @@ static void form_column(device const float2* a, device float2* w, uint m, uint c
 }
 // Swaps rows p and q across the panel's formed columns, matching the symmetric
 // swap applied to the front.
-static void swap_panel_rows(device float2* w, uint m, uint columns, uint p, uint q, uint lane,
+static void swap_panel_rows(device T* w, uint m, uint columns, uint p, uint q, uint lane,
                             uint threads) {
     if (p != q)
         for (uint t = lane; t < columns; t += threads) {
-            float2 v = w[t * m + p];
+            T v = w[t * m + p];
             w[t * m + p] = w[t * m + q];
             w[t * m + q] = v;
         }
@@ -603,14 +607,14 @@ kernel void factor_panel(
     threadgroup_barrier(mem_flags::mem_device);
     if (status[s] != 0 || p >= n)
         return; // Group-uniform.
-    device float2* a = fronts + node.offset;
-    device float2* w = panels + node.woffset;
+    device T* a = (device T*)(fronts + node.offset);
+    device T* w = (device T*)(panels + node.woffset);
     device uint* perm = perms + first;
     // Reduction scratch is written one slot per SIMD group, never one per
     // lane, so it is sized by MAX_SIMDS and is independent of the dispatch.
     threadgroup float maxima[MAX_SIMDS];
     threadgroup uint indices[MAX_SIMDS], choice[3], bad[MAX_SIMDS];
-    threadgroup float2 rowbuf[PANEL_COLS], coef[PANEL_COLS];
+    threadgroup T rowbuf[PANEL_COLS], coef[PANEL_COLS];
     threadgroup float candidate[1];
     uint t = 0, k = p;
     while (t < PANEL && k < n) {
@@ -654,7 +658,7 @@ kernel void factor_panel(
             // chain of up to PANEL dependent loads behind the decision.
             float rm = 0;
             for (uint j = k + lane; j < n; j += width) {
-                float2 v = a[imax * m + j];
+                T v = a[imax * m + j];
                 for (uint t2 = 0; t2 < t; t2++)
                     v -= mul(w[t2 * m + j], coef[t2]);
                 if (j == imax)
@@ -695,7 +699,7 @@ kernel void factor_panel(
                 form_column<false>(a, w, m, t, t, k, k, first, p, two, diagonal, subdiag,
                                    rowbuf, coef, lane, width, n);
             }
-            float2 raw = w[t * m + k], d = raw;
+            T raw = w[t * m + k], d = raw;
             if (pivot_dead(raw)) {
                 float big = front_scale(a, m, n, lane, width, maxima, sg, sl, simds);
                 if (big <= 0) {
@@ -718,10 +722,10 @@ kernel void factor_panel(
                 threadgroup_barrier(mem_flags::mem_device);
             }
             if (lane == 0)
-                diagonal[first + k] = d;
+                diagonal[first + k] = widen(d);
             for (uint i = k + 1 + lane; i < n; i += width) {
-                float2 v = cdiv(w[t * m + i], d);
-                invalid |= uint(!all(isfinite(v)));
+                T v = cdiv(w[t * m + i], d);
+                invalid |= uint(!finite(v));
                 w[t * m + i] = v;
             }
         } else {
@@ -731,11 +735,11 @@ kernel void factor_panel(
             swap_panel_rows(w, m, t + 1, k + 1, second, lane, width);
             form_column<false>(a, w, m, t, t + 1, k + 1, k, first, p, two, diagonal, subdiag,
                                rowbuf, coef, lane, width, n);
-            float2 da = w[t * m + k], db = w[t * m + k + 1], dc = w[(t + 1) * m + k + 1];
+            T da = w[t * m + k], db = w[t * m + k + 1], dc = w[(t + 1) * m + k + 1];
             float scale = max(mag(da), max(mag(db), mag(dc)));
-            float2 aa = da / scale, bb = db / scale, cc = dc / scale,
+            T aa = da / scale, bb = db / scale, cc = dc / scale,
                    det = mul(aa, cc) - mul(bb, bb);
-            if (!all(isfinite(det))) {
+            if (!finite(det)) {
                 if (lane == 0)
                     status[s] = PIVOT_NONFINITE | (k + 1);
                 return;
@@ -745,7 +749,7 @@ kernel void factor_panel(
                 // k; the partner column was already formed at t+1 but is simply
                 // not consumed, and the next pivot re-forms it. Group-uniform.
                 step = 1;
-                float2 d = da;
+                T d = da;
                 if (pivot_dead(da)) {
                     float big = front_scale(a, m, n, lane, width, maxima, sg, sl, simds);
                     if (big <= 0) {
@@ -758,28 +762,28 @@ kernel void factor_panel(
                     d = floor_pivot(da, tiny);
                 }
                 if (lane == 0) {
-                    diagonal[first + k] = d;
+                    diagonal[first + k] = widen(d);
                     w[t * m + k] = d;
                     state[s].perturbed += uint(pivot_dead(da) || pivot_tiny(da, tiny));
                 }
                 threadgroup_barrier(mem_flags::mem_device);
                 for (uint i = k + 1 + lane; i < n; i += width) {
-                    float2 v = cdiv(w[t * m + i], d);
-                    invalid |= uint(!all(isfinite(v)));
+                    T v = cdiv(w[t * m + i], d);
+                    invalid |= uint(!finite(v));
                     w[t * m + i] = v;
                 }
             } else {
                 if (lane == 0) {
-                    diagonal[first + k] = da;
-                    diagonal[first + k + 1] = dc;
-                    subdiag[first + k] = db;
+                    diagonal[first + k] = widen(da);
+                    diagonal[first + k + 1] = widen(dc);
+                    subdiag[first + k] = widen(db);
                     two[first + k] = 1;
                 }
                 for (uint i = k + 2 + lane; i < n; i += width) {
-                    float2 x = w[t * m + i] / scale, y = w[(t + 1) * m + i] / scale;
-                    float2 u = cdiv(mul(x, cc) - mul(y, bb), det);
-                    float2 v = cdiv(mul(y, aa) - mul(x, bb), det);
-                    invalid |= uint(!all(isfinite(u)) || !all(isfinite(v)));
+                    T x = w[t * m + i] / scale, y = w[(t + 1) * m + i] / scale;
+                    T u = cdiv(mul(x, cc) - mul(y, bb), det);
+                    T v = cdiv(mul(y, aa) - mul(x, bb), det);
+                    invalid |= uint(!finite(u) || !finite(v));
                     w[t * m + i] = u;
                     w[(t + 1) * m + i] = v;
                 }
@@ -794,7 +798,7 @@ kernel void factor_panel(
                 // reduce_or falls between the same read and write.
                 threadgroup_barrier(mem_flags::mem_device);
                 if (lane == 0)
-                    w[t * m + k + 1] = float2(0);
+                    w[t * m + k + 1] = T(0);
             }
         }
         // Each lane checked the multipliers it wrote, so no pass re-reads them.
@@ -865,12 +869,12 @@ kernel void factor_panel_tail(
     uint sg [[simdgroup_index_in_threadgroup]], uint sl [[thread_index_in_simdgroup]],
     uint simdw [[threads_per_simdgroup]], uint width [[threads_per_threadgroup]]) {
     threadgroup uint bad[MAX_SIMDS];
-    threadgroup float2 rowbuf[PANEL_COLS];
+    threadgroup T rowbuf[PANEL_COLS];
     // Column t of the panel subtracts coefficient[t][t2] times panel column t2,
     // for t2 < consumed[t]. Shared by every row this threadgroup owns.
-    threadgroup float2 coefficient[PANEL_COLS][PANEL_COLS];
+    threadgroup T coefficient[PANEL_COLS][PANEL_COLS];
     threadgroup uint consumed[PANEL_COLS];
-    threadgroup float2 block[TAIL_ROWS][PANEL_COLS];
+    threadgroup T block[TAIL_ROWS][PANEL_COLS];
     uint splits = range.z;
     uint s = ids[range.x + group / splits];
     uint slice = group - (group / splits) * splits;
@@ -882,8 +886,8 @@ kernel void factor_panel_tail(
     // failed, has nothing below to solve.
     if (taken == 0 || status[s] != 0 || n >= m)
         return;
-    device float2* a = fronts + node.offset;
-    device const float2* w = panels + node.woffset;
+    device T* a = (device T*)(fronts + node.offset);
+    device const T* w = (device const T*)(panels + node.woffset);
     for (uint t = 0; t < taken; t++) {
         uint col = p + t;
         // The second column of a 2x2 consumes one fewer than its position: the
@@ -909,30 +913,30 @@ kernel void factor_panel_tail(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane < rows) {
-            threadgroup float2* row = &block[lane][0];
+            threadgroup T* row = &block[lane][0];
             uint t = 0;
             while (t < taken) {
                 uint pivot = p + t, count = consumed[t];
                 if (two[first + pivot] && t + 1 < taken) {
-                    float2 v0 = row[t], v1 = row[t + 1];
+                    T v0 = row[t], v1 = row[t + 1];
                     for (uint t2 = 0; t2 < count; t2++) {
                         v0 -= mul(row[t2], coefficient[t][t2]);
                         v1 -= mul(row[t2], coefficient[t + 1][t2]);
                     }
-                    float2 da = diagonal[first + pivot], db = subdiag[first + pivot],
-                           dc = diagonal[first + pivot + 1];
+                    T da = narrow(diagonal[first + pivot]), db = narrow(subdiag[first + pivot]),
+                           dc = narrow(diagonal[first + pivot + 1]);
                     float scale = max(mag(da), max(mag(db), mag(dc)));
-                    float2 aa = da / scale, bb = db / scale, cc = dc / scale,
+                    T aa = da / scale, bb = db / scale, cc = dc / scale,
                            det = mul(aa, cc) - mul(bb, bb);
-                    float2 x = v0 / scale, y = v1 / scale;
+                    T x = v0 / scale, y = v1 / scale;
                     row[t] = cdiv(mul(x, cc) - mul(y, bb), det);
                     row[t + 1] = cdiv(mul(y, aa) - mul(x, bb), det);
                     t += 2;
                 } else {
-                    float2 v = row[t];
+                    T v = row[t];
                     for (uint t2 = 0; t2 < count; t2++)
                         v -= mul(row[t2], coefficient[t][t2]);
-                    row[t] = cdiv(v, diagonal[first + pivot]);
+                    row[t] = cdiv(v, narrow(diagonal[first + pivot]));
                     t += 1;
                 }
             }
@@ -940,8 +944,8 @@ kernel void factor_panel_tail(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint idx = lane; idx < rows * taken; idx += width) {
             uint r = idx / taken, t = idx - r * taken;
-            float2 v = block[r][t];
-            invalid |= uint(!all(isfinite(v)));
+            T v = block[r][t];
+            invalid |= uint(!finite(v));
             a[(base + r) * m + p + t] = v;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

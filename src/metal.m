@@ -16,7 +16,10 @@ typedef struct { uint32_t offset,nr,nc,rows,children,count,entries,nentries,firs
 _Static_assert(sizeof(SpartaNode)==14*sizeof(uint32_t),"SpartaNode must mirror struct Node");
 // Buffers bound to every kernel. Buffer 20 is the LU U12 store and stays at the
 // four-byte stub on the LDL^T path; buffer 14 is set per dispatch with setBytes.
-#define SPARTA_BUFFERS 22
+// Buffer 22 holds one word per node, nonzero for a front the real copy of the
+// kernels factored; the complex assembly reads it to widen that front's
+// contribution block. It is all zero unless a real plan is installed.
+#define SPARTA_BUFFERS 23
 // Threadgroup width for factor_panel, the wide-front pivot kernel. Deliberately
 // not PIVOT_THREADS: that constant still sizes factor_narrow, whose fronts are
 // too thin to use a wide group. See the sweep in factor_panel. Override at run
@@ -118,6 +121,13 @@ static const char* const kSpartaClassNames[SPARTA_CLASSES]={
  // buffers of a factorization started but not yet finished.
  NSData* factorLevels; NSData* factorSteps; id<MTLBuffer> factorIds,factorTiles,factorSchur;
  int bindFactor; NSMutableArray<id<MTLCommandBuffer>>* pending;
+ // Config::real_split: the fronts whose values are all real, as a third plan
+ // that runs next to the factor plan on every level, with the pipelines of the
+ // real copy of the LDL^T kernels. Only consulted with bindFactor set, and
+ // only when `realLevels` is not nil. `bindReal` says which of the two plans
+ // the encoder currently has bound.
+ NSData* realLevels; NSData* realSteps; id<MTLBuffer> realIds,realTiles,realSchur; int bindReal;
+ id<MTLComputePipelineState> rFactor,rZero,rInit,rChild,rNarrow,rPanel,rTail,rStrip,rSchur,rStore;
  // Opt-in profiling only; zero cost and untouched when SPARTA_PROFILE is unset.
  int profile; NSMutableArray<id<MTLCommandBuffer>>* profBuffers; NSMutableArray<NSNumber*>* profClass,* profSize,* profLevel; uint32_t profLevelNow;
  double profSeconds[SPARTA_CLASSES]; uint64_t profCalls[SPARTA_CLASSES],profGroups[SPARTA_CLASSES];
@@ -269,6 +279,26 @@ void* sparta_v1_create(const void* const* data,const size_t* lengths,const uint3
                                       c->solveForwardWide,c->solveBackwardWide,c->solveForwardLuWide,c->solveBackwardLuWide};
   for(unsigned i=0;i<sizeof(wide)/sizeof(*wide);i++)if(wide[i].maxTotalThreadsPerThreadgroup<128){message(error,cap,@"Required Metal threadgroup sizes unavailable");return NULL;}
   for(unsigned i=0;i<sizeof(full)/sizeof(*full);i++)if(full[i].maxTotalThreadsPerThreadgroup<256){message(error,cap,@"Required Metal threadgroup sizes unavailable");return NULL;}
+  // The real copy of the LDL^T factor kernels, when the plan may use it. Same
+  // source and macros, with SPARTA_REAL set; see `T` in common.metal.
+  if(geometry[6]&&!lu){
+   NSMutableDictionary* macros=[options.preprocessorMacros mutableCopy];
+   macros[@"SPARTA_REAL"]=@1;options.preprocessorMacros=macros;
+   id<MTLLibrary> reals=[c->device newLibraryWithSource:source options:options error:&e];
+   if(!reals){message(error,cap,e.localizedDescription);return NULL;}
+   struct { const char* name; id<MTLComputePipelineState> __strong* slot; } wanted[]={
+    {"factor_nodes",&c->rFactor},{"zero_fronts",&c->rZero},{"initialize_large",&c->rInit},
+    {"assemble_children",&c->rChild},{"factor_narrow",&c->rNarrow},{"factor_panel",&c->rPanel},
+    {"factor_panel_tail",&c->rTail},{"update_strip",&c->rStrip},{"update_schur",&c->rSchur},
+    {"store_factors",&c->rStore},
+   };
+   for(unsigned i=0;i<sizeof(wanted)/sizeof(*wanted);i++){
+    *wanted[i].slot=[c->device newComputePipelineStateWithFunction:[reals newFunctionWithName:@(wanted[i].name)] error:&e];
+    if(!*wanted[i].slot||(*wanted[i].slot).maxTotalThreadsPerThreadgroup<256){
+     message(error,cap,[NSString stringWithFormat:@"Metal pipeline %s (real) failed: %@",wanted[i].name,
+      e.localizedDescription?:@"threadgroup size unavailable"]);return NULL;}
+   }
+  }
   // Sizing is bounded by what this device actually reports, not a fixed budget.
   size_t total=0;
   for(unsigned i=0;i<SPARTA_BUFFERS;i++){
@@ -377,7 +407,11 @@ int sparta_v1_pivot_range(void* context,double* lo,double* hi){
 static id<MTLComputeCommandEncoder> begin(SpartaContext* c,id<MTLCommandBuffer> command) {
  id<MTLComputeCommandEncoder> encoder=[command computeCommandEncoder];if(!encoder)return nil;
  for(unsigned i=0;i<SPARTA_BUFFERS;i++)if(i!=14)[encoder setBuffer:c->buffers[i] offset:0 atIndex:i];
- if(c->bindFactor&&c->factorIds){
+ if(c->bindFactor&&c->bindReal){
+  [encoder setBuffer:c->realIds offset:0 atIndex:5];
+  [encoder setBuffer:c->realTiles offset:0 atIndex:16];
+  [encoder setBuffer:c->realSchur offset:0 atIndex:18];
+ }else if(c->bindFactor&&c->factorIds){
   [encoder setBuffer:c->factorIds offset:0 atIndex:5];
   [encoder setBuffer:c->factorTiles offset:0 atIndex:16];
   [encoder setBuffer:c->factorSchur offset:0 atIndex:18];
@@ -508,25 +542,51 @@ static void report_profile(SpartaContext* c,double total){
 // levels. The commands are committed but not waited for.
 static int encode_factor(SpartaContext* c,uint32_t first,uint32_t last,NSMutableArray<id<MTLCommandBuffer>>* submitted,char* error,size_t cap){
    uint32_t nrhs=1;
-   // The LU path changes only which pipelines these names resolve to.
-   id<MTLComputePipelineState> kFactor=c->lu?c->factorLu:c->factor;
-   id<MTLComputePipelineState> kInit=c->lu?c->initializeLargeLu:c->initializeLarge;
-   id<MTLComputePipelineState> kNarrow=c->lu?c->factorNarrowLu:c->factorNarrow;
-   id<MTLComputePipelineState> kPanel=c->lu?c->factorPanelLu:c->factorPanel;
-   id<MTLComputePipelineState> kStrip=c->lu?c->updateStripLu:c->updateStrip;
-   id<MTLComputePipelineState> kSchur=c->lu?c->updateSchurLu:c->updateSchur;
-   id<MTLComputePipelineState> kStore=c->lu?c->storeFactorsLu:c->storeFactors;
    id<MTLCommandBuffer> command=[c->queue commandBuffer];if(!command){message(error,cap,@"No command buffer");return 0;}
    id<MTLComputeCommandEncoder> encoder=begin(c,command);
    if(!encoder){message(error,cap,@"No compute encoder");return 0;}
     NSData* table=c->bindFactor?c->factorLevels:c->levels;
-    const SpartaLevel* levels=table.bytes;size_t count=table.length/sizeof(SpartaLevel);
-    const SpartaStep* steps=(c->bindFactor?c->factorSteps:c->steps).bytes;
+    size_t count=table.length/sizeof(SpartaLevel);
     if(last>count)last=(uint32_t)count;
+    // With a real plan installed every level runs twice: the factor plan's
+    // fronts on the complex pipelines, then the real plan's on the real ones.
+    // The two sets of a level are disjoint and independent, and both keep the
+    // full plan's level numbers and workspace offsets.
+    //
+    // A level's factor copy runs only once every half has assembled. It also
+    // compacts each contribution block, and the allocator places those blocks
+    // over the children's blocks the same level has just assembled, which are
+    // free from then on -- so a complex front's compaction would overwrite the
+    // block of a real front's child still waiting in the second half. Each
+    // level is therefore its halves' assembly and factorization, then their
+    // copies, which with one half is the order it always had.
+    int halves=c->bindFactor&&c->realLevels?2:1;
     unsigned passes=0;
-    for(size_t l=first;l<last;l++){
+    for(size_t l=first;l<last;l++)for(int pass=0;pass<2*halves;pass++){
+     int real=pass%halves==1,copy=pass>=halves;
+     if(halves==2){
+      c->bindReal=real;
+      [encoder setBuffer:real?c->realIds:c->factorIds offset:0 atIndex:5];
+      [encoder setBuffer:real?c->realTiles:c->factorTiles offset:0 atIndex:16];
+      [encoder setBuffer:real?c->realSchur:c->factorSchur offset:0 atIndex:18];
+     }
+     const SpartaLevel* levels=(real?c->realLevels:table).bytes;
+     const SpartaStep* steps=(real?c->realSteps:c->bindFactor?c->factorSteps:c->steps).bytes;
+     // The LU path changes only which pipelines these names resolve to, and
+     // the real half only which copy of the LDL^T kernels.
+     id<MTLComputePipelineState> kFactor=real?c->rFactor:c->lu?c->factorLu:c->factor;
+     id<MTLComputePipelineState> kZero=real?c->rZero:c->zeroFronts;
+     id<MTLComputePipelineState> kInit=real?c->rInit:c->lu?c->initializeLargeLu:c->initializeLarge;
+     id<MTLComputePipelineState> kChild=real?c->rChild:c->assembleChildren;
+     id<MTLComputePipelineState> kNarrow=real?c->rNarrow:c->lu?c->factorNarrowLu:c->factorNarrow;
+     id<MTLComputePipelineState> kPanel=real?c->rPanel:c->lu?c->factorPanelLu:c->factorPanel;
+     id<MTLComputePipelineState> kTail=real?c->rTail:c->lu?c->panelTailLu:c->panelTail;
+     id<MTLComputePipelineState> kStrip=real?c->rStrip:c->lu?c->updateStripLu:c->updateStrip;
+     id<MTLComputePipelineState> kSchur=real?c->rSchur:c->lu?c->updateSchurLu:c->updateSchur;
+     id<MTLComputePipelineState> kStore=real?c->rStore:c->lu?c->storeFactorsLu:c->storeFactors;
      SpartaLevel level=levels[l];
      c->profLevelNow=(uint32_t)l;
+     if(!copy){
      STEP(kFactor,level.smallStart,level.smallCount,0,P_FACTOR);
      // Narrow and wide cooperative fronts are adjacent in the id list, so one
      // assembly dispatch covers both.
@@ -544,7 +604,7 @@ static int encode_factor(SpartaContext* c,uint32_t first,uint32_t last,NSMutable
        uint32_t useful=(uint32_t)(((uint64_t)level.maxRows*level.maxRows+1023)/1024);
        if(!useful)useful=1;
        if(splits>useful)splits=useful;
-       STEPW(c->zeroFronts,level.narrowStart,fronts,9,P_ZERO,splits);
+       STEPW(kZero,level.narrowStart,fronts,9,P_ZERO,splits);
       }
      }
      STEP(kInit,level.narrowStart,level.narrowCount+level.largeCount,5,P_INIT);
@@ -556,7 +616,7 @@ static int encode_factor(SpartaContext* c,uint32_t first,uint32_t last,NSMutable
       uint32_t splits=fronts>=SPARTA_CHILD_GROUPS?1:(SPARTA_CHILD_GROUPS+fronts-1)/fronts;
       if(splits>SPARTA_CHILD_SLICES)splits=SPARTA_CHILD_SLICES;
       for(uint32_t c2=0;c2<level.maxChildren;c2++)
-       STEPX(c->assembleChildren,level.narrowStart,fronts,10,P_CHILD,splits,c2);
+       STEPX(kChild,level.narrowStart,fronts,10,P_CHILD,splits,c2);
      }
      // Narrow fronts take every pivot in one dispatch, then drain once.
      STEP(kNarrow,level.narrowStart,level.narrowCount,1,P_NARROW);
@@ -585,7 +645,7 @@ static int encode_factor(SpartaContext* c,uint32_t first,uint32_t last,NSMutable
       if(live.nodes){
        uint32_t splits=live.nodes>=SPARTA_TAIL_GROUPS?1:(SPARTA_TAIL_GROUPS+live.nodes-1)/live.nodes;
        if(splits>SPARTA_TAIL_SLICES)splits=SPARTA_TAIL_SLICES;
-       STEPX(c->lu?c->panelTailLu:c->panelTail,level.largeStart,live.nodes,11,P_PANEL_TAIL,splits,0);
+       STEPX(kTail,level.largeStart,live.nodes,11,P_PANEL_TAIL,splits,0);
       }
       STEP(kStrip,level.tileStart+live.tileStart,live.tiles,2,P_STRIP);
       if(c->schurBatch&&(q+1)%c->schurBatch==0){
@@ -615,6 +675,7 @@ static int encode_factor(SpartaContext* c,uint32_t first,uint32_t last,NSMutable
      // update_schur returns immediately on next<=panel.
      STEP(kSchur,level.schurStart,level.schurCount,2,P_DRAIN);
      STEP(c->advancePanel,level.largeStart,level.largeCount,0,P_DRAIN_ADVANCE);
+     }else{
      // Fronts are recycled from the next level on, so this level's factor
      // columns have to be copied out while they are still resident.
      // Sliced as the front clear is, and for the same reason: near the root a
@@ -630,7 +691,9 @@ static int encode_factor(SpartaContext* c,uint32_t first,uint32_t last,NSMutable
        STEPW(kStore,level.smallStart,fronts,9,P_STORE,splits);
       }
      }
+     }
     }
+   c->bindReal=0;
    [encoder endEncoding];
    [submitted addObject:command];[command commit];
    return 1;
@@ -754,6 +817,29 @@ int sparta_v1_set_factor_plan(void* context,const void* ids,size_t idsBytes,cons
   c->factorIds=b[0];c->factorTiles=b[1];c->factorSchur=b[2];
   c->factorLevels=[NSData dataWithBytes:level_data length:level_count*sizeof(SpartaLevel)];
   c->factorSteps=[NSData dataWithBytes:step_data length:step_count*sizeof(SpartaStep)];
+  return 1;
+ }@catch(NSException* e){message(error,cap,e.reason);return 0;}}
+}
+
+// Install the real plan of Config::real_split: the same tables as
+// `set_factor_plan`, for the fronts the real copy of the kernels factors. A
+// level count of zero removes it.
+int sparta_v1_set_real_plan(void* context,const void* ids,size_t idsBytes,const void* tiles,size_t tilesBytes,
+                            const void* schur,size_t schurBytes,const uint32_t* level_data,uint32_t level_count,
+                            const uint32_t* step_data,uint32_t step_count,char* error,size_t cap){
+ @autoreleasepool {@try {
+  SpartaContext* c=(__bridge SpartaContext*)context;
+  if(!level_count){c->realLevels=nil;c->realSteps=nil;c->realIds=c->realTiles=c->realSchur=nil;return 1;}
+  if(!c->rFactor){message(error,cap,@"the real kernels were not built for this context");return 0;}
+  id<MTLBuffer> b[3];const void* src[3]={ids,tiles,schur};size_t len[3]={idsBytes,tilesBytes,schurBytes};
+  for(int i=0;i<3;i++){
+   b[i]=[c->device newBufferWithLength:MAX(len[i],4) options:MTLResourceStorageModeShared];
+   if(!b[i]){message(error,cap,@"allocating the real dispatch tables failed");return 0;}
+   if(len[i])memcpy(b[i].contents,src[i],len[i]);
+  }
+  c->realIds=b[0];c->realTiles=b[1];c->realSchur=b[2];
+  c->realLevels=[NSData dataWithBytes:level_data length:level_count*sizeof(SpartaLevel)];
+  c->realSteps=[NSData dataWithBytes:step_data length:step_count*sizeof(SpartaStep)];
   return 1;
  }@catch(NSException* e){message(error,cap,e.reason);return 0;}}
 }

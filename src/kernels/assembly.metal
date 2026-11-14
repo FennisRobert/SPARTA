@@ -7,6 +7,21 @@
 // recycled. Both come in an LDL^T and an LU form, differing only in whether
 // the front is mirrored about its diagonal and whether the row block of U is
 // kept as well.
+// Where a finished child's contribution block starts, as elements of `U`.
+//
+// `soffset`/`sld` locate the block whether it was compacted out of its front
+// -- in which case the front slot has since been reused -- or left strided
+// inside it. A real child holds its front in the first half of the slot, as
+// floats, so a block left inside it starts at a float index, not at `soffset`.
+// A compacted block starts at `soffset` either way. For a complex child both
+// branches give the same address.
+template <typename U>
+static device const U* child_block(device const float2* fronts, Node cn) {
+    uint m = cn.nr, nc = cn.nc;
+    if (cn.soffset == cn.offset + nc * m + nc)
+        return (device const U*)(fronts + cn.offset) + nc * m + nc;
+    return (device const U*)(fronts + cn.soffset);
+}
 // `mirror` is the only difference between the two factorizations here. LDL^T
 // stores one triangle of the input and reflects each scattered entry across the
 // diagonal; LU is handed both triangles and puts every entry exactly where the
@@ -29,7 +44,7 @@ static void assemble_front(bool mirror, device const Node* nodes, device const C
     uint s = ids[range.x + group];
     Node node = nodes[s];
     uint m = node.nr;
-    device float2* a = fronts + node.offset;
+    device T* a = (device T*)(fronts + node.offset);
     if (lane == 0) {
         status[s] = 0;
         state[s] = FrontState{0, 0, 0, 0, 0};
@@ -66,8 +81,8 @@ static void assemble_front(bool mirror, device const Node* nodes, device const C
     for (uint e = lane; e < node.nentries; e += width) {
         Entry v = entries[node.entries + e];
         uint i = v.position / m, j = v.position % m;
-        float2 val = values[v.source];
-        invalid |= uint(!all(isfinite(val)));
+        T val = narrow(values[v.source]);
+        invalid |= uint(!finite(val));
         a[i * m + j] = val;
         if (mirror)
             a[j * m + i] = val;
@@ -116,10 +131,12 @@ kernel void initialize_large(SPARTA_ASSEMBLY_ARGS) {
     threadgroup uint bad[MAX_SIMDS];
     SPARTA_ASSEMBLY_CALL(true);
 }
+#if !SPARTA_REAL
 kernel void initialize_large_lu(SPARTA_ASSEMBLY_ARGS) {
     threadgroup uint bad[MAX_SIMDS];
     SPARTA_ASSEMBLY_CALL(false);
 }
+#endif
 // Adds one child's Schur block into each of a level's fronts.
 //
 // Split out of `initialize_large`, and dispatched once per child ordinal rather
@@ -149,6 +166,7 @@ kernel void assemble_children(device const Node* nodes [[buffer(0)]],
                               device float2* fronts [[buffer(7)]],
                               device uint* status [[buffer(12)]],
                               constant uint4& range [[buffer(14)]],
+                              device const uint* real [[buffer(22)]],
                               uint group [[threadgroup_position_in_grid]],
                               uint lane [[thread_index_in_threadgroup]],
                               uint sg [[simdgroup_index_in_threadgroup]],
@@ -173,11 +191,13 @@ kernel void assemble_children(device const Node* nodes [[buffer(0)]],
     uint m = node.nr;
     Node cn = nodes[child.node];
     uint tail = cn.nr - cn.nc;
-    device float2* a = fronts + node.offset;
-    // `soffset`/`sld` locate the child's block whether it was compacted out of
-    // its front -- in which case the front slot has since been reused -- or
-    // left strided inside it.
-    device const float2* source = fronts + cn.soffset;
+    device T* a = (device T*)(fronts + node.offset);
+    // A real child's block is read as reals and widened; see child_block.
+    // Group-uniform, and constant false in the real copy, whose children are
+    // all real.
+    bool widened = !SPARTA_REAL && real[child.node] != 0;
+    device const T* source = child_block<T>(fronts, cn);
+    device const float* reals = child_block<float>(fronts, cn);
     uint sld = cn.sld;
     uint invalid = 0;
     for (uint index = slice * width + lane; index < tail * tail; index += splits * width) {
@@ -188,9 +208,9 @@ kernel void assemble_children(device const Node* nodes [[buffer(0)]],
         if (SPARTA_LOWER && j > i)
             continue;
         uint mi = maps[child.map + i], mj = maps[child.map + j];
-        float2 add = source[i * sld + j];
-        float2 v = a[mi * m + mj] + add;
-        invalid |= uint(!all(isfinite(v)));
+        T add = widened ? from_real(reals[i * sld + j]) : source[i * sld + j];
+        T v = a[mi * m + mj] + add;
+        invalid |= uint(!finite(v));
         a[mi * m + mj] = v;
         if (SPARTA_LOWER && i != j && mi < node.nc)
             a[mj * m + mi] += add;
@@ -228,7 +248,7 @@ kernel void zero_fronts(device const Node* nodes [[buffer(0)]], device const uin
     uint slice = group - (group / splits) * splits;
     Node node = nodes[s];
     uint m = node.nr, total = m * m;
-    device float2* a = fronts + node.offset;
+    device T* a = (device T*)(fronts + node.offset);
     for (uint i = slice * width + lane; i < total; i += splits * width) {
         // LDL^T never reads above the diagonal of the trailing rows; see
         // SPARTA_LOWER.
@@ -237,7 +257,7 @@ kernel void zero_fronts(device const Node* nodes [[buffer(0)]], device const uin
             if (r >= node.nc && i - r * m > r)
                 continue;
         }
-        a[i] = float2(0);
+        a[i] = T(0);
     }
 }
 // Compacts the trailing `nr-nc` square of a finished front into the node's
@@ -263,8 +283,8 @@ static void compact_block(Node node, device float2* fronts, uint lane, uint widt
     uint m = node.nr, nc = node.nc, tail = m - nc;
     if (!tail || node.soffset == node.offset + nc * m + nc)
         return;
-    device const float2* a = fronts + node.offset;
-    device float2* block = fronts + node.soffset;
+    device const T* a = (device const T*)(fronts + node.offset);
+    device T* block = (device T*)(fronts + node.soffset);
     for (uint idx = lane; idx < tail * tail; idx += width) {
         uint i = idx / tail, j = idx - i * tail;
         // LDL^T moves the lower triangle only; see SPARTA_LOWER.
@@ -291,15 +311,17 @@ kernel void store_factors(
     uint lane = (group - (group / splits) * splits) * threads + local, width = splits * threads;
     Node node = nodes[s];
     uint m = node.nr;
-    device const float2* a = fronts + node.offset;
+    device const T* a = (device const T*)(fronts + node.offset);
     device float2* l = factors + node.loffset;
     // A flat strided copy, so it takes whatever width the host dispatched.
+    // The store is complex in both copies; see `widen`.
     for (uint idx = lane; idx < node.nc * m; idx += width) {
         uint k = idx / m, i = idx - k * m;
-        l[idx] = a[i * m + k];
+        l[idx] = widen(a[i * m + k]);
     }
     compact_block(node, fronts, lane, width, SPARTA_LOWER);
 }
+#if !SPARTA_REAL
 // The LU form of the same copy.
 //
 // The first nc columns are kept exactly as above, and they are already the
@@ -320,9 +342,9 @@ kernel void store_factors_lu(
     uint lane = (group - (group / splits) * splits) * threads + local, width = splits * threads;
     Node node = nodes[s];
     uint m = node.nr, nc = node.nc, tail = m - nc;
-    device const float2* a = fronts + node.offset;
-    device float2* l = factors + node.loffset;
-    device float2* u = upper + node.uoffset;
+    device const T* a = (device const T*)(fronts + node.offset);
+    device T* l = factors + node.loffset;
+    device T* u = upper + node.uoffset;
     for (uint idx = lane; idx < nc * m; idx += width) {
         uint k = idx / m, i = idx - k * m;
         l[idx] = a[i * m + k];
@@ -333,3 +355,4 @@ kernel void store_factors_lu(
     }
     compact_block(node, fronts, lane, width, false);
 }
+#endif

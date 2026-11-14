@@ -26,7 +26,7 @@ class SymbolicTests(unittest.TestCase):
         self.assertEqual(f.n,4)
         for name in ('Settings','Analysis','Factor','ldlt','lu','solve'):
             self.assertFalse(hasattr(sparta,name))
-        with self.assertRaises(TypeError): sparta.analyze(a,unknown_option=True)
+        with self.assertWarns(sparta.UnusedSettingWarning): sparta.analyze(a,unknown_option=True)
         with self.assertRaises(ValueError): sparta.analyze(a,path='lu',triangle='lower')
         with self.assertRaises(NotImplementedError): sparta.analyze(a,ordering=sparta.Ordering.AMD)
 

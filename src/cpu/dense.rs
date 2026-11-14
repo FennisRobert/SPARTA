@@ -137,6 +137,27 @@ mod ffi {
 #[allow(clippy::too_many_arguments)]
 unsafe fn gemm(
     trans_b: i32,
+    shape: (usize, usize, usize),
+    alpha: C,
+    a: *const C,
+    lda: usize,
+    b: *const C,
+    ldb: usize,
+    beta: C,
+    c: *mut C,
+    ldc: usize,
+) {
+    gemm_ab(ffi::NO_TRANS, trans_b, shape, alpha, a, lda, b, ldb, beta, c, ldc);
+}
+
+/// `c = alpha * op(a) * op(b) + beta * c`, row-major, through this copy's GEMM.
+///
+/// # Safety
+/// As for [`gemm`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn gemm_ab(
+    no: i32,
+    trans_b: i32,
     (m, n, k): (usize, usize, usize),
     alpha: C,
     a: *const C,
@@ -149,7 +170,7 @@ unsafe fn gemm(
 ) {
     let (m, n, k, lda, ldb, ldc) = (m as i32, n as i32, k as i32, lda as i32, ldb as i32, ldc as i32);
     let (a, b, c) = (a.cast::<c_void>(), b.cast::<c_void>(), c.cast::<c_void>());
-    let (order, no) = (ffi::ROW_MAJOR, ffi::NO_TRANS);
+    let order = ffi::ROW_MAJOR;
     let (pa, pb) = ((&alpha as *const C).cast(), (&beta as *const C).cast());
     match KIND {
         ScalarKind::Complex64 => (library().zgemm)(order, no, trans_b, m, n, k, pa, a, lda, b, ldb, pb, c, ldc),
@@ -311,6 +332,24 @@ pub(super) fn gemm_nn(
     // SAFETY: as for `gemm_nt`.
     unsafe {
         gemm(ffi::NO_TRANS, (m, n, k), minus, a.as_ptr(), lda, b.as_ptr(), ldb, one, c.as_mut_ptr(), ldc);
+    }
+}
+
+/// `c[m][n] -= a[k][m]^T * b[k][n]`, all row-major with the given row strides.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn gemm_tn(m: usize, n: usize, k: usize, a: &[C], lda: usize, b: &[C], ldb: usize, c: &mut [C], ldc: usize) {
+    if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+    assert!(lda >= m && ldb >= n && ldc >= n, "row strides too short");
+    assert!(a.len() >= (k - 1) * lda + m, "left operand out of bounds");
+    assert!(b.len() >= (k - 1) * ldb + n, "right operand out of bounds");
+    assert!(c.len() >= (m - 1) * ldc + n, "target out of bounds");
+    let (minus, one) = (C::from_re(-1.0), C::from_re(1.0));
+    // SAFETY: the rectangles are in bounds, asserted above, and `c` is a
+    // separate buffer from both operands.
+    unsafe {
+        gemm_ab(ffi::TRANS, ffi::NO_TRANS, (m, n, k), minus, a.as_ptr(), lda, b.as_ptr(), ldb, one, c.as_mut_ptr(), ldc);
     }
 }
 

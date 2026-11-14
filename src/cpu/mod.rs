@@ -11,10 +11,12 @@ mod level;
 mod panel;
 mod profile;
 mod solve;
+mod sparse;
 mod supernodal;
 mod update;
 
 use crate::{Analysis, Error, Kind, Result};
+pub(crate) use sparse::Columns;
 
 // `C`, the value type of this copy, and `R`, the real type of its precision.
 cpu_types!();
@@ -71,6 +73,11 @@ pub(crate) struct Solver {
     /// Present when this solver factors supernodally; see
     /// `Config::supernodal`.
     supernodal: Option<supernodal::Layout>,
+    /// The real half of a supernodal complex `LDL^T`; see [`RealPart`].
+    real: Option<Box<RealHalf>>,
+    /// The nodes the latest factorization left in `real`'s store, by node;
+    /// empty when it used no real half.
+    mask: Vec<bool>,
     /// Whether each node's `nc` L columns are stored row-major, `nr` rows of
     /// `nc` values, rather than column-major. Row-major is what the CPU solve
     /// reads and what a front's rows copy into without a transpose; the hybrid
@@ -109,7 +116,12 @@ impl Solver {
         // hybrid's column-major solvers stay multifrontal.
         let supernodal = (plan.config.supernodal && plan.kind == Kind::Ldlt && rowmajor)
             .then(|| supernodal::Layout::new(&plan));
+        let real = (supernodal.is_some() && <C as Scalar>::KIND.is_complex())
+            .then(|| RealHalf::new(&plan, threads).map(Box::new))
+            .transpose()?;
         Ok(Self {
+            real,
+            mask: Vec::new(),
             workers: Mutex::new((0..threads).map(|_| Worker::default()).collect()),
             schedule: level::schedule(&plan),
             pool,
@@ -136,12 +148,7 @@ impl Solver {
     /// kept front waits on one left out.
     #[allow(dead_code)]
     pub(crate) fn restrict(&mut self, keep: &[bool]) {
-        self.schedule = level::schedule(&self.plan);
-        for level in &mut self.schedule {
-            level.nodes.retain(|&id| keep[id as usize]);
-            level.spread &= level.nodes.len() >= 2;
-        }
-        self.schedule.retain(|level| !level.nodes.is_empty());
+        self.schedule = restricted(&level::schedule(&self.plan), |id| keep[id as usize]);
     }
 
     /// The threads this solver runs on, for work done on its behalf.
@@ -168,15 +175,28 @@ impl Solver {
         }
     }
 
+    /// The matrix dimension.
+    pub(crate) fn n(&self) -> usize {
+        self.plan.n
+    }
+
     /// Factor finite `values` in the analyzed CSC entry order.
     pub(crate) fn factor(&mut self, values: &[C]) -> Result<()> {
         self.valid = false;
         self.seconds = 0.0;
         self.perturbed = 0;
-        if self.destroyed || values.len() != self.plan.nnz || values.iter().any(|&v| !finite(v)) {
-            return Err(Error::Invalid(
-                "finite values must match a live analyzed CSC pattern".into(),
-            ));
+        if self.destroyed {
+            return Err(Error::Invalid("this solver was destroyed".into()));
+        }
+        if values.len() != self.plan.nnz {
+            return Err(Error::Invalid(format!(
+                "expected {} matrix values for the analyzed pattern, got {}",
+                self.plan.nnz,
+                values.len()
+            )));
+        }
+        if let Some(at) = values.iter().position(|&v| !finite(v)) {
+            return Err(Error::Invalid(format!("matrix value {at} is not finite")));
         }
         let started = Instant::now();
         let mut report = Report::default();
@@ -185,7 +205,7 @@ impl Solver {
         self.seconds = started.elapsed().as_secs_f64();
         report.print(self.seconds);
         self.valid = result.is_ok();
-        result
+        result.map_err(|e| e.located(|node, pivot| unknown(&self.plan, &self.perms, node, pivot)))
     }
 
     /// Assemble and eliminate fronts leaves first, copying factors before slot reuse.
@@ -215,8 +235,11 @@ impl Solver {
             rowmajor,
             pool,
             supernodal,
+            real,
+            mask: last,
             ..
         } = self;
+        last.clear();
         // A front alone on the machine may have the library thread its
         // products -- unless this solver is bounded to fewer threads, which
         // the library's own threading would not respect.
@@ -246,10 +269,45 @@ impl Solver {
                 t0.elapsed().as_secs_f64(), plan.nodes[level.nodes[0] as usize].nr);
         };
         let result = if let Some(layout) = supernodal {
-            supernodal::factor_all(
-                plan, layout, schedule, factors, diagonal, subdiag, perms, two, values, tiny, workers, machine,
-                report,
-            )
+            // The nodes no complex entry reaches go first, in real arithmetic.
+            let mask = real.as_deref_mut().filter(|_| plan.config.real_split).and_then(|part| {
+                let mask = plan.real_nodes(|s| values[s].im() == 0.0);
+                mask.iter().any(|&r| r).then_some((part, mask))
+            });
+            match mask {
+                None => supernodal::factor_all(
+                    plan, layout, schedule, factors, diagonal, subdiag, perms, two, values, tiny, workers, machine,
+                    report, None,
+                ),
+                Some((part, mask)) => {
+                    let clock = Instant::now();
+                    part.values(values.len()).par_iter_mut().zip(values.par_iter()).for_each(|(r, v)| *r = v.re());
+                    let ours = part
+                        .factor(plan, &mask, tiny, machine)
+                        .map_err(|e| e.located(|node, pivot| unknown(plan, part.perms(), node, pivot)));
+                    if dump {
+                        eprintln!("REAL HALF {:.4} s", clock.elapsed().as_secs_f64());
+                    }
+                    ours.and_then(|count| {
+                        bumped.fetch_add(count, Ordering::Relaxed);
+                        let rest = restricted(schedule, |id| !mask[id as usize]);
+                        let split = supernodal::Split {
+                            real: &mask,
+                            factors: part.factors(),
+                            diagonal: part.diagonal(),
+                            subdiag: part.subdiag(),
+                            perms: part.perms(),
+                            two: part.two(),
+                        };
+                        let result = supernodal::factor_all(
+                            plan, layout, &rest, factors, diagonal, subdiag, perms, two, values, tiny, workers,
+                            machine, report, Some(split),
+                        );
+                        *last = mask;
+                        result
+                    })
+                }
+            }
             .map(|count| {
                 bumped.fetch_add(count, Ordering::Relaxed);
             })
@@ -354,6 +412,8 @@ impl Solver {
         self.perms = Vec::new();
         self.two = Vec::new();
         self.workers = Mutex::new(Vec::new());
+        self.real = None;
+        self.mask = Vec::new();
         self.schedule = Vec::new();
         self.plan.release();
         self.valid = false;
@@ -400,6 +460,132 @@ impl Solver {
             hi = hi.max(v);
         }
         Some((f64::from(lo), f64::from(hi)))
+    }
+}
+
+/// The caller's index of the unknown at 1-based column `pivot` of `node`'s
+/// front, after the symmetric interchanges recorded in `perms` (the node's
+/// local pivot order). `None` when the column is outside the node.
+///
+/// LU interchanges rows only, so its column `pivot` is the unknown.
+pub(crate) fn unknown(plan: &Analysis, perms: &[usize], node: usize, pivot: u32) -> Option<usize> {
+    let node = plan.nodes.get(node)?;
+    let (first, nc) = (node.first as usize, node.nc as usize);
+    let k = (pivot as usize).checked_sub(1).filter(|&k| k < nc)?;
+    let local = match plan.kind {
+        Kind::Lu => k,
+        Kind::Ldlt => perms.get(first + k).copied().filter(|&l| l < nc).unwrap_or(k),
+    };
+    plan.perm.get(first + local).map(|&p| p as usize)
+}
+
+/// `schedule` with only the nodes `keep` accepts, empty levels dropped.
+fn restricted(schedule: &[Level], keep: impl Fn(u32) -> bool) -> Vec<Level> {
+    schedule
+        .iter()
+        .filter_map(|level| {
+            let nodes: Vec<u32> = level.nodes.iter().copied().filter(|&id| keep(id)).collect();
+            (!nodes.is_empty()).then_some(Level { spread: level.spread && nodes.len() >= 2, nodes })
+        })
+        .collect()
+}
+
+/// The real-arithmetic half of a complex supernodal `LDL^T`.
+///
+/// In many complex systems the imaginary parts sit on a few unknowns, such as
+/// the port and boundary unknowns of an FEM model. A node none of whose
+/// descendants has a complex entry has a real factor
+/// (see `Analysis::real_nodes`), and real arithmetic is about four times cheaper. The
+/// complex copy of a precision keeps one of these, from the real copy of the
+/// same precision, and runs it first: the supernodal factorization on the
+/// real parts of every entry, restricted to the real nodes. What it leaves in
+/// the other nodes' columns is their real parts plus every update the real
+/// nodes sent them, which the complex half starts from. The ordering is not
+/// touched, so neither is the fill.
+pub(crate) struct RealPart {
+    layout: supernodal::Layout,
+    workers: Mutex<Vec<Worker>>,
+    factors: Vec<C>,
+    diagonal: Vec<C>,
+    subdiag: Vec<C>,
+    perms: Vec<usize>,
+    two: Vec<bool>,
+    values: Vec<C>,
+}
+
+// Only the complex copies construct one; the real copies just define it.
+#[allow(dead_code)]
+impl RealPart {
+    /// Storage for the real half of `plan`, its nodes run by `threads` workers.
+    pub(crate) fn new(plan: &Analysis, threads: usize) -> Result<Self> {
+        Ok(Self {
+            layout: supernodal::Layout::new(plan),
+            workers: Mutex::new((0..threads).map(|_| Worker::default()).collect()),
+            factors: allocate_lazy(plan.factor_elements)?,
+            diagonal: allocate_lazy(plan.n)?,
+            subdiag: allocate_lazy(plan.n)?,
+            perms: vec![0; plan.n],
+            two: vec![false; plan.n],
+            values: Vec::new(),
+        })
+    }
+
+    /// The buffer for the real parts of the entries, in analyzed CSC order.
+    pub(crate) fn values(&mut self, nnz: usize) -> &mut [C] {
+        self.values.resize(nnz, C::from_re(0.0));
+        &mut self.values
+    }
+
+    /// Factor the nodes `real` marks from the entries [`values`] holds, with
+    /// the complex matrix's static-pivoting threshold `tiny`. Returns the
+    /// pivots perturbed. Runs on the calling pool.
+    pub(crate) fn factor(&mut self, plan: &Analysis, real: &[bool], tiny: R, machine: bool) -> Result<u64> {
+        let schedule = restricted(&level::schedule(plan), |id| real[id as usize]);
+        let mut report = Report::default();
+        let clock = Instant::now();
+        let result = supernodal::factor_all(
+            plan, &self.layout, &schedule, &mut self.factors, &mut self.diagonal, &mut self.subdiag,
+            &mut self.perms, &mut self.two, &self.values, tiny, &self.workers, machine, &mut report, None,
+        );
+        for worker in self.workers.lock().unwrap().iter_mut() {
+            report.merge(&worker.report);
+            worker.report = Report::default();
+        }
+        report.print(clock.elapsed().as_secs_f64());
+        result
+    }
+
+    /// The real factor store: the real nodes' `L` blocks, in the plan's layout.
+    pub(crate) fn factors(&self) -> &[C] {
+        &self.factors
+    }
+    /// `c[m][n] -= a[m][k] * b[k][n]`, row-major, in this copy's arithmetic;
+    /// `lda`, `ldb` and `ldc` are the row strides.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gemm_nn(m: usize, n: usize, k: usize, a: &[C], lda: usize, b: &[C], ldb: usize, c: &mut [C], ldc: usize) {
+        dense::gemm_nn(m, n, k, a, lda, b, ldb, c, ldc);
+    }
+    /// `c[m][n] -= a[k][m]^T * b[k][n]`, row-major, in this copy's arithmetic;
+    /// `lda`, `ldb` and `ldc` are the row strides.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gemm_tn(m: usize, n: usize, k: usize, a: &[C], lda: usize, b: &[C], ldb: usize, c: &mut [C], ldc: usize) {
+        dense::gemm_tn(m, n, k, a, lda, b, ldb, c, ldc);
+    }
+    /// `D`'s diagonal, by column; valid for the real nodes' columns.
+    pub(crate) fn diagonal(&self) -> &[C] {
+        &self.diagonal
+    }
+    /// `D`'s subdiagonal, by column; valid for the real nodes' columns.
+    pub(crate) fn subdiag(&self) -> &[C] {
+        &self.subdiag
+    }
+    /// Each real node's pivot order, by column.
+    pub(crate) fn perms(&self) -> &[usize] {
+        &self.perms
+    }
+    /// Whether each real node's column starts a 2x2 pivot.
+    pub(crate) fn two(&self) -> &[bool] {
+        &self.two
     }
 }
 
