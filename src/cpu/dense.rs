@@ -36,10 +36,12 @@ pub(super) enum Threading {
 /// Choose the threading of the dense calls this thread makes next,
 /// reporting whether the library has a per-thread control.
 ///
-/// SPARTA wants Rayon to own every level of parallelism. SpartaBLAS starts no
-/// threads of its own: with `Machine` a large call spreads over the Rayon pool
-/// it runs in, with `Caller` it stays on the calling thread, and the setting
-/// is per thread, so workers never fight over it.
+/// SPARTA wants Rayon to own every level of parallelism, which needs a
+/// control that is per thread, so workers never fight over it. With
+/// `Caller` a call stays on the calling thread. With `Machine` a large call
+/// spreads: SpartaBLAS over the Rayon pool it runs in, Accelerate over its
+/// own threads. Accelerate has the control from macOS 15 on; on macOS 13 and
+/// 14 this reports false and `level::schedule` adapts.
 pub(super) fn set_threading(threading: Threading) -> bool {
     match blas::library().and_then(|library| library.per_thread) {
         Some(PerThread::Sparta(set)) => {
@@ -48,6 +50,14 @@ pub(super) fn set_threading(threading: Threading) -> bool {
                 Threading::Caller => 1,
             }) == 0
         }
+        // SAFETY: the symbol `crate::blas` resolved, called with one of the
+        // two values Accelerate documents.
+        Some(PerThread::Accelerate(set)) => unsafe {
+            set(match threading {
+                Threading::Machine => 0,
+                Threading::Caller => 1,
+            }) == 0
+        },
         None => false,
     }
 }

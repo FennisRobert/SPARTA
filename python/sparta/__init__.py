@@ -54,7 +54,7 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
     ----------
     force_cpu : bool or None, default None
         True uses Rust complex128 factorization and solves on CPU, with SPARTA's
-        own dense kernels (SpartaBLAS) for large updates. False uses Metal complex64. None uses the
+        own dense kernels (SpartaBLAS, or Accelerate on Macs before M4) for large updates. False uses Metal complex64. None uses the
         config setting, or False without a config. factorize(force_cpu=...) can
         override this later without repeating symbolic analysis.
     hybrid : bool, float or None, default None

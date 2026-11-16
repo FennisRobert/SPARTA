@@ -352,9 +352,11 @@ pub(super) struct Level {
 /// whole machine. Widest first, so Rayon's stealing does not end a level
 /// waiting on one late large front.
 ///
-/// The dense kernels have a per-thread control (`dense::controllable` is
-/// always true with SpartaBLAS), so every level of two or more fronts spreads.
-/// The narrow-front rule below only applies to a library without one.
+/// With a per-thread control (`dense::controllable`: always with SpartaBLAS,
+/// with Accelerate from macOS 15), every level of two or more fronts spreads.
+/// Without one, on macOS 13 and 14 with Accelerate, a spread level would have
+/// every front threading against every other, so only levels whose fronts
+/// are too narrow to reach the dense kernels are spread there.
 pub(super) fn schedule(plan: &Analysis) -> Vec<Level> {
     let controllable = dense::controllable();
     plan.levels

@@ -299,7 +299,7 @@ footer .bottom { border-top: 1px solid #2c2729; padding: 16px 0 22px; display: f
           <li>Same analysis and factorization as the GPU, in double precision</li>
           <li>SpartaBLAS: SPARTA's own dense kernels, one set per processor family</li>
           <li>Hand-written kernels for the Arm SME2 matrix unit (Apple M4 and later): 82–91% of peak on one core</li>
-          <li>NEON, AVX2 and AVX-512 kernel sets; no BLAS or LAPACK to install</li>
+          <li>NEON, AVX2 and AVX-512 kernel sets; Apple's Accelerate on Macs before M4; no BLAS or LAPACK to install</li>
           <li>Small fronts one per core, large fronts across all cores, from one thread pool that never oversubscribes</li>
           <li>Real arithmetic for the real parts of complex FEM systems</li>
         </ul>

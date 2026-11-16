@@ -41,7 +41,8 @@ limits on memory bandwidth and arithmetic.
   useful arithmetic.
 - **Its own dense kernels.** On one core, the dense kernels reach 82 to 91% of
   the processor's peak. You do not need to install BLAS, LAPACK or any other
-  maths library.
+  maths library. On Macs before M4, SPARTA uses Apple's Accelerate, which
+  comes with macOS.
 
 [Why SPARTA is fast](#why-sparta-is-fast) lists the choices and the
 measurements.
@@ -153,7 +154,7 @@ faster.
 - **Parallelism that never competes for cores.** Near the bottom of the
   elimination tree, there are many small independent blocks, and each runs on
   one core. Near the top, there are a few large blocks, and each spreads over
-  every core. The dense kernels start no threads of their own.
+  every core. The dense kernels never add threads that compete with these.
 - **Pivots stay in their front.** When a pivot is tiny, SPARTA raises it
   instead of passing it on to a later block (see `static_pivot` in
   [Numerics](#numerics)). As a result, the plan never changes during
@@ -1415,6 +1416,12 @@ work is the matrix products, the triangular solves, and the LU and LDLᵀ
 factorization of each block's diagonal. You do not need to install or link
 anything, on any platform. GPU mode does not use these kernels.
 
+On Apple M1 to M3 and on Intel Macs, SPARTA uses Apple's Accelerate instead,
+which comes with macOS. These Macs have a matrix unit that only Apple's
+libraries can program, so Accelerate is faster there than SpartaBLAS's `neon`
+set. From M4 on, the same unit is programmable through SME, and the `sme512`
+set is as fast as Accelerate on our FEM test cases.
+
 SpartaBLAS has one kernel set per processor family. On first use, it picks
 the best set the processor supports:
 
@@ -1427,19 +1434,22 @@ the best set the processor supports:
 | `scalar` | Anything else | Portable fallback |
 
 `sparta.blas_library()` (Python) and `sparta::blas_library()` (Rust) name the
-set in use, for example `"SpartaBLAS (sme512)"`. To force a set for testing,
-set `SPARTA_KERNEL` before the first CPU factorization:
+set in use, for example `"SpartaBLAS (sme512)"`, or `"Accelerate"`. To force a
+set for testing, set `SPARTA_KERNEL` before the first CPU factorization. On a
+Mac, `SPARTA_KERNEL=accelerate` forces Accelerate:
 
 ```sh
-SPARTA_KERNEL=neon python my_simulation.py     # sme512, avx512, avx2, neon or scalar
+SPARTA_KERNEL=neon python my_simulation.py     # sme512, avx512, avx2, neon, scalar or accelerate
 ```
 
 If the processor cannot run the forced set, SPARTA prints a message and uses
 the best available set instead.
 
-The kernels start no threads of their own. Large calls split across the same
+SpartaBLAS starts no threads of its own. Large calls split across the same
 Rayon pool as the rest of SPARTA (see [CPU threads](#cpu-threads)), so the
-dense work never competes with the factorization for cores.
+dense work never competes with the factorization for cores. Accelerate uses
+its own threads, but only for a block that has the whole machine to itself.
+On macOS 15 and later, setting `threads` keeps Accelerate on one thread per call.
 
 The `sme512` kernels follow Arm's architecture, not one vendor's, but they need
 a 512-bit vector length. A processor with SME at another length uses `neon`

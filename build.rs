@@ -12,8 +12,10 @@
 //!   supports nothing compiles the symbolic analysis and the CPU backend, and
 //!   reports no device.
 //!
-//! Nothing is linked for the CPU dense kernels: they are SPARTA's own
-//! (`crates/sparta-blas`), compiled into the library.
+//! The CPU dense kernels are SPARTA's own (`crates/sparta-blas`), compiled
+//! into the library. On macOS, Accelerate is linked as well: `src/blas.rs`
+//! uses it on Macs without SME (M1 to M3, Intel), whose matrix unit only
+//! Apple's libraries can program.
 
 use std::{env, fs, path::{Path, PathBuf}, process::Command};
 
@@ -363,6 +365,9 @@ fn main() {
     }
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    if os == "macos" {
+        println!("cargo:rustc-link-lib=framework=Accelerate");
+    }
 
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     match backend(&os, &arch) {

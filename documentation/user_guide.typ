@@ -307,7 +307,7 @@ it made them faster.
 - *Parallelism that never competes for cores.* Near the bottom of the
   elimination tree, there are many small fronts, and each runs on one core.
   Near the top, there are a few large fronts, and each spreads over every
-  core. The dense kernels start no threads of their own.
+  core. The dense kernels never add threads that compete with these.
 - *Pivots stay in their front.* When a pivot is tiny, SPARTA raises it instead
   of passing it on (`static_pivot`). As a result, the plan never changes during
   factoring.
@@ -578,6 +578,12 @@ dense work is the matrix products, the triangular solves and the factorization
 of each front's diagonal block. You do not need to install or link anything,
 on any platform.
 
+On Apple M1 to M3 and on Intel Macs, SPARTA uses Apple's Accelerate instead,
+which comes with macOS. These Macs have a matrix unit that only Apple's
+libraries can program, so Accelerate is faster there than SpartaBLAS's `neon`
+set. From M4 on, the same unit is programmable through SME, and the `sme512`
+set is as fast as Accelerate on our FEM test cases.
+
 SpartaBLAS has one kernel set per processor family. On first use, it picks the
 best set the processor supports:
 
@@ -594,11 +600,12 @@ To see which set is in use:
 
 #code(```python
 import sparta
-print(sparta.blas_library())   # for example "SpartaBLAS (sme512)"
+print(sparta.blas_library())   # for example "SpartaBLAS (sme512)" or "Accelerate"
 ```)
 
 In Rust, `sparta::blas_library()` returns the same text. To force a set for
-testing, set `SPARTA_KERNEL` before the first CPU factorization. If the
+testing, set `SPARTA_KERNEL` before the first CPU factorization. On a Mac,
+`SPARTA_KERNEL=accelerate` forces Accelerate. If the
 processor cannot run that set, SPARTA prints a message and uses the best
 available set instead.
 
@@ -606,8 +613,11 @@ available set instead.
 SPARTA_KERNEL=neon python my_simulation.py
 ```)
 
-The kernels start no threads of their own. Large calls split across the same
-thread pool as the rest of SPARTA, so `threads` limits them too.
+SpartaBLAS starts no threads of its own. Large calls split across the same
+thread pool as the rest of SPARTA, so `threads` limits them too. Accelerate
+uses its own threads, but only for a front that has the whole machine to
+itself. On macOS 15 and later, setting `threads` keeps Accelerate on one
+thread per call.
 
 = Quick use
 
@@ -1482,7 +1492,7 @@ the setting.
   [`SPARTA_HYBRID_CPU`], [Overrides the default of `hybrid_cpu`.],
   [`RAYON_NUM_THREADS`], [Sizes the process-wide thread pool that SPARTA uses when `threads` is `0`. Set it before the program starts.],
   [`SPARTA_NUM_THREADS`], [A positive count overrides `threads` wherever it was given, in every language.],
-  [`SPARTA_KERNEL`], [Forces a CPU dense kernel set: `sme512`, `avx512`, `avx2`, `neon` or `scalar` (@blas).],
+  [`SPARTA_KERNEL`], [Forces a CPU dense kernel set: `sme512`, `avx512`, `avx2`, `neon` or `scalar`, or `accelerate` on a Mac (@blas).],
   [`SPARTA_PROFILE`], [`1` prints the time of each stage of analysis and factorization; `2` adds GPU dispatch detail.],
 )
 

@@ -242,8 +242,8 @@ idempotent and leave `Drop` with nothing to do.
 
 - `sparta.gpu_available()` reports whether Metal is visible to the process.
 - `sparta.blas_library()` names the CPU dense kernels in use, for example
-  `"SpartaBLAS (sme512)"`. `SPARTA_KERNEL` (`sme512`, `avx512`, `avx2`, `neon`
-  or `scalar`) forces a kernel set when set before the first CPU factorization.
+  `"SpartaBLAS (sme512)"`, or `"Accelerate"` on Macs before M4. `SPARTA_KERNEL`
+  (`sme512`, `avx512`, `avx2`, `neon`, `scalar`, or `accelerate` on a Mac) forces a kernel set when set before the first CPU factorization.
 - `F.path` is the selected Path enum; `F.n` is the matrix dimension.
 - `F.info` reports symbolic counts and byte estimates.
 - `F.factor_device_seconds` is GPU factor time, excluding CPU analysis/preparation.
