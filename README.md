@@ -1399,7 +1399,7 @@ GPUs under Windows and Linux.
 - **Memory.** All buffers together must fit in the GPU's memory. The four
   that grow with the problem (the front workspace, the factors, the panel
   workspace and LU's `U`) are reached by device address, so each can be up to
-  16 GiB, or the device's largest allocation if that is smaller. The others
+  16 GiB, or the device's largest buffer if that is smaller. The others
   are descriptor bindings, which NVIDIA limits to 4 GiB each, but they hold
   only the matrix and the analysis tables.
 - **Choosing a device.** With several GPUs, SPARTA uses the first discrete

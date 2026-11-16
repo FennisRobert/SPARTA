@@ -23,9 +23,12 @@ pub(super) struct Gpu {
     /// (`maxStorageBufferRange`, 4 GiB on NVIDIA).
     pub max_bound: u64,
     /// Largest buffer the kernels reach by address, in bytes: the device's
-    /// largest buffer and allocation, and 2^31 complex64 elements, the most
-    /// the kernels' signed 32-bit indices reach.
+    /// largest buffer, and 2^31 complex64 elements, the most the kernels'
+    /// signed 32-bit indices reach.
     pub max_addressed: u64,
+    /// The driver's recommended largest single allocation
+    /// (`maxMemoryAllocationSize`), named when a larger one fails.
+    pub max_allocation: u64,
     /// Smallest subgroup the device may run a compute pipeline at.
     pub min_subgroup: u32,
     /// Whether the device adds floats atomically in storage buffers, which
@@ -53,6 +56,7 @@ struct Candidate {
     min_subgroup: u32,
     max_bound: u64,
     max_addressed: u64,
+    max_allocation: u64,
 }
 
 /// The environment variable that picks the device: an index into the list of
@@ -145,6 +149,7 @@ impl Gpu {
             memory,
             max_bound: chosen.max_bound,
             max_addressed: chosen.max_addressed,
+            max_allocation: chosen.max_allocation,
             min_subgroup: chosen.min_subgroup,
             atomic_float: chosen.atomic_float,
             name,
@@ -219,8 +224,17 @@ impl Gpu {
                 Ok(memory) => memory,
                 Err(e) => {
                     device.destroy_buffer(buffer, None);
+                    let advice = if needs.size > self.max_allocation {
+                        format!(
+                            " ({} recommends at most {:.2} GiB per allocation)",
+                            self.name,
+                            self.max_allocation as f64 / GIB
+                        )
+                    } else {
+                        String::new()
+                    };
                     return Err(Error::Device(format!(
-                        "allocating {:.2} GiB for {what}: {e}",
+                        "allocating {:.2} GiB for {what}: {e}{advice}",
                         size as f64 / GIB
                     )));
                 }
@@ -364,10 +378,13 @@ fn candidates(instance: &ash::Instance) -> Result<(Vec<Candidate>, Vec<String>)>
             let max_bound = maintenance
                 .max_buffer_size
                 .min(u64::from(properties.limits.max_storage_buffer_range));
-            let max_addressed = maintenance
-                .max_buffer_size
-                .min(allocation.max_memory_allocation_size)
-                .min(8 << 31);
+            // maxMemoryAllocationSize is a recommendation, not a limit: a larger
+            // allocation is valid and either succeeds or fails with
+            // OUT_OF_DEVICE_MEMORY. NVIDIA recommends 0xffe00000 (just under
+            // 4 GiB) on every card, yet allocates larger blocks, so it does
+            // not bound the buffer here.
+            let max_addressed = maintenance.max_buffer_size.min(8 << 31);
+            let max_allocation = allocation.max_memory_allocation_size;
             let portability = instance
                 .enumerate_device_extension_properties(physical)
                 .unwrap_or_default()
@@ -382,6 +399,7 @@ fn candidates(instance: &ash::Instance) -> Result<(Vec<Candidate>, Vec<String>)>
                 min_subgroup: subgroup_size.min_subgroup_size.max(1),
                 max_bound,
                 max_addressed,
+                max_allocation,
             });
         }
     }

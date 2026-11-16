@@ -11,7 +11,7 @@ build-backend = "maturin"
 
 [project]
 name = "sparta-solver"
-version = "0.3.8"
+version = "0.3.9"
 requires-python = ">=3.9"
 dependencies = ["numpy>=1.21", "scipy>=1.7"]
 description = "Sparse direct solver for finite-element problems: optimal ordering, own dense kernels, GPU or CPU"
