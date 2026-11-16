@@ -52,6 +52,7 @@ pub(super) fn set_threading(threading: Threading) -> bool {
         }
         // SAFETY: the symbol `crate::blas` resolved, called with one of the
         // two values Accelerate documents.
+        #[cfg(target_os = "macos")]
         Some(PerThread::Accelerate(set)) => unsafe {
             set(match threading {
                 Threading::Machine => 0,

@@ -11,7 +11,7 @@
 //! Right-hand sides are held row-major, `nrhs` values per unknown, so every
 //! factor column is read once for all of them, and every inner loop walks a
 //! factor column contiguously.
-use super::dense::{self, Threading};
+use super::dense::{self, Side, Threading, Tri};
 use super::Scalar;
 use super::{block, div, finite, RealHalf, Solver, C, R};
 use crate::{Error, Kind, Result};
@@ -145,7 +145,36 @@ fn axpy_real(t: &mut [C], l: &[R], y: &[C]) {
     }
 }
 
+/// Run `work` with this thread's dense calls spread over the machine when
+/// `threads` is set, and back on the calling thread after.
+fn with_threading<T>(threads: bool, work: impl FnOnce() -> T) -> T {
+    if threads {
+        dense::set_threading(Threading::Machine);
+    }
+    let out = work();
+    if threads {
+        dense::set_threading(Threading::Caller);
+    }
+    out
+}
+
 impl Solver {
+    /// Call `solve` with a node's `n` by `n` diagonal block of its factor,
+    /// row-major, as complex values (a real block is copied, which costs `n²`
+    /// against the solve's `n² r`), and whether it may use every core: only
+    /// a node alone in its level of a solve that set the pool to one thread
+    /// per call (`with_caller_blas`).
+    fn solve_diagonal(&self, block: Block<'_>, n: usize, r: usize, alone: bool, solve: impl FnOnce(&[C], bool)) {
+        let threads = alone && gemm(r, usize::MAX);
+        match block {
+            Block::Complex(l) => solve(&l[..n * n], threads),
+            Block::Real(l) => {
+                let copy: Vec<C> = l[..n * n].iter().map(|&v| C::from_re(v)).collect();
+                solve(&copy, threads)
+            }
+        }
+    }
+
     /// Node `id`'s `nr` by `nc` block of `L`, row-major, wherever it is stored.
     fn block(&self, id: usize) -> Block<'_> {
         let node = self.plan.nodes[id];
@@ -247,9 +276,10 @@ impl Solver {
         let plan = &self.plan;
         let mut tails: Vec<Vec<C>> = vec![Vec::new(); plan.nodes.len()];
         for level in &plan.levels {
+            let alone = level.len() == 1;
             let done: Vec<Vec<C>> = level
                 .par_iter()
-                .map(|&id| self.forward_node(id as usize, x, r, &tails))
+                .map(|&id| self.forward_node(id as usize, x, r, &tails, alone))
                 .collect();
             for (&id, tail) in level.iter().zip(done) {
                 let node = plan.nodes[id as usize];
@@ -264,7 +294,7 @@ impl Solver {
 
     /// Eliminate node `id`'s pivots from the right-hand sides and return its
     /// trailing update, `nr - nc` rows of `r` values in front order.
-    unsafe fn forward_node(&self, id: usize, x: Rows, r: usize, tails: &[Vec<C>]) -> Vec<C> {
+    unsafe fn forward_node(&self, id: usize, x: Rows, r: usize, tails: &[Vec<C>], alone: bool) -> Vec<C> {
         let plan = &self.plan;
         let node = plan.nodes[id];
         let (m, n, first) = (node.nr as usize, node.nc as usize, node.first as usize);
@@ -287,7 +317,7 @@ impl Solver {
                 }
             }
         }
-        let (y, t) = self.eliminate(id, w, r);
+        let (y, t) = self.eliminate(id, w, r, alone);
         let lu = plan.kind == Kind::Lu;
         for (k, value) in y.chunks_exact(r).enumerate() {
             let g = if lu { rows[k] } else { rows[perm[k]] };
@@ -304,10 +334,12 @@ impl Solver {
     /// - `w`: the front's right-hand side, `nr` rows of `r` values in front
     ///   order: its own pivot rows plus every child's update.
     /// - `r`: values per row.
+    /// - `alone`: whether the node has its level to itself, so its triangular
+    ///   solve may spread over the machine.
     ///
     /// Returns `y`, `nc` rows in pivot order, and the update, `nr - nc` rows
     /// in front order, for the parent.
-    pub(super) fn eliminate(&self, id: usize, mut w: Vec<C>, r: usize) -> (Vec<C>, Vec<C>) {
+    pub(super) fn eliminate(&self, id: usize, mut w: Vec<C>, r: usize, alone: bool) -> (Vec<C>, Vec<C>) {
         let node = self.plan.nodes[id];
         let (m, n, first) = (node.nr as usize, node.nc as usize, node.first as usize);
         let perm = &self.perms[first..first + n];
@@ -317,11 +349,24 @@ impl Solver {
             slot.copy_from_slice(&w[perm[k] * r..perm[k] * r + r]);
         }
         // L is row-major (`Solver::rowmajor`): row `i` holds `L[i][0..nc]`.
-        for i in 1..n {
-            let (before, at) = y.split_at_mut(i * r);
-            match block {
-                Block::Complex(l) => dot(&mut at[..r], &l[i * n..i * n + i], before),
-                Block::Real(l) => dot_real(&mut at[..r], &l[i * n..i * n + i], before),
+        if gemm(r, n * n) {
+            // `y = L11^-1 y` by the blocked solve, whose work is mostly GEMM,
+            // rather than row by row. With the same in `backward_node`, on
+            // Zen 4 (8 cores, AVX-512, default refinement) 64 right-hand
+            // sides went from 7.9 to 7.2 s on em_m4 and from 0.93 to 0.86 s
+            // on em_m1. Without refinement, 16 and 64 right-hand sides now
+            // take 0.7 to 0.8 times 0.3.6's time on em_m1 and em_m4 and
+            // under half on em_m3 (LU).
+            self.solve_diagonal(block, n, r, alone, |l11, threads| {
+                with_threading(threads, || dense::trsm(Side::Left, Tri::UnitLower, n, r, l11, n, &mut y, r))
+            });
+        } else {
+            for i in 1..n {
+                let (before, at) = y.split_at_mut(i * r);
+                match block {
+                    Block::Complex(l) => dot(&mut at[..r], &l[i * n..i * n + i], before),
+                    Block::Real(l) => dot_real(&mut at[..r], &l[i * n..i * n + i], before),
+                }
             }
         }
         let mut t = w.split_off(n * r);
@@ -406,11 +451,12 @@ impl Solver {
     /// only its own pivot rows.
     unsafe fn backward(&self, x: Rows, r: usize) {
         for level in self.plan.levels.iter().rev() {
-            level.par_iter().for_each(|&id| self.backward_node(id as usize, x, r));
+            let alone = level.len() == 1;
+            level.par_iter().for_each(|&id| self.backward_node(id as usize, x, r, alone));
         }
     }
 
-    unsafe fn backward_node(&self, id: usize, x: Rows, r: usize) {
+    unsafe fn backward_node(&self, id: usize, x: Rows, r: usize, alone: bool) {
         let plan = &self.plan;
         let node = plan.nodes[id];
         let (m, n, first) = (node.nr as usize, node.nc as usize, node.first as usize);
@@ -504,7 +550,24 @@ impl Solver {
                 }
             }
         }
-        if lu {
+        if gemm(r, n * n) {
+            // The blocked solve, whose work is mostly GEMM. LU: `head =
+            // U11^-1 head`, U11 above L11's diagonal. LDL^T: `L11^T x = head`
+            // is `x^T L11 = head^T`, solved on a transposed copy.
+            self.solve_diagonal(block, n, r, alone, |l11, threads| {
+                with_threading(threads, || {
+                    if lu {
+                        dense::trsm(Side::Left, Tri::Upper, n, r, l11, n, head, r);
+                    } else {
+                        let mut ht: Vec<C> = (0..r * n).map(|e| head[(e % n) * r + e / n]).collect();
+                        dense::trsm(Side::Right, Tri::UnitLower, r, n, l11, n, &mut ht, n);
+                        for (e, &v) in ht.iter().enumerate() {
+                            head[(e % n) * r + e / n] = v;
+                        }
+                    }
+                })
+            });
+        } else if lu {
             let Block::Complex(l) = block else {
                 unreachable!("only LDL^T has a real half")
             };

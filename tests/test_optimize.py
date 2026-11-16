@@ -57,6 +57,7 @@ class ProfileTests(ProfileFile):
         with self.assertRaises(ValueError):
             sparta.optimize(laplacian(4), name='one_shot', verbose=False)
 
+    @unittest.skipUnless(sparta.gpu_available(), "GPU device required")
     def test_analyze_takes_a_profile_or_preset_name(self):
         a = laplacian(12)
         sparta.Config.defaults().with_(nemin=8).save('small')

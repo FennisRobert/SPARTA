@@ -106,6 +106,73 @@ pub unsafe fn sytrf<T: Element>(n: usize, a: *mut T, lda: usize, ipiv: &mut [i32
     info
 }
 
+/// `A[j0.., j0..] -= L·Wᵀ` on the lower triangle of the `m × m` block at
+/// `(j0, j0)`, where L is `A[j0.., 0..k]` and W is `W[j0.., 0..k]`.
+///
+/// Recursive, as a SYRK: the block halves into two triangles, recursed, and
+/// the rectangle below the first, one GEMM. Most of the work then lands in a
+/// few large products, which the kernels run near peak and thread well,
+/// rather than in one `NB`-column GEMM per block column. On a 1286-column
+/// `zsytrf` on 8 Zen 4 cores, the whole factorization went from 62 to 106
+/// GFLOP/s threaded (OpenBLAS: 212), and on one core from 0.67-0.78 to
+/// 0.68-0.85 times OpenBLAS's speed over 128 to 1286 columns.
+/// Triangles of `NB` columns or fewer go through scratch: their whole square
+/// by GEMM, then only the lower triangle back, since the upper is not
+/// referenced.
+unsafe fn update_lower<T: Element>(threads: bool, j0: usize, m: usize, a: Mat<T>, w: Mat<T>, k: usize) {
+    let l = |row: usize| View { p: a.at(row, 0) as *const T, rs: 1, cs: a.ld as isize };
+    let wt = |row: usize| View { p: w.at(row, 0) as *const T, rs: w.ld as isize, cs: 1 };
+    if m <= NB {
+        let mut block = vec![T::zero(); m * m];
+        gemm(threads, m, m, k, -T::one(), l(j0), wt(j0), T::zero(), block.as_mut_ptr(), 1, m as isize);
+        for jj in 0..m {
+            for i in jj..m {
+                a.set(j0 + i, j0 + jj, a.get(j0 + i, j0 + jj) + block[i + jj * m]);
+            }
+        }
+        return;
+    }
+    let h = (m / 2).div_ceil(NB) * NB;
+    update_lower(threads, j0, h, a, w, k);
+    gemm(threads, m - h, h, k, -T::one(), l(j0 + h), wt(j0), T::one(), a.at(j0 + h, j0), 1, a.ld as isize);
+    update_lower(threads, j0 + h, m - h, a, w, k);
+}
+
+crate::isa::multiversion! {
+    /// `out[0..len] -= Σ_p src[0..len, p]·s[p]` for `p < k`: one column of the
+    /// panel brought up to date by the panel's earlier columns. `src` is
+    /// column-major with leading dimension `lds`; `s[p]` is at `s + p·ss`.
+    /// This is the panel's serial work, a matrix-vector product, so it is
+    /// compiled per kernel family.
+    unsafe fn panel_update<T: Element>(len: usize, k: usize, out: *mut T, src: *const T, lds: usize, s: *const T, ss: usize) => panel_update_body
+}
+
+/// The loop of [`panel_update`], four source columns per pass so `out` is
+/// read and written a quarter as often. With the AVX copies, `zsytrf` on one
+/// Zen 4 core went from 0.68-0.85 to 0.91-1.03 times OpenBLAS's speed (128 to
+/// 1286 columns).
+#[inline(always)]
+unsafe fn panel_update_body<T: Element>(len: usize, k: usize, out: *mut T, src: *const T, lds: usize, s: *const T, ss: usize) {
+    let out = std::slice::from_raw_parts_mut(out, len);
+    let col = |p: usize| std::slice::from_raw_parts(src.add(p * lds), len);
+    let mut p = 0;
+    while p + 4 <= k {
+        let (s0, s1, s2, s3) = (*s.add(p * ss), *s.add((p + 1) * ss), *s.add((p + 2) * ss), *s.add((p + 3) * ss));
+        let (c0, c1, c2, c3) = (col(p), col(p + 1), col(p + 2), col(p + 3));
+        for i in 0..len {
+            out[i] = out[i] - (c0[i] * s0 + c1[i] * s1 + c2[i] * s2 + c3[i] * s3);
+        }
+        p += 4;
+    }
+    while p < k {
+        let s0 = *s.add(p * ss);
+        for (o, &x) in out.iter_mut().zip(col(p)) {
+            *o = *o - x * s0;
+        }
+        p += 1;
+    }
+}
+
 /// One blocked panel (`?lasyf`, lower) of the `n × n` trailing matrix `a`.
 /// Returns (columns factored, `info` relative to the panel).
 unsafe fn lasyf<T: Element>(threads: bool, n: usize, a: Mat<T>, w: &mut [T], ipiv: &mut [i32]) -> (usize, i32) {
@@ -115,19 +182,8 @@ unsafe fn lasyf<T: Element>(threads: bool, n: usize, a: Mat<T>, w: &mut [T], ipi
     let mut info = 0;
     let mut k = 0;
     // Column k of the trailing matrix, updated by the panel so far, into
-    // column `col` of W: W[k.., col] = A-source - A[k.., 0..k]·W[row, 0..k]^T.
-    // Column by column of the panel, so the inner loop runs down contiguous
-    // columns of A and W.
-    let update = |k: usize, col: usize, row: usize| {
-        let out = std::slice::from_raw_parts_mut(w.at(k, col), n - k);
-        for p in 0..k {
-            let s = w.get(row, p);
-            let src = std::slice::from_raw_parts(a.at(k, p), n - k);
-            for (o, &x) in out.iter_mut().zip(src) {
-                *o = *o - x * s;
-            }
-        }
-    };
+    // column `col` of W: W[k.., col] -= A[k.., 0..k]·W[row, 0..k]^T.
+    let update = |k: usize, col: usize, row: usize| panel_update(n - k, k, w.at(k, col), a.at(k, 0), a.ld, w.at(row, 0), w.ld);
     loop {
         if (k + 1 >= NB && NB < n) || k >= n {
             break;
@@ -234,27 +290,8 @@ unsafe fn lasyf<T: Element>(threads: bool, n: usize, a: Mat<T>, w: &mut [T], ipi
         k += kstep;
     }
 
-    // A22 -= L21·W21^T, lower triangle, NB columns at a time: the diagonal
-    // blocks column by column, the blocks below them by GEMM.
-    for j in (k..n).step_by(NB) {
-        let jb = NB.min(n - j);
-        // The diagonal block whole, by GEMM into scratch; only its lower
-        // triangle goes back, since the upper one is not referenced.
-        let mut block = vec![T::zero(); jb * jb];
-        let lj = View { p: a.at(j, 0) as *const T, rs: 1, cs: a.ld as isize };
-        let wj = View { p: w.at(j, 0) as *const T, rs: w.ld as isize, cs: 1 };
-        gemm(threads, jb, jb, k, -T::one(), lj, wj, T::zero(), block.as_mut_ptr(), 1, jb as isize);
-        for jj in 0..jb {
-            for i in jj..jb {
-                a.set(j + i, j + jj, a.get(j + i, j + jj) + block[i + jj * jb]);
-            }
-        }
-        if j + jb < n {
-            let l21 = View { p: a.at(j + jb, 0) as *const T, rs: 1, cs: a.ld as isize };
-            let w21t = View { p: w.at(j, 0) as *const T, rs: w.ld as isize, cs: 1 };
-            gemm(threads, n - j - jb, jb, k, -T::one(), l21, w21t, T::one(), a.at(j + jb, j), 1, a.ld as isize);
-        }
-    }
+    // A22 -= L21·W21^T, lower triangle.
+    update_lower(threads, k, n - k, a, w, k);
 
     // Put L21 back in LAPACK's storage order: undo, in the earlier columns,
     // the row interchanges the panel applied to them.

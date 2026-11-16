@@ -72,35 +72,50 @@ pub(crate) unsafe fn real<S: Simd, const MV: usize, const NR: usize>(
         b = b.add(NR);
     }
 
-    // The accumulators go to memory once, with stores the compiler unrolls
-    // fully; everything after reads them back from `tile`. Indexing `acc` in
-    // the write-out loops instead would make the compiler keep it addressable
-    // and store every accumulator on every step of the loop above.
+    // A full tile on a C contiguous down its columns goes straight from the
+    // accumulators. Every index into `acc` is a constant of the unrolled
+    // loops, so the compiler keeps it in registers; a loop variable would make
+    // it keep `acc` in memory and store every accumulator on every step of
+    // the loop above. Writing through `tile` instead cost a store and a load
+    // per vector, which at the short depths of a front's update (32 to 64)
+    // is a large share of the tile. On Zen 4 (AVX-512, one thread) it took
+    // `dgemm` at depths 32 to 64 from 0.77-0.88 times OpenBLAS's speed to
+    // 0.90-0.99, and `zgemm` on every shape tried from 0.89-1.04 to 0.99-1.07.
     let mr = MV * l;
+    let va = S::splat(alpha);
+    if t.m == mr && t.n == NR && t.rs == 1 {
+        if beta == S::R::ZERO {
+            unroll!(J < NR => {
+                let col = t.c.offset(J as isize * t.cs);
+                unroll!(I < MV => { S::store(col.add(I * l), S::mul(acc[I][J], va)); });
+            });
+        } else if beta == S::R::ONE {
+            unroll!(J < NR => {
+                let col = t.c.offset(J as isize * t.cs);
+                unroll!(I < MV => {
+                    let p = col.add(I * l);
+                    S::store(p, S::fma(acc[I][J], va, S::load(p)));
+                });
+            });
+        } else {
+            let vb = S::splat(beta);
+            unroll!(J < NR => {
+                let col = t.c.offset(J as isize * t.cs);
+                unroll!(I < MV => {
+                    let p = col.add(I * l);
+                    S::store(p, S::fma(acc[I][J], va, S::mul(S::load(p), vb)));
+                });
+            });
+        }
+        return;
+    }
+    // Otherwise the accumulators go to memory once, with stores the compiler
+    // unrolls fully, and everything after reads them back from `tile`.
     let mut tile = [S::R::ZERO; MAX_TILE];
     unroll!(J < NR => {
         unroll!(I < MV => { S::store(tile.as_mut_ptr().add(J * mr + I * l), acc[I][J]); });
     });
     let tile = tile.as_ptr();
-    let va = S::splat(alpha);
-    if t.m == mr && t.n == NR && t.rs == 1 {
-        let vb = S::splat(beta);
-        for j in 0..NR {
-            let col = t.c.offset(j as isize * t.cs);
-            for i in 0..MV {
-                let (p, x) = (col.add(i * l), S::load(tile.add(j * mr + i * l)));
-                let v = if beta == S::R::ZERO {
-                    S::mul(x, va)
-                } else if beta == S::R::ONE {
-                    S::fma(x, va, S::load(p))
-                } else {
-                    S::fma(x, va, S::mul(S::load(p), vb))
-                };
-                S::store(p, v);
-            }
-        }
-        return;
-    }
     // A partial tile, or C not contiguous down its columns.
     for j in 0..t.n {
         for i in 0..t.m {
@@ -153,29 +168,21 @@ pub(crate) unsafe fn complex<S: Simd, const MV: usize, const NR: usize>(
         b = b.add(2 * NR);
     }
 
-    // As in `real`: accumulators to memory once, real parts then imaginary
-    // parts per column.
-    let mut tile = [S::R::ZERO; MAX_TILE];
-    unroll!(J < NR => {
-        unroll!(I < MV => {
-            S::store(tile.as_mut_ptr().add(2 * J * mr + I * l), re[I][J]);
-            S::store(tile.as_mut_ptr().add(2 * J * mr + mr + I * l), im[I][J]);
-        });
-    });
-    let tile = tile.as_ptr();
+    // As in `real`: a full tile goes straight from the accumulators, with
+    // constant indices only.
     let zero = S::R::ZERO;
     let beta_zero = beta.0 == zero && beta.1 == zero;
     if t.m == mr && t.n == NR && t.rs == 1 {
         let (ar, ai) = (S::splat(alpha.0), S::splat(alpha.1));
         let (br, bi) = (S::splat(beta.0), S::splat(beta.1));
+        let alpha_real = alpha.1 == zero;
         let beta_one = beta.0 == S::R::ONE && beta.1 == zero;
-        for j in 0..NR {
-            let col = t.c.offset(2 * j as isize * t.cs);
-            for i in 0..MV {
-                let p = col.add(2 * i * l);
-                let r = S::load(tile.add(2 * j * mr + i * l));
-                let m = S::load(tile.add(2 * j * mr + mr + i * l));
-                let (mut vr, mut vi) = if alpha.1 == zero {
+        unroll!(J < NR => {
+            let col = t.c.offset(2 * J as isize * t.cs);
+            unroll!(I < MV => {
+                let p = col.add(2 * I * l);
+                let (r, m) = (re[I][J], im[I][J]);
+                let (mut vr, mut vi) = if alpha_real {
                     (S::mul(r, ar), S::mul(m, ar))
                 } else {
                     (S::fnma(m, ai, S::mul(r, ar)), S::fma(r, ai, S::mul(m, ar)))
@@ -191,10 +198,19 @@ pub(crate) unsafe fn complex<S: Simd, const MV: usize, const NR: usize>(
                     }
                 }
                 S::store2(p, vr, vi);
-            }
-        }
+            });
+        });
         return;
     }
+    // Otherwise through memory, real parts then imaginary parts per column.
+    let mut tile = [S::R::ZERO; MAX_TILE];
+    unroll!(J < NR => {
+        unroll!(I < MV => {
+            S::store(tile.as_mut_ptr().add(2 * J * mr + I * l), re[I][J]);
+            S::store(tile.as_mut_ptr().add(2 * J * mr + mr + I * l), im[I][J]);
+        });
+    });
+    let tile = tile.as_ptr();
     for j in 0..t.n {
         for i in 0..t.m {
             let p = t.c.offset(2 * (i as isize * t.rs + j as isize * t.cs));

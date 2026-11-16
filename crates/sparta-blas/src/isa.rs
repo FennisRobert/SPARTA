@@ -106,3 +106,41 @@ pub fn force(isa: Option<Isa>) -> Result<(), String> {
         }
     }
 }
+
+/// Define `fn $name` that runs `$body` compiled for the kernel family in use.
+///
+/// The crate is compiled for the target's baseline, which on x86-64 is SSE2:
+/// only the microkernels carry AVX2 or AVX-512 themselves. This compiles a
+/// generic `$body`, which must be `#[inline(always)]`, twice more on x86-64,
+/// with AVX2 and with AVX-512 enabled, and picks the copy matching
+/// [`current`]. Elsewhere it is a plain call. Used where it was measured to
+/// matter: the LDLᵀ panel. The packing and the small triangular solves
+/// showed no change on Zen 4.
+macro_rules! multiversion {
+    ($(#[$m:meta])* $vis:vis unsafe fn $name:ident <$T:ident : $B:path> ($($a:ident : $t:ty),* $(,)?) $(-> $r:ty)? => $body:ident) => {
+        $(#[$m])*
+        #[allow(clippy::too_many_arguments)]
+        $vis unsafe fn $name<$T: $B>($($a: $t),*) $(-> $r)? {
+            #[cfg(target_arch = "x86_64")]
+            {
+                #[target_feature(enable = "avx512f,avx2,fma")]
+                #[allow(clippy::too_many_arguments)]
+                unsafe fn avx512<$T: $B>($($a: $t),*) $(-> $r)? {
+                    $body::<$T>($($a),*)
+                }
+                #[target_feature(enable = "avx2,fma")]
+                #[allow(clippy::too_many_arguments)]
+                unsafe fn avx2<$T: $B>($($a: $t),*) $(-> $r)? {
+                    $body::<$T>($($a),*)
+                }
+                match $crate::isa::current() {
+                    $crate::isa::Isa::Avx512 => return avx512::<$T>($($a),*),
+                    $crate::isa::Isa::Avx2 => return avx2::<$T>($($a),*),
+                    _ => {}
+                }
+            }
+            $body::<$T>($($a),*)
+        }
+    };
+}
+pub(crate) use multiversion;

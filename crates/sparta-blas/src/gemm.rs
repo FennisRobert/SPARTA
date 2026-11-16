@@ -315,57 +315,85 @@ pub(crate) unsafe fn gemm<T: Element>(
             let beta = if pc == 0 { beta } else { one };
             let bview = View { p: b.at(pc, jc), rs: b.rs, cs: b.cs };
             with_buffer(&PACK_B, packed_len::<T>(nc, kc, cfg.nr), |bp: *mut T::Real| {
-                let special = cfg.pack.is_some_and(|f| f(nc, kc, bview.p.cast(), bview.cs, bview.rs, cfg.nr, bp));
-                if !special {
-                    pack_b(kc, nc, bview, cfg.nr, bp);
-                }
-                let bp = bp as *const T::Real;
                 let w = if T::COMPLEX { 2 } else { 1 };
-                // One task: rows [i0, i0 + mc) against B columns [j0, j1).
-                let task = |i0: usize, j0: usize, j1: usize| {
-                    let mc = cfg.mc.min(m - i0);
-                    let aview = View { p: a.at(i0, pc), rs: a.rs, cs: a.cs };
-                    with_buffer(&PACK_A, packed_len::<T>(mc, kc, cfg.mr), |ap: *mut T::Real| {
-                        let special = cfg.pack.is_some_and(|f| f(mc, kc, aview.p.cast(), aview.rs, aview.cs, cfg.mr, ap));
-                        if !special {
-                            pack_a(mc, kc, aview, cfg.mr, ap);
-                        }
-                        let block = Block {
-                            mc,
-                            nc: j1 - j0,
-                            kc,
-                            ap,
-                            bp: bp.add(j0 * kc * w),
-                            c: cr.offset(w as isize * (i0 as isize * rsc + (jc + j0) as isize * csc)),
-                            rs: rsc,
-                            cs: csc,
-                            alpha,
-                            beta,
-                        };
-                        (cfg.kernel)(&block);
-                    });
-                };
-                if parallel {
-                    // Split rows into MC blocks and, when that gives too few
-                    // tasks, columns into whole NR slivers as well.
-                    let rows = m.div_ceil(cfg.mc);
-                    let slivers = nc.div_ceil(cfg.nr);
-                    let want = 2 * rayon::current_num_threads();
-                    let cols = want.div_ceil(rows).clamp(1, slivers);
-                    let per = slivers.div_ceil(cols) * cfg.nr;
-                    let task = Shared(task);
-                    (0..rows * cols).into_par_iter().for_each(|t| {
-                        let (r, s) = (t / cols, t % cols);
-                        let j0 = s * per;
-                        if j0 < nc {
-                            task.get()(r * cfg.mc, j0, (j0 + per).min(nc));
-                        }
-                    });
-                } else {
-                    for i0 in (0..m).step_by(cfg.mc) {
-                        task(i0, 0, nc);
+                // Pack columns [j0, j1) of the B block, j0 a multiple of NR,
+                // into their place in `bp`.
+                let pack_b_part = Shared(|j0: usize, j1: usize, bp: *mut T::Real| {
+                    let view = View { p: bview.at(0, j0), rs: bview.rs, cs: bview.cs };
+                    let dst = bp.add(j0 * kc * w);
+                    let special = cfg.pack.is_some_and(|f| f(j1 - j0, kc, view.p.cast(), view.cs, view.rs, cfg.nr, dst));
+                    if !special {
+                        pack_b(kc, j1 - j0, view, cfg.nr, dst);
                     }
+                });
+                // Pack rows [i0, i0 + mc) of the A block into `ap`.
+                let pack_a_rows = Shared(|i0: usize, mc: usize, ap: *mut T::Real| {
+                    let aview = View { p: a.at(i0, pc), rs: a.rs, cs: a.cs };
+                    let special = cfg.pack.is_some_and(|f| f(mc, kc, aview.p.cast(), aview.rs, aview.cs, cfg.mr, ap));
+                    if !special {
+                        pack_a(mc, kc, aview, cfg.mr, ap);
+                    }
+                });
+                // Multiply packed rows [i0, i0 + mc) of A by B columns [j0, j1).
+                let multiply = Shared(|i0: usize, mc: usize, ap: *const T::Real, j0: usize, j1: usize, bp: *const T::Real| {
+                    let block = Block {
+                        mc,
+                        nc: j1 - j0,
+                        kc,
+                        ap,
+                        bp: bp.add(j0 * kc * w),
+                        c: cr.offset(w as isize * (i0 as isize * rsc + (jc + j0) as isize * csc)),
+                        rs: rsc,
+                        cs: csc,
+                        alpha,
+                        beta,
+                    };
+                    (cfg.kernel)(&block);
+                });
+                if !parallel {
+                    pack_b_part.get()(0, nc, bp);
+                    for i0 in (0..m).step_by(cfg.mc) {
+                        let mc = cfg.mc.min(m - i0);
+                        with_buffer(&PACK_A, packed_len::<T>(mc, kc, cfg.mr), |ap: *mut T::Real| {
+                            pack_a_rows.get()(i0, mc, ap);
+                            multiply.get()(i0, mc, ap, 0, nc, bp);
+                        });
+                    }
+                    return;
                 }
+                // Threaded. B is packed by every thread, in whole slivers;
+                // packed by the caller alone, it left the others idle for a
+                // fifth to a third of each step (Zen 4, 1024-cubed dgemm).
+                let threads = rayon::current_num_threads();
+                let slivers = nc.div_ceil(cfg.nr);
+                let per_pack = slivers.div_ceil(threads).max(1) * cfg.nr;
+                let shared_b = Shared(bp);
+                (0..nc.div_ceil(per_pack)).into_par_iter().for_each(|t| {
+                    let j0 = t * per_pack;
+                    pack_b_part.get()(j0, (j0 + per_pack).min(nc), *shared_b.get());
+                });
+                // Rows into MC blocks and, when that gives too few tasks,
+                // columns into whole NR slivers as well.
+                let rows = m.div_ceil(cfg.mc);
+                let want = 2 * threads;
+                let cols = want.div_ceil(rows).clamp(1, slivers);
+                let per = slivers.div_ceil(cols) * cfg.nr;
+                // Each task packs its own rows of A. With several tasks per
+                // row block that packs them more than once, which measured
+                // cheaper than packing A in a parallel step of its own
+                // first: the extra fork and join cost more at the medium
+                // sizes (200 to 600 rows) than the repeated packing.
+                (0..rows * cols).into_par_iter().for_each(|t| {
+                    let (r, c) = (t / cols, t % cols);
+                    let (i0, j0) = (r * cfg.mc, c * per);
+                    if j0 < nc {
+                        let mc = cfg.mc.min(m - i0);
+                        with_buffer(&PACK_A, packed_len::<T>(mc, kc, cfg.mr), |ap: *mut T::Real| {
+                            pack_a_rows.get()(i0, mc, ap);
+                            multiply.get()(i0, mc, ap, j0, (j0 + per).min(nc), *shared_b.get());
+                        });
+                    }
+                });
             });
         }
     }

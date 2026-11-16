@@ -47,6 +47,7 @@ pub(crate) enum PerThread {
     Sparta(extern "C" fn(u32) -> i32),
     /// Accelerate's `BLASSetThreading` (macOS 15 and later): a call spreads
     /// over Accelerate's own threads.
+    #[cfg(target_os = "macos")]
     Accelerate(unsafe extern "C" fn(u32) -> i32),
 }
 

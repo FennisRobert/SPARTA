@@ -76,7 +76,8 @@ class SymbolicTests(unittest.TestCase):
         a = sparse.csc_matrix(np.ones((8,8),dtype=np.complex64)+np.eye(8,dtype=np.complex64))
         with self.assertRaises(RuntimeError): sparta.analyze(a,max_front=4)
         if not sparta.gpu_available():
-            with self.assertRaisesRegex(RuntimeError,'Metal'): sparta.analyze(a,path=sparta.Path.LDLT).factorize()
+            # Metal or Vulkan, whichever this build targets.
+            with self.assertRaisesRegex(RuntimeError,'Metal|Vulkan'): sparta.analyze(a,path=sparta.Path.LDLT).factorize()
 
 @unittest.skipUnless(sparta.gpu_available(), 'requires Apple Silicon Metal')
 class HardwareTests(unittest.TestCase):

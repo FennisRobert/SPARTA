@@ -74,7 +74,7 @@ class PathologyTests(unittest.TestCase):
         a = bench.lap3d(6, 0.5 + 0.1j)
         with warnings.catch_warnings():
             warnings.simplefilter('error', sparta.AccuracyWarning)
-            sparta.analyze(a).factorize().solve(a @ np.ones(216))
+            sparta.analyze(a, force_cpu=not sparta.gpu_available()).factorize().solve(a @ np.ones(216))
 
     def test_complex64_overflow_message(self) -> None:
         if not sparta.gpu_available():

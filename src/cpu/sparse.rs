@@ -271,7 +271,7 @@ impl Solver {
                     }
                 }
             }
-            let (solved, tail) = self.eliminate(id as usize, w, r);
+            let (solved, tail) = self.eliminate(id as usize, w, r, false);
             let perm = &self.perms[node.first as usize..node.first as usize + n];
             for (k, value) in solved.chunks_exact(r).enumerate() {
                 let row = own + perm[k];
