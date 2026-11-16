@@ -7,8 +7,13 @@
 use super::{Analysis, Complex32, Error, Result};
 
 /// No GPU kernels were compiled into this build.
-pub(crate) fn available() -> bool {
-    false
+pub(crate) fn status() -> std::result::Result<String, String> {
+    Err(format!(
+        "this build of SPARTA has no GPU backend (built without default \
+         features, or {}-{} has none)",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    ))
 }
 
 pub(crate) struct Context;

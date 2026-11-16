@@ -240,7 +240,12 @@ idempotent and leave `Drop` with nothing to do.
 
 ## Inspection and availability
 
-- `sparta.gpu_available()` reports whether Metal is visible to the process.
+- `sparta.gpu_available()` reports whether this build's GPU backend (Metal or
+  Vulkan) can run in the process.
+- `sparta.gpu_status()` names the GPU, for example `"Vulkan on NVIDIA RTX
+  A5000"`, or returns `"unavailable: "` and the reason: no GPU backend in the
+  build, no Metal device, or a missing Vulkan loader or driver with what to
+  install. Rust: `sparta::gpu_status()`, `Ok(device)` or `Err(reason)`.
 - `sparta.blas_library()` names the CPU dense kernels in use, for example
   `"SpartaBLAS (sme512)"`, or `"Accelerate"` on Macs before M4. `SPARTA_KERNEL`
   (`sme512`, `avx512`, `avx2`, `neon`, `scalar`, or `accelerate` on a Mac) forces a kernel set when set before the first CPU factorization.

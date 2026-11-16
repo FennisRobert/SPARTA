@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "sparta-python"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "num-complex",
  "numpy",
@@ -383,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "sparta-solver"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "ash",
  "num-complex",

@@ -94,6 +94,8 @@ pub(super) struct Recorder<'a> {
     pub pipelines: &'a mut Pipelines,
     pub pool: vk::CommandPool,
     pub set: vk::DescriptorSet,
+    /// Device addresses of the `ADDRESSED` buffers, pushed with every range.
+    pub addresses: [u64; 4],
     pub commands: Vec<vk::CommandBuffer>,
     pub marks: Option<Marks>,
     bound: vk::Pipeline,
@@ -106,6 +108,7 @@ impl<'a> Recorder<'a> {
         pipelines: &'a mut Pipelines,
         pool: vk::CommandPool,
         set: vk::DescriptorSet,
+        addresses: [u64; 4],
         marks: Option<Marks>,
     ) -> Result<Self> {
         let mut recorder = Self {
@@ -113,6 +116,7 @@ impl<'a> Recorder<'a> {
             pipelines,
             pool,
             set,
+            addresses,
             commands: Vec::new(),
             marks,
             bound: vk::Pipeline::null(),
@@ -205,7 +209,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// One dispatch of `kernel` at workgroup shape `shape`, `groups` workgroups,
-    /// with push constants `range`, followed by the barrier that orders it
+    /// with push constants `range` (and the buffer addresses), followed by the barrier that orders it
     /// before everything recorded after it. Nothing is recorded for zero groups.
     fn dispatch(
         &mut self,
@@ -220,7 +224,11 @@ impl<'a> Recorder<'a> {
         let pipeline = self.pipelines.get(self.gpu, kernel, shape.0, shape.1)?;
         let command = self.current();
         let device = &self.gpu.device;
-        let bytes: Vec<u8> = range.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let bytes: Vec<u8> = range
+            .iter()
+            .flat_map(|v| v.to_ne_bytes())
+            .chain(self.addresses.iter().flat_map(|a| a.to_ne_bytes()))
+            .collect();
         // SAFETY: recording into the current command buffer with objects of
         // this device.
         unsafe {

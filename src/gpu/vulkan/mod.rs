@@ -26,12 +26,15 @@ mod schedule;
 use super::{Analysis, Complex32, Error, Result};
 use ash::vk;
 use device::{Buffer, Gpu};
-use pipelines::{Geometry, Pipelines, BINDINGS};
+use pipelines::{Geometry, Pipelines, ADDRESSED, BINDINGS};
 
-/// Whether a usable Vulkan compute device is visible to this process.
-pub(crate) fn available() -> bool {
-    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(device::any_device)
+/// The Vulkan device this process would run on, or why there is none.
+pub(crate) fn status() -> std::result::Result<String, String> {
+    static STATUS: std::sync::OnceLock<std::result::Result<String, String>> =
+        std::sync::OnceLock::new();
+    STATUS
+        .get_or_init(|| device::probe().map(|name| format!("Vulkan on {name}")))
+        .clone()
 }
 
 /// Buffer slots of a plan, in Metal's numbering (slot 14 is the push-constant
@@ -44,6 +47,8 @@ struct Inner {
     gpu: Gpu,
     pipelines: Pipelines,
     buffers: Vec<Option<Buffer>>,
+    /// Device addresses of the [`ADDRESSED`] buffers, in that order.
+    addresses: [u64; 4],
     descriptors: vk::DescriptorPool,
     set: vk::DescriptorSet,
     commands: vk::CommandPool,
@@ -117,6 +122,7 @@ impl Context {
             gpu,
             pipelines,
             buffers: (0..SLOTS).map(|_| None).collect(),
+            addresses: [0; 4],
             descriptors: vk::DescriptorPool::null(),
             set: vk::DescriptorSet::null(),
             commands: vk::CommandPool::null(),
@@ -230,13 +236,18 @@ impl Inner {
                 local as f64 / device::GIB
             )));
         }
-        for &slot in BINDINGS.iter() {
+        let slots = BINDINGS.iter().map(|&b| (b as usize, false));
+        for (slot, addressed) in slots.chain(ADDRESSED.iter().map(|&s| (s, true))) {
             let what = format!("buffer {slot}");
-            self.buffers[slot as usize] = Some(self.gpu.buffer(
-                lengths[slot as usize],
+            self.buffers[slot] = Some(self.gpu.buffer(
+                lengths[slot],
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
                 &what,
+                addressed,
             )?);
+        }
+        for (address, &slot) in self.addresses.iter_mut().zip(&ADDRESSED) {
+            *address = self.gpu.address(self.buffers[slot].as_ref().expect("created above"));
         }
         self.create_objects()?;
         self.write_descriptors();
@@ -251,7 +262,7 @@ impl Inner {
         self.stage(true, largest)?;
         let pool = self.commands;
         let command = self.one_shot(pool)?;
-        for slot in BINDINGS.iter().map(|&b| b as usize) {
+        for slot in BINDINGS.iter().map(|&b| b as usize).chain(ADDRESSED) {
             // SAFETY: recording into a fresh command buffer.
             unsafe {
                 self.gpu
@@ -397,9 +408,9 @@ impl Inner {
         let buffer = match up {
             false => self
                 .gpu
-                .buffer(bytes, cached, "staging buffer")
-                .or_else(|_| self.gpu.buffer(bytes, flags, "staging buffer"))?,
-            true => self.gpu.buffer(bytes, flags, "staging buffer")?,
+                .buffer(bytes, cached, "staging buffer", false)
+                .or_else(|_| self.gpu.buffer(bytes, flags, "staging buffer", false))?,
+            true => self.gpu.buffer(bytes, flags, "staging buffer", false)?,
         };
         // SAFETY: host-visible memory bound to this buffer, mapped whole.
         let mapped = unsafe {
@@ -696,7 +707,14 @@ impl Inner {
             wide: self.wide,
         };
         let mut recorder =
-            schedule::Recorder::new(&self.gpu, &mut self.pipelines, pool, set, marks)?;
+            schedule::Recorder::new(
+            &self.gpu,
+            &mut self.pipelines,
+            pool,
+            set,
+            self.addresses,
+            marks,
+        )?;
         if factoring {
             schedule::factor(&mut recorder, &shape)?;
         } else {
@@ -898,6 +916,7 @@ impl Inner {
                 bytes,
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
                 "the solution block",
+                false,
             )?;
             if let Some(old) = self.buffers[slot].replace(grown) {
                 self.gpu.free(&old);

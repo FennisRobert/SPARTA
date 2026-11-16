@@ -258,6 +258,13 @@ impl PyFactor {
 fn gpu_available() -> bool {
     sparta::gpu_available()
 }
+/// Returns the GPU this process would factor on, such as "Vulkan on NVIDIA
+/// RTX A5000", or "unavailable: " and why there is none. For Vulkan the reason
+/// names a missing loader or driver and what to install.
+#[pyfunction]
+fn gpu_status() -> String {
+    sparta::gpu_status().unwrap_or_else(|reason| format!("unavailable: {reason}"))
+}
 /// Returns the GPU backend this extension was built for: "metal" or "vulkan".
 ///
 /// One build carries one backend's kernels, so this describes the module and
@@ -306,6 +313,7 @@ fn _sparta(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFactor>()?;
     m.add_class::<PyCpuFactor>()?;
     m.add_function(wrap_pyfunction!(gpu_available, m)?)?;
+    m.add_function(wrap_pyfunction!(gpu_status, m)?)?;
     m.add_function(wrap_pyfunction!(device, m)?)?;
     m.add_function(wrap_pyfunction!(blas_library, m)?)?;
     m.add_function(wrap_pyfunction!(_settings, m)?)?;

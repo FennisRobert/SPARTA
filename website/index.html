@@ -41,7 +41,6 @@ code, pre, .mono { font-family: "Roboto Mono", ui-monospace, Menlo, monospace; }
 .strip .wrap { display: flex; justify-content: space-between; gap: 16px; height: 34px; align-items: center; }
 .strip b { color: #fff; font-weight: 500; }
 .strip i { display: inline-block; width: 7px; height: 7px; margin: 0 6px 1px 14px; background: #d4213f; }
-.strip i.alpha { background: var(--amber); }
 @media (max-width: 700px) { .strip .right { display: none; } }
 nav { position: sticky; top: 0; z-index: 10; background: #fff; box-shadow: 0 1px 0 var(--line), 0 4px 14px rgba(0, 0, 0, .05); }
 nav .wrap { display: flex; align-items: center; gap: 30px; height: 66px; }
@@ -177,8 +176,6 @@ td.num { font-family: "Roboto Mono", monospace; font-size: 14px; }
 .status { display: inline-block; font-size: 12px; font-weight: 500; letter-spacing: .1em; text-transform: uppercase;
           padding: 3px 8px; margin: 10px 0 14px; background: var(--band); color: var(--muted); }
 .platform.live .status { background: var(--red); color: #fff; }
-.platform.alpha { border-top-color: var(--amber); }
-.platform.alpha .status { background: var(--amber); color: #fff; }
 .platform dl { margin: 0; font-size: 15px; }
 .platform dt { color: var(--muted); font-size: 13px; margin-top: 10px; }
 .platform dd { margin: 2px 0 0; }
@@ -221,7 +218,7 @@ footer .bottom { border-top: 1px solid #2c2729; padding: 16px 0 22px; display: f
 <div class="strip">
   <div class="wrap">
     <span><b>SPARTA</b> · GPU sparse direct solver</span>
-    <span class="right"><i></i>Metal: available<i class="alpha"></i>Vulkan: alpha</span>
+    <span class="right"><i></i>Metal: available<i></i>Vulkan: available</span>
   </div>
 </div>
 
@@ -475,24 +472,24 @@ close(F)                <span class="c"># 4. free the GPU memory</span></pre></d
           <dt>Operating system</dt><dd>macOS 13 or later</dd>
         </dl>
       </div>
-      <div class="platform alpha">
+      <div class="platform live">
         <h3>Windows</h3>
-        <span class="status">Alpha</span>
+        <span class="status">Available</span>
         <dl>
           <dt>GPU</dt><dd>NVIDIA or AMD, Vulkan 1.3 driver</dd>
           <dt>Backend</dt><dd>Vulkan</dd>
-          <dt>Status</dt><dd>Factorizes and solves; tested on an NVIDIA RTX 3080 and an AMD Radeon integrated GPU.
-            Not yet tuned for speed.</dd>
+          <dt>Tested on</dt><dd>NVIDIA RTX 3080 and AMD Radeon integrated GPU</dd>
         </dl>
       </div>
-      <div class="platform alpha">
+      <div class="platform live">
         <h3>Linux</h3>
-        <span class="status">Alpha</span>
+        <span class="status">Available</span>
         <dl>
           <dt>GPU</dt><dd>NVIDIA or AMD, Vulkan 1.3 driver</dd>
           <dt>Backend</dt><dd>Vulkan</dd>
-          <dt>Status</dt><dd>The same Vulkan backend as on Windows, not yet tested on Linux. Not yet tuned for
-            speed.</dd>
+          <dt>Tested on</dt><dd>NVIDIA RTX A5000</dd>
+          <dt>Note</dt><dd>Server and headless NVIDIA drivers often leave out Vulkan: install
+            <code>libvulkan1</code> and <code>libnvidia-gl</code> for your driver version.</dd>
         </dl>
       </div>
     </div>
@@ -560,8 +557,8 @@ close(F)                <span class="c"># 4. free the GPU memory</span></pre></d
             reports how far it got.</p></details>
         <details><summary>Supported GPUs</summary>
           <p>Apple Silicon GPUs through Metal are supported. AMD and NVIDIA GPUs on Windows and Linux run through
-            the Vulkan backend, built on the same device-independent core. It is in alpha: it factorizes and
-            solves correctly, but its kernels are not yet tuned, so expect it to be slower than it will be.</p></details>
+            the Vulkan backend, built on the same device-independent core. On Linux, the NVIDIA driver needs its
+            Vulkan part, which server and headless installs often leave out.</p></details>
       </div>
     </div>
   </div>

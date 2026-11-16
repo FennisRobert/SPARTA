@@ -5,7 +5,7 @@
 //! backend module is exactly this, and nothing else:
 //!
 //! ```text
-//! pub(crate) fn available() -> bool
+//! pub(crate) fn status() -> std::result::Result<String, String>
 //! pub(crate) struct Context
 //! impl Context {
 //!     pub(crate) fn new(plan: &Analysis) -> Result<Self>
@@ -51,8 +51,16 @@ mod absent;
 #[cfg(not(any(sparta_metal, sparta_vulkan)))]
 use absent as backend;
 
+/// Whether this build's GPU backend can run in this process.
 pub fn gpu_available() -> bool {
-    backend::available()
+    gpu_status().is_ok()
+}
+
+/// The GPU this process would factor on, such as `"Vulkan on NVIDIA RTX
+/// A5000"`, or why there is none: no GPU backend in this build, no Metal
+/// device, or for Vulkan a missing loader or driver, with what to install.
+pub fn gpu_status() -> std::result::Result<String, String> {
+    backend::status()
 }
 /// Reusable GPU allocation. Factors remain on GPU between factor and solve.
 /// There is no implicit CPU fallback or precision conversion.

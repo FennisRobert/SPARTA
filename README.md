@@ -48,7 +48,7 @@ limits on memory bandwidth and arithmetic.
 measurements.
 
 **Hardware.** On Apple Silicon, SPARTA factors on the GPU through Metal. On
-AMD and NVIDIA GPUs, it uses a Vulkan backend, which is in alpha. On any 64-bit
+AMD and NVIDIA GPUs on Windows and Linux, it factors through Vulkan. On any 64-bit
 machine, it can factor on the CPU in double precision.
 
 **Precision.** SPARTA takes real or complex matrices and uses real or complex
@@ -222,11 +222,25 @@ double-precision CPU backend, but has no GPU backend.
 
 **Windows.** Any 64-bit machine runs the analysis and the double-precision CPU
 backend. AMD and NVIDIA GPUs run through the [Vulkan](#vulkan) backend, which
-is in alpha: tested on an NVIDIA RTX 3080 and an AMD Radeon integrated GPU,
-correct but not yet tuned for speed.
+is tested on an NVIDIA RTX 3080 and an AMD Radeon integrated GPU.
 
-**Linux.** The same as Windows: the analysis, the CPU backend and the alpha
-Vulkan backend. Not yet tested on Linux.
+**Linux.** The same as Windows: the analysis, the CPU backend and the Vulkan
+backend, tested on two NVIDIA RTX A5000s. The NVIDIA driver on a server or
+headless install often comes without its Vulkan part, so the GPU works for
+CUDA but `gpu_available()` is false. `sparta.gpu_status()` then says which part
+is missing and, when an NVIDIA driver is loaded, which package to install. To
+add it on Ubuntu or Debian, install the Vulkan loader and the Vulkan driver
+that match the installed driver version (580 here, or `libnvidia-gl-580-server`
+for the server driver):
+
+```sh
+sudo apt install libvulkan1 vulkan-tools libnvidia-gl-580
+vulkaninfo --summary      # lists the GPUs Vulkan can use
+```
+
+On Fedora and RHEL, the loader is `vulkan-loader`, and the NVIDIA driver
+package includes its Vulkan part. In a Docker container,
+`NVIDIA_DRIVER_CAPABILITIES` must include `graphics`.
 
 ### Packages
 
@@ -371,6 +385,7 @@ pip downloads its build helper (maturin), NumPy and SciPy from PyPI.
 ```python
 import sparta
 print(sparta.__version__, sparta.gpu_available())   # gpu_available() is False if no GPU is usable
+print(sparta.gpu_status())   # the GPU in use, or why there is none and what to install
 ```
 
 For development work on the Python layer, `pip install -e .` gives an editable install.
@@ -1300,6 +1315,7 @@ report the same things in code:
 | Property | Tells you |
 |---|---|
 | `sparta.gpu_available()` | Whether this build's GPU backend (Metal or Vulkan) can run in this process |
+| `sparta.gpu_status()` | The GPU in use, for example `"Vulkan on NVIDIA RTX A5000"`, or `"unavailable: "` and the reason, such as a missing Vulkan loader or driver with the package to install |
 | `sparta.blas_library()` | The CPU dense kernels in use, for example `"SpartaBLAS (sme512)"` |
 | `F.n`, `F.path` | Matrix size and the chosen method |
 | `F.info` | Pattern statistics and estimated memory |
@@ -1333,7 +1349,7 @@ decides:
 | Cargo feature | Backend | State |
 |---|---|---|
 | `metal` | Apple Metal, Apple Silicon | Implemented. The default on Apple Silicon |
-| `vulkan` | Vulkan compute, AMD and NVIDIA | Alpha. The default on Windows and Linux. See [Vulkan](#vulkan) below |
+| `vulkan` | Vulkan compute, AMD and NVIDIA | Implemented. The default on Windows and Linux. See [Vulkan](#vulkan) below |
 | neither, on any other target (Intel Mac) | none | Analysis and the CPU backend only |
 | `--no-default-features`, neither named | none | Analysis and the CPU backend only, on any target |
 
@@ -1377,7 +1393,15 @@ GPUs under Windows and Linux.
   SPIR-V, the build stops with an error instead of using stale kernels.
 - **Running** needs a driver with Vulkan 1.3. Nothing is linked at build time.
   SPARTA opens the Vulkan loader when the first solver is created. Without a
-  loader, `gpu_available()` is false.
+  loader, `gpu_available()` is false, and `gpu_status()` says why. On Linux,
+  the loader and the NVIDIA Vulkan driver are separate packages; see
+  [Per operating system](#per-operating-system).
+- **Memory.** All buffers together must fit in the GPU's memory. The four
+  that grow with the problem (the front workspace, the factors, the panel
+  workspace and LU's `U`) are reached by device address, so each can be up to
+  16 GiB, or the device's largest allocation if that is smaller. The others
+  are descriptor bindings, which NVIDIA limits to 4 GiB each, but they hold
+  only the matrix and the analysis tables.
 - **Choosing a device.** With several GPUs, SPARTA uses the first discrete
   one. To pick another, set `SPARTA_VULKAN_DEVICE` to its index or part of its
   name:
@@ -1391,7 +1415,7 @@ maturin develop --release --manifest-path python/Cargo.toml --features vulkan
 `SPARTA_PROFILE=1` prints the device time per kernel, as on Metal, and
 `SPARTA_PROFILE=2` lists every dispatch. The Khronos validation layer
 (`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`) runs without messages.
-Tested on an NVIDIA RTX 3080 and an AMD Radeon integrated GPU (Windows 11).
+Tested on an NVIDIA RTX 3080 and an AMD Radeon integrated GPU on Windows 11, and two NVIDIA RTX A5000s on Linux.
 
 **Testing the Vulkan path on a Mac.** MoltenVK translates Vulkan to Metal,
 so you can check the Vulkan kernels on Apple Silicon. Use it for testing only:

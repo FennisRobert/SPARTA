@@ -78,7 +78,7 @@ pub use analysis::{Analysis, Kind};
 pub use blas::describe as blas_library;
 pub use config::Config;
 pub use device::Device;
-pub use gpu::gpu_available;
+pub use gpu::{gpu_available, gpu_status};
 pub use num_complex::{Complex32, Complex64};
 pub use preset::Preset;
 pub use scalar::{Scalar, ScalarKind};

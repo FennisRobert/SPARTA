@@ -92,8 +92,12 @@ extern "C" {
 pub(crate) fn real_split(plan: &Analysis) -> bool {
     plan.kind == crate::Kind::Ldlt && plan.config.real_split
 }
-pub(crate) fn available() -> bool {
-    unsafe { sparta_v1_available() != 0 }
+pub(crate) fn status() -> std::result::Result<String, String> {
+    if unsafe { sparta_v1_available() != 0 } {
+        Ok("Metal".into())
+    } else {
+        Err("no Metal device is visible to this process".into())
+    }
 }
 fn message(bytes: &[u8]) -> Error {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());

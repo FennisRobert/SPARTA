@@ -26,6 +26,16 @@ fn pattern(n: usize) -> (Vec<usize>, Vec<usize>) {
 }
 
 #[test]
+/// `gpu_status` names a device exactly when `gpu_available` is true, and
+/// otherwise gives a reason.
+fn gpu_status_agrees_with_gpu_available() {
+    match sparta::gpu_status() {
+        Ok(device) => assert!(sparta::gpu_available() && !device.is_empty()),
+        Err(reason) => assert!(!sparta::gpu_available() && !reason.is_empty()),
+    }
+}
+
+#[test]
 /// Creating a solver compiles the kernels and builds every pipeline, on both
 /// factorization paths. A failure here names the backend's own message.
 fn every_pipeline_builds() {

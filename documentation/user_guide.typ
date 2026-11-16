@@ -389,7 +389,7 @@ complex128.
 #table(columns: (auto, 1fr),
   head([], [Support]),
   [GPU], [Apple Silicon (M1 or later) through Metal. AMD and NVIDIA GPUs on
-    Windows and Linux through Vulkan, in alpha: correct, not yet tuned.],
+    Windows and Linux through Vulkan.],
   [CPU], [A double-precision backend on any 64-bit machine, used when you ask
     for it, on SPARTA's own dense kernels (@blas).],
   [Languages], [Rust and Python, covered in this guide, and MATLAB and Julia
@@ -410,14 +410,28 @@ everything, including the GPU. An Intel Mac runs the analysis and the
 double-precision CPU backend, but has no GPU.
 
 *Windows.* Any 64-bit machine runs the analysis and the CPU backend. AMD and
-NVIDIA GPUs run through the Vulkan backend, which is in alpha. It was tested on
-an NVIDIA RTX 3080 and an AMD Radeon integrated GPU: it is correct, but not
-yet tuned for speed. A normal install includes it. To run it, you need a GPU
+NVIDIA GPUs run through the Vulkan backend, which was tested on an NVIDIA
+RTX 3080 and an AMD Radeon integrated GPU. A normal install includes it. To run it, you need a GPU
 driver with Vulkan 1.3. Without one, `gpu_available()` is false, and
 `force_cpu=True` selects the CPU backend.
 
-*Linux.* The same as Windows: the analysis, the CPU backend and the alpha
-Vulkan backend. SPARTA has not been tested on Linux yet.
+*Linux.* The same as Windows: the analysis, the CPU backend and the Vulkan
+backend, tested on two NVIDIA RTX A5000s. The NVIDIA driver on a server or
+headless install often comes without its Vulkan part, so the GPU works for
+CUDA but `gpu_available()` is false. `sparta.gpu_status()` then says which part
+is missing and, when an NVIDIA driver is loaded, which package to install. To
+add it on Ubuntu or Debian, install the Vulkan loader and the Vulkan driver that
+match the installed driver version (580 here, or `libnvidia-gl-580-server` for
+the server driver):
+
+```sh
+sudo apt install libvulkan1 vulkan-tools libnvidia-gl-580
+vulkaninfo --summary      # lists the GPUs Vulkan can use
+```
+
+On Fedora and RHEL, the loader is `vulkan-loader`, and the NVIDIA driver
+package includes its Vulkan part. In a Docker container,
+`NVIDIA_DRIVER_CAPABILITIES` must include `graphics`.
 
 == Packages you need <requirements>
 
@@ -565,11 +579,14 @@ the solution of a small system.
 import sparta
 print(sparta.__version__)
 print(sparta.gpu_available())   # True on an Apple Silicon Mac
+print(sparta.gpu_status())      # the GPU in use, or why there is none
 ```)
 
-If `gpu_available()` prints `False` on an Apple Silicon Mac, the process
-cannot see the GPU. This happens in some sandboxed or remote sessions. Run from
-a normal Terminal window instead.
+If `gpu_available()` prints `False`, `gpu_status()` gives the reason. On an
+Apple Silicon Mac, the process cannot see the GPU. This happens in some
+sandboxed or remote sessions. Run from a normal Terminal window instead. On
+Windows and Linux, the reason names the missing Vulkan loader or driver, and
+on Linux with an NVIDIA driver loaded, the package to install.
 
 == The CPU dense kernels <blas>
 

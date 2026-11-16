@@ -4,8 +4,8 @@
 # a C compiler.
 #
 # Pushing a tag v* builds that tag, publishes it to PyPI and creates its
-# GitHub Release. The tag must match the version in pyproject.toml (v0.3.7 for
-# 0.3.7), or nothing is published. Running the workflow by hand ("Run
+# GitHub Release. The tag must match the version in pyproject.toml (v0.3.8 for
+# 0.3.8), or nothing is published. Running the workflow by hand ("Run
 # workflow" on the Actions tab) builds and tests without publishing, or, given
 # a tag, builds that tag and publishes it.
 #
@@ -20,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build and publish, e.g. v0.3.7. Empty: build and test only."
+        description: "Tag to build and publish, e.g. v0.3.8. Empty: build and test only."
         required: false
         default: ""
 

@@ -44,14 +44,22 @@ pub(super) struct Pipelines {
     atomic_float: bool,
 }
 
-/// Descriptor bindings 0..=20 except 14, which is the push-constant range.
-pub(super) const BINDINGS: [u32; 20] = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20,
-];
+/// Descriptor bindings: Metal's buffers 0..=20 except 14, which is the
+/// push-constant range, and the [`ADDRESSED`] ones.
+pub(super) const BINDINGS: [u32; 16] = [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 15, 16, 18];
+
+/// The buffers the kernels reach by device address, in the order of the
+/// addresses in the push constants: fronts, factors, panels, upper. These grow
+/// with the factorization and may exceed the 4 GiB a binding covers.
+pub(super) const ADDRESSED: [usize; 4] = [7, 17, 19, 20];
+
+/// Push-constant bytes: the 16-byte range, then one 8-byte address per
+/// [`ADDRESSED`] buffer.
+pub(super) const PUSH_BYTES: u32 = 16 + 8 * ADDRESSED.len() as u32;
 
 impl Pipelines {
-    /// The descriptor and pipeline layouts every kernel shares: twenty storage
-    /// buffers and a 16-byte push-constant range.
+    /// The descriptor and pipeline layouts every kernel shares: the bound
+    /// storage buffers and the push constants (range and addresses).
     pub fn new(gpu: &Gpu, geometry: Geometry) -> Result<Self> {
         let bindings: Vec<_> = BINDINGS
             .iter()
@@ -65,7 +73,7 @@ impl Pipelines {
             .collect();
         let push = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .size(16)];
+            .size(PUSH_BYTES)];
         // SAFETY: the create infos outlive the calls; the layouts are
         // destroyed in `destroy`.
         unsafe {

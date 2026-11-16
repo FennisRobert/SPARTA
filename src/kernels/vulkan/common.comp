@@ -17,8 +17,13 @@
 // - The workgroup width is a specialization constant too (`local_size_x_id`),
 //   so a kernel Metal dispatches at several widths has one pipeline per width.
 //   `gl_WorkGroupSize.x` is what Metal reads from [[threads_per_threadgroup]].
-// - GLSL has no pointers. Buffers are global, and a front, panel or factor
-//   block is addressed by its base offset.
+// - A front, panel or factor block is addressed by its base offset into one
+//   global array, as Metal's kernels index their buffers.
+// - The four arrays that grow with the factorization (fronts, factors, panels,
+//   upper) are reached through 64-bit buffer device addresses rather than
+//   descriptor bindings. A binding covers at most maxStorageBufferRange bytes,
+//   4 GiB on NVIDIA and MoltenVK; an address has no such window, so these
+//   arrays can use most of the device's memory.
 // - Subgroups replace SIMD groups. Their width is 32 on NVIDIA and 32 or 64 on
 //   AMD, so every reduction counts subgroups with `gl_NumSubgroups` rather than
 //   assuming Apple's 32.
@@ -26,6 +31,7 @@
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_buffer_reference : require
 
 // --- Geometry (Config), in the order the host passes it ---------------------
 // Pivots accumulated per panel. Config::panel.
@@ -93,7 +99,6 @@ layout(std430, set = 0, binding = 3) readonly buffer MapsBuffer { uint maps[]; }
 layout(std430, set = 0, binding = 4) readonly buffer EntriesBuffer { Entry entries[]; };
 layout(std430, set = 0, binding = 5) readonly buffer IdsBuffer { uint ids[]; };
 layout(std430, set = 0, binding = 6) readonly buffer ValuesBuffer { vec2 values[]; };
-layout(std430, set = 0, binding = 7) workgroupcoherent buffer FrontsBuffer { vec2 fronts[]; };
 // LDL^T: the block diagonal. LU: solve scratch.
 layout(std430, set = 0, binding = 8) workgroupcoherent buffer DiagonalBuffer { vec2 diagonal[]; };
 layout(std430, set = 0, binding = 9) workgroupcoherent buffer SubdiagBuffer { vec2 subdiag[]; };
@@ -104,15 +109,30 @@ layout(std430, set = 0, binding = 12) workgroupcoherent buffer StatusBuffer { ui
 // because the forward sweep needs it as raw words for its atomics.
 layout(std430, set = 0, binding = 15) workgroupcoherent buffer StateBuffer { FrontState state[]; };
 layout(std430, set = 0, binding = 16) readonly buffer StripBuffer { UpdateTile strip_jobs[]; };
-layout(std430, set = 0, binding = 17) workgroupcoherent buffer FactorsBuffer { vec2 factors[]; };
 layout(std430, set = 0, binding = 18) readonly buffer SchurBuffer { UpdateTile schur_jobs[]; };
-layout(std430, set = 0, binding = 19) workgroupcoherent buffer PanelsBuffer { vec2 panels[]; };
-layout(std430, set = 0, binding = 20) workgroupcoherent buffer UpperBuffer { vec2 upper[]; };
+
+// Metal's buffers 7, 17, 19 and 20, by address: the frontal workspace, the
+// factor store, the panel workspace and LU's U store. Same qualifiers as the
+// bound buffers above, so the memory model treats them alike.
+layout(buffer_reference, std430, buffer_reference_align = 8) workgroupcoherent buffer Complexes {
+    vec2 at[];
+};
 
 // Metal's buffer 14: the per-dispatch range. {start, count} for most kernels,
 // {start, count, splits, extra} for the sliced ones, {start, count, n, nrhs}
-// for the solve sweeps.
-layout(push_constant) uniform Range { uvec4 range; };
+// for the solve sweeps. Then the addresses of the four arrays above, the same
+// for every dispatch of a context.
+layout(push_constant) uniform Range {
+    uvec4 range;
+    Complexes fronts_at, factors_at, panels_at, upper_at;
+};
+// The kernels index these as if they were bound arrays. The indices are
+// 32-bit and SPIR-V reads them as signed, so each array holds at most 2^31
+// elements (16 GiB); the host refuses a larger one.
+#define fronts fronts_at.at
+#define factors factors_at.at
+#define panels panels_at.at
+#define upper upper_at.at
 
 // --- Barriers ----------------------------------------------------------------
 // Metal's threadgroup_barrier with its three fence choices. Each is an
