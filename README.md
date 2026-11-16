@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="documentation/logo_header.svg" alt="SPARTA logo: a Spartan helmet" height="170">
+  <img src="https://raw.githubusercontent.com/FennisRobert/SPARTA/main/documentation/logo_header.svg" alt="SPARTA logo: a Spartan helmet" height="170">
 </p>
 
 <h1 align="center">SPARTA</h1>
@@ -9,8 +9,8 @@
 </p>
 
 <p align="center">
-  <b>A sparse direct solver that factors on the GPU</b><br>
-  Multifrontal LDLᵀ and LU for large sparse systems, from Rust, Python and C/C++
+  <b>A sparse direct solver built for finite-element problems</b><br>
+  Specialised for FEM systems, tuned to keep every core busy, factorization on the GPU or CPU
 </p>
 
 <p align="center">
@@ -29,29 +29,42 @@
 
 ---
 
-SPARTA is a sparse direct solver: it solves large linear systems **Ax = b**,
-where almost every entry of A is zero, by factoring A on the GPU. It runs on
-Apple Silicon GPUs through Metal today. A Vulkan backend for AMD and NVIDIA
-GPUs is planned but not written yet.
+SPARTA solves **Ax = b** for the large sparse matrices that finite-element
+(FEM) simulations produce. It is a direct solver: it factors A, then solves.
+It is built for FEM systems only, and is tuned to run close to the machine's
+limits on memory bandwidth and arithmetic.
 
-Matrices may be real or complex. A real matrix is factored with real
-arithmetic and a complex one with complex arithmetic; SPARTA picks from the
-type of the values you pass. The GPU works in single precision, which is fast
-but carries only about seven significant digits. When that is not accurate enough, SPARTA can close the gap
-in two ways. **Iterative refinement**, on by default in Python, corrects the GPU
-answer in double precision on the CPU. A **CPU backend** does the whole
-factorization in double precision when you ask for it.
+- **Built for FEM.** SPARTA plans the whole factorization once from the
+  sparsity pattern. Every later matrix with the same pattern, such as the
+  next frequency of a sweep, reuses that plan.
+- **Every core kept busy.** Many small, measured choices keep every core doing
+  useful arithmetic.
+- **Its own dense kernels.** On one core, the dense kernels reach 82 to 91% of
+  the processor's peak. You do not need to install BLAS, LAPACK or any other
+  maths library.
 
-Two factorization methods are implemented:
+[Why SPARTA is fast](#why-sparta-is-fast) lists the choices and the
+measurements.
 
-- **LDLᵀ** for symmetric matrices, real or complex, where A equals its own
-  transpose.
-- **LU** for every other square matrix: unsymmetric, structurally symmetric or
-  Hermitian.
+**Hardware.** On Apple Silicon, SPARTA factors on the GPU through Metal. On
+AMD and NVIDIA GPUs, it uses a Vulkan backend, which is in alpha. On any 64-bit
+machine, it can factor on the CPU in double precision.
 
-Before factoring, SPARTA reorders the unknowns with **nested dissection** to
-keep the factors small, using **SCALPEL**, SPARTA's own parallel
-implementation. No other ordering strategies are implemented.
+**Precision.** SPARTA takes real or complex matrices and uses real or complex
+arithmetic to match. The GPU works in single precision, which carries about
+seven significant digits. If you need more, you have two options:
+
+- **Iterative refinement** corrects the GPU answer in double precision on the
+  CPU. It is on by default in Python.
+- **The CPU backend** does the whole factorization in double precision.
+
+**Factorizations.** For symmetric matrices, where A equals its own transpose,
+SPARTA uses **LDLᵀ**. For every other square matrix (unsymmetric, only
+structurally symmetric, or Hermitian), it uses **LU**.
+
+**Ordering.** Before factoring, SPARTA reorders the unknowns to keep the
+factors small. It uses **SCALPEL**, its own parallel nested dissection. No
+other ordering is available.
 
 SPARTA can be used from **Rust**, **Python**, and **C or C++**.
 
@@ -59,24 +72,25 @@ SPARTA can be used from **Rust**, **Python**, and **C or C++**.
 
 **Getting started**
 1. [How SPARTA works](#how-sparta-works)
-2. [Requirements](#requirements)
-3. [Installing](#installing)
-4. [Quick start](#quick-start)
+2. [Why SPARTA is fast](#why-sparta-is-fast)
+3. [Requirements](#requirements)
+4. [Installing](#installing)
+5. [Quick start](#quick-start)
 
 **Using SPARTA in detail**
 
-5. [Describing your matrix](#describing-your-matrix)
-6. [Many matrices and right-hand sides](#many-matrices-and-right-hand-sides)
-7. [Configuration](#configuration)
-8. [Precision and accuracy](#precision-and-accuracy)
-9. [Memory and diagnostics](#memory-and-diagnostics)
+6. [Describing your matrix](#describing-your-matrix)
+7. [Many matrices and right-hand sides](#many-matrices-and-right-hand-sides)
+8. [Configuration](#configuration)
+9. [Precision and accuracy](#precision-and-accuracy)
+10. [Memory and diagnostics](#memory-and-diagnostics)
 
 **Building and development**
 
-10. [Building from source](#building-from-source)
-11. [Development](#development)
-12. [Contributing](#contributing)
-13. [Credits and licence](#credits-and-licence)
+11. [Building from source](#building-from-source)
+12. [Development](#development)
+13. [Contributing](#contributing)
+14. [Credits and licence](#credits-and-licence)
 
 # Getting started
 
@@ -96,6 +110,106 @@ Each step can be repeated without redoing the ones before it:
 - **Same pattern of nonzeros, new values** (a frequency sweep, a time loop):
   factor again. The analysis and the GPU memory it reserved are reused.
 - **Different pattern**: analyze again.
+
+## Why SPARTA is fast
+
+This section shows where SPARTA's speed comes from, so you can judge how it
+applies to your own problems.
+
+A direct solver's time is the number of operations divided by the rate at
+which they run. For FEM systems, the number of operations is already as low as
+it can be. SPARTA is therefore built to raise the rate: to keep every core busy
+and close to its peak.
+
+### The number of operations
+
+Factoring a sparse matrix turns some zero entries into nonzeros. The order in
+which the unknowns are eliminated decides how many. SPARTA uses nested
+dissection: it splits the mesh in two along a small separator, orders each half
+the same way, and eliminates the separator last. On FEM meshes, no other order
+does better, up to a constant factor:
+
+| Mesh, n unknowns | Operations to factor | Memory for the factors |
+|---|---|---|
+| 2D | proportional to n<sup>1.5</sup> | proportional to n log n |
+| 3D | proportional to n<sup>2</sup> | proportional to n<sup>4/3</sup> |
+
+(George, 1973; Hoffman, Martin and Rose, 1973; Lipton, Rose and Tarjan, 1979.)
+
+### The rate: choices made for FEM systems
+
+Each choice below was measured on FEM test cases and kept because it made them
+faster.
+
+- **Plan once, factor many times.** The analysis fixes the ordering, the
+  schedule and every block of memory. For a new matrix with the same pattern,
+  SPARTA goes straight to the numerical factorization.
+- **Wide fronts.** SPARTA merges neighbouring groups of columns into wider
+  dense blocks, even when that stores a few extra zeros. Wider blocks run
+  closer to peak.
+- **One large update per node.** In CPU mode, each node's update goes straight
+  into the columns of the nodes above it. No intermediate matrix has to be
+  cleared and assembled.
+- **Parallelism that never competes for cores.** Near the bottom of the
+  elimination tree, there are many small independent blocks, and each runs on
+  one core. Near the top, there are a few large blocks, and each spreads over
+  every core. The dense kernels start no threads of their own.
+- **Pivots stay in their front.** When a pivot is tiny, SPARTA raises it
+  instead of passing it on to a later block (see `static_pivot` in
+  [Numerics](#numerics)). As a result, the plan never changes during
+  factoring.
+- **Real arithmetic where the values are real.** In many FEM models, only the
+  port and boundary unknowns have complex values. SPARTA factors the parts that
+  stay real in real arithmetic, which is about four times cheaper (see
+  `real_split`).
+- **Complex symmetric LDLᵀ.** Lossy materials and absorbing boundaries give
+  complex symmetric matrices. SPARTA factors these as LDLᵀ, which costs half as
+  much as LU.
+- **Solves in blocks.** SPARTA pushes many right-hand sides through the factors
+  in one pass. Port projections touch only the parts of the factors they need
+  (see [Port matrices](#port-matrices-and-sparse-right-hand-sides)).
+- **No round trips in GPU mode.** The whole factorization runs on the GPU,
+  without returning to the CPU between steps.
+
+### The speed of each operation: dense kernels near peak
+
+Most of the arithmetic happens in large dense blocks near the top of the
+elimination tree, as matrix products. SPARTA runs these on its own dense
+kernels, SpartaBLAS, with a separate kernel set for each processor family (see
+[CPU dense kernels](#cpu-dense-kernels-spartablas)).
+
+On an Apple M4 Pro, against the processor's measured peak:
+
+| Product | Unit | Peak | SpartaBLAS | Fraction of peak |
+|---|---|---|---|---|
+| `f64`, one thread | matrix unit (SME) | 499 GFLOP/s | 450 GFLOP/s | 90% |
+| `complex128`, one thread | matrix unit (SME) | 499 GFLOP/s | 453 GFLOP/s | 91% |
+| `f32`, one thread | matrix unit (SME) | 1996 GFLOP/s | 1634 GFLOP/s | 82% |
+| `complex64`, one thread | matrix unit (SME) | 1996 GFLOP/s | 1763 GFLOP/s | 88% |
+| `f64`, one core | vector unit (NEON) | 58 GFLOP/s | 52 to 55 GFLOP/s | 90 to 95% |
+| `complex128`, all 14 cores | matrix units | 1255 GFLOP/s | 902 GFLOP/s | 72% |
+
+The peak is the most fused multiply-adds the processor can issue, measured with
+nothing else running. The products are 512 × 512 × 512 on one thread and
+3000 × 3000 × 400 on all cores, in the `C −= A·Bᵀ` form the factorization uses.
+To reproduce the numbers, run `examples/peak.rs` and
+`examples/vs_accelerate.rs` in `crates/sparta-blas`. The x86 kernels (AVX2,
+AVX-512) are written but **not yet measured** on x86 hardware.
+
+In CPU mode, the dense kernels take most of the factorization time. On our
+largest FEM test case, 97% of the time goes to the large blocks.
+
+### What SPARTA is not designed for
+
+Two kinds of sparse systems fit SPARTA poorly:
+
+- **Badly scaled, strongly indefinite systems**, such as some saddle-point
+  problems. These need pivots that move between blocks to stay accurate.
+  SPARTA keeps pivots in their block, so it can lose accuracy here. When that
+  happens, SPARTA reports it (see [Checking a solve](#checking-a-solve)).
+- **Matrices that do not come from a mesh**, such as circuit or network
+  matrices. These have few large dense blocks, so SPARTA's dense kernels hardly
+  help.
 
 ## Requirements
 
@@ -117,7 +231,7 @@ Vulkan backend. Not yet tested on Linux.
 
 | Package | What it is for |
 |---|---|
-| Rust toolchain (`rustc`, `cargo`) | Compiling SPARTA. Needed by every install route except prebuilt binaries. |
+| Rust toolchain (`rustc`, `cargo`) | Compiling SPARTA. Not needed for the PyPI wheels or prebuilt binaries. |
 | Xcode command line tools | macOS only: compiling the Metal bridge. |
 | git | Downloading the source from GitHub. |
 | Python 3.9 or later, with pip | The Python package. |
@@ -162,16 +276,20 @@ python3 --version     # "python --version" on Windows
 
 ## Installing
 
-SPARTA is not published on crates.io or PyPI, so `cargo add sparta-solver` and
-`pip install sparta-solver` will not find it. Each language below has the same
-three routes:
+For Python, install SPARTA from PyPI (see [Python](#python)). That needs no
+Rust and no compiler on the platforms listed there. Every other route compiles
+SPARTA from source.
+
+SPARTA is not published on crates.io, so `cargo add sparta-solver` will not
+find it. The other languages have three routes:
 
 1. **You have access to the GitHub repository.**
 2. **You have a copy of the source, but no GitHub access.**
 3. **You have prebuilt binaries**, so nothing needs compiling.
 
 Routes 1 and 2 compile SPARTA and need the Rust toolchain from
-[Requirements](#requirements), and on macOS the Xcode command line tools. The first build takes a few minutes.
+[Requirements](#requirements), and on macOS the Xcode command line tools. The
+first build takes a few minutes.
 
 ### Rust
 
@@ -207,29 +325,38 @@ from source. If you were sent a source archive, unpack it and use route 2.
 
 ### Python
 
-Install into the Python environment you run your simulations in. The package is
-imported as `sparta`. For routes 1 and 2, install the Rust toolchain first (see
-[Requirements](#requirements)): pip compiles SPARTA's Rust code during the install.
+Install SPARTA into the Python environment you run your simulations in. The
+package is imported as `sparta`.
 
-**1. With GitHub access.**
-
-```sh
-git clone git@github.com:FennisRobert/SPARTA.git   # or: gh repo clone FennisRobert/SPARTA
-cd SPARTA
-pip install .
-```
-
-Or in one line, without keeping a copy of the source:
+**1. From PyPI.**
 
 ```sh
-pip install "git+ssh://git@github.com/FennisRobert/SPARTA.git"
+pip install sparta-solver
 ```
 
-Both need an SSH key registered with your GitHub account (`gh auth login`
-sets one up).
+PyPI has prebuilt wheels for Python 3.9 and later on these platforms, so they
+need no Rust and no compiler:
 
-**2. From a copy of the source.** Unpack it, then install from its top folder,
-the one containing `pyproject.toml`:
+| Platform | Backends |
+|---|---|
+| macOS on Apple Silicon | Metal GPU and CPU |
+| macOS on Intel | CPU |
+| Linux x86_64 and aarch64 | Vulkan GPU and CPU |
+| Windows x86_64 | Vulkan GPU and CPU |
+
+On any other platform, pip downloads the source and compiles it. That needs
+the Rust toolchain from [Requirements](#requirements).
+
+**2. From GitHub.** This installs the latest, unreleased code and needs the
+Rust toolchain:
+
+```sh
+pip install "git+https://github.com/FennisRobert/SPARTA.git"
+```
+
+**3. From a copy of the source.** This also needs the Rust toolchain. Unpack
+the source, then install from its top folder, the one containing
+`pyproject.toml`:
 
 ```sh
 cd path/to/SPARTA
@@ -237,20 +364,6 @@ pip install .
 ```
 
 pip downloads its build helper (maturin), NumPy and SciPy from PyPI.
-
-**3. From a prebuilt wheel.** A wheel is a ready-compiled package: no Rust,
-no compiler, no source code needed.
-
-```sh
-pip install sparta_solver-0.3.6-cp39-abi3-macosx_11_0_arm64.whl
-```
-
-One wheel works for every Python from 3.9 up, on Apple Silicon only. To make a
-wheel to hand out, run this in the source folder:
-
-```sh
-pip wheel . --no-deps -w dist      # writes dist/sparta_solver-<version>-cp39-abi3-macosx_11_0_arm64.whl
-```
 
 **Check the install:**
 
@@ -294,7 +407,7 @@ The library finds itself through the rpath, so point `-rpath` at wherever your
 application keeps `libsparta.dylib`. To make the SDK to hand out, run
 `make package` in `crates/sparta-capi`, which writes it under `dist/`.
 
-More in [crates/sparta-capi/README.md](crates/sparta-capi/README.md).
+More in [crates/sparta-capi/README.md](https://github.com/FennisRobert/SPARTA/blob/main/crates/sparta-capi/README.md).
 
 ### MATLAB and Julia
 
@@ -312,8 +425,8 @@ using Pkg
 Pkg.develop(path = "bindings/julia")
 ```
 
-Details in [bindings/matlab/README.md](bindings/matlab/README.md) and
-[bindings/julia/README.md](bindings/julia/README.md).
+Details in [bindings/matlab/README.md](https://github.com/FennisRobert/SPARTA/blob/main/bindings/matlab/README.md) and
+[bindings/julia/README.md](https://github.com/FennisRobert/SPARTA/blob/main/bindings/julia/README.md).
 
 ## Quick start
 
@@ -378,16 +491,18 @@ F.destroy()             # 4. hand back the GPU memory
    Python gets round to it. It is optional but recommended for large systems;
    see [Memory and diagnostics](#memory-and-diagnostics).
 
-`analyze` takes any square SciPy sparse matrix holding float32, float64,
-complex64 or complex128 values. SPARTA never modifies yours. It keeps one
-copy of the matrix (the lower triangle for a symmetric one) so that later
-changes to your array cannot desynchronise refinement from the factors; with
-refinement on, the kept data is about the size of your matrix for a symmetric
-one and about twice it for an unsymmetric one.
-A real matrix is factored with real arithmetic. On the CPU that is about twice
-as fast as the same matrix stored as complex. On the GPU, real matrices run
-through the complex kernels for now, so they are no faster there yet. Results
-are real when the matrix and b are both real, and complex otherwise.
+`analyze` takes any square SciPy sparse matrix with float32, float64,
+complex64 or complex128 values. SPARTA never modifies your matrix.
+
+SPARTA keeps its own copy of the matrix, so that later changes to your array
+cannot put refinement out of step with the factors. For a symmetric matrix, it
+keeps only the lower triangle. With refinement on, this copy is about the size
+of your matrix when it is symmetric, and about twice that when it is not.
+
+**Real matrices.** A real matrix is factored in real arithmetic. In CPU mode,
+this is about twice as fast as the same matrix stored as complex. In GPU mode,
+real matrices still run through the complex kernels, so they are not faster
+yet. When the matrix and b are both real, x is real. Otherwise, x is complex.
 
 ### C and C++
 
@@ -496,7 +611,7 @@ F = sparta.analyze(A, path=sparta.Path.LU)      # force LU, whatever A is
 **SPARTA checks what you declare.** If you declare A symmetric and it is not,
 `analyze` raises `ValueError`. It never silently factors a different matrix
 from the one you gave it. `sparta.MatrixType` lists every type you can declare;
-[python/API.md](python/API.md) explains each one.
+[python/API.md](https://github.com/FennisRobert/SPARTA/blob/main/python/API.md) explains each one.
 
 **Only the lower triangle.** Pass the whole matrix by default. If you only
 store the lower triangle, say so, and SPARTA reads it as a symmetric matrix
@@ -563,19 +678,23 @@ sparta_solve(solver, b2, x2);
 ```
 
 Only the values may change, and they must be in the same order as the first
-time. Stored zeros count as part of the pattern, so a matrix that stores an
-extra explicit zero has a different pattern. In Python, `factorize()` with no
-matrix reuses the values from the last successful factorization, and
-`factorize(matrix=...)` with a different pattern runs the analysis again
-before it factors, keeping your settings. `F.reanalyses` counts how often that
-happened; each one costs a full analysis, so a count that keeps rising means
-the pattern is not stable between calls.
+time. Stored zeros count as part of the pattern: a matrix with one extra
+explicit zero has a different pattern.
+
+In Python:
+
+- `factorize()` with no matrix reuses the values of the last successful
+  factorization.
+- `factorize(matrix=...)` with a different pattern runs the analysis again,
+  with your settings, before it factors.
+- `F.reanalyses` counts these extra analyses. Each one costs a full analysis.
+  If the count keeps rising, your pattern changes between calls.
 
 ### Several right-hand sides at once
 
-Solve many right-hand sides in one call rather than one at a time. The columns
-share one pass over the factors, which on the shipped test systems makes an
-eight-column block 4× to 6× faster than eight separate solves.
+Solve many right-hand sides in one call, not one at a time. The columns share
+one pass over the factors. On our FEM test cases, a block of eight columns is
+4× to 6× faster than eight separate solves.
 
 **Rust**
 
@@ -599,9 +718,9 @@ sparta_solve_many_real(solver, b, x, nrhs);   /* real b against real factors */
 
 ### Port matrices and sparse right-hand sides
 
-In a frequency sweep you often don't need the full solution, only a few
-numbers taken from it: the port matrix of the model, or the field at a few
-chosen unknowns. SPARTA computes those directly.
+In a frequency sweep, you often need only a few numbers from the solution:
+the port matrix of the model, or the field at a few chosen unknowns. SPARTA
+can compute those directly, without forming the full solution.
 
 - **B: what you excite.** An `n × p` sparse matrix with one column per
   excitation, such as one port. Each column is nonzero only on the unknowns of
@@ -635,23 +754,27 @@ let z = solver.solve_projected(&b, None)?;     // B^T A^-1 B, p x p, column-majo
 let v = solver.solve_projected(&b, Some(&w))?; // W^T A^-1 B, q x p, column-major
 ```
 
-**How it runs.** On CPU `LDLᵀ` factors, a column of B only reaches the part of
-the factorization connected to its nonzeros: the fronts on the path from its
-unknowns to the root of the elimination tree. A projection then needs that
-part alone. It forms no solution at all, does no backward sweep, and never
-builds an `n × p` block. Everywhere else (the GPU, the hybrid factorization,
-LU) SPARTA solves as usual and projects the solution, so the answer is the
-same, just not faster. `F.diagnostics()['solve_route']` says which way the
-latest solve went: `'sparse'` or `'dense'`.
+**How it runs.** For LDLᵀ factors in CPU mode, SPARTA takes a fast route. A
+column of B only reaches the blocks on the path from its unknowns to the top of
+the elimination tree, so a projection only touches those blocks. It forms no
+full solution and never builds an `n × p` block.
 
-**Accuracy.** Projections are as trustworthy as an ordinary solve:
-- **CPU factors:** in Python the fast route is taken only when no pivot was
-  perturbed, and SPARTA's double-precision factors then need no refinement.
-- **Sparse solve without `project`:** it measures its residual and refines on
-  the usual route if that falls short of `refinement_rtol`. Reports and
-  warnings are exactly those of a dense solve.
-- **Fast projection:** it forms no solution, so `refinement_reports` is empty.
-- **Exact symmetry:** `project=B` on a symmetric matrix returns an exactly
+For GPU factors, the hybrid factorization and LU, SPARTA solves as usual and
+then projects. The answer is the same, but not faster.
+
+`F.diagnostics()['solve_route']` says which route the latest solve took:
+`'sparse'` or `'dense'`.
+
+**Accuracy.** Projections are as accurate as an ordinary solve:
+
+- **CPU factors:** In Python, SPARTA takes the fast route only when no pivot
+  was perturbed. The double-precision factors then need no refinement.
+- **Sparse solve without `project`:** SPARTA measures the residual. If it is
+  above `refinement_rtol`, SPARTA refines on the usual route. You get the same
+  reports and warnings as from a dense solve.
+- **Fast projection:** No full solution is formed, so `refinement_reports` is
+  empty.
+- **Symmetry:** For a symmetric matrix, `project=B` returns an exactly
   symmetric result on every route.
 
 **What it saves.** Measured on the CPU (M4 Pro, complex128), with ports of six
@@ -664,12 +787,12 @@ unknowns each:
 | 887k unknowns | 20 | 0.782 s | 0.126 s | 6× | 1.13× |
 | 887k unknowns | 100 | 7.64 s | 0.20 s | 38× | 2.5× |
 
-The more ports, the more it pays. With a handful of ports the factorization
-dominates either way.
+The more ports you have, the more it saves. With only a few ports, the
+factorization takes most of the time either way.
 
-**Coming from a dedicated port-matrix API.** Some solvers offer
+**If you know separate port-matrix calls.** Some solvers offer
 `port_matrix(B)`, `solve_sparse(B)` and a "reach" query as separate calls. In
-SPARTA:
+SPARTA, they map as follows:
 
 | Elsewhere | SPARTA |
 |---|---|
@@ -677,15 +800,14 @@ SPARTA:
 | `solve_sparse(B)` | `solve_many(B)` with a sparse B; Rust `solve_sparse(&b)` |
 | A reach query, to decide whether the sparse route pays | Not needed: SPARTA chooses the route, and `diagnostics()['solve_route']` reports it |
 
-Unlike such calls, these work on every factorization (GPU and LU included).
-They also take a separate `W` as well as `B`. C, Julia and MATLAB don't expose
-them yet.
+SPARTA's versions work on every factorization, including GPU and LU, and
+also take a separate `W`. C, Julia and MATLAB do not offer them yet.
 
 ## Configuration
 
-Most users need no settings at all: the defaults are measured, and the ones
-that matter most are covered in [Precision and accuracy](#precision-and-accuracy).
-This section lists every setting for when you want to tune.
+Most users need no settings: the defaults are measured. The settings that
+matter most are covered in [Precision and accuracy](#precision-and-accuracy).
+This section lists every setting, for when you want to tune.
 
 ### Setting options in each language
 
@@ -712,11 +834,13 @@ config = sparta.Config.preset("sweep").with_(nemin=32)
 F = sparta.analyze(A, config=config)    # keyword arguments still override the config
 ```
 
-The solve-behaviour settings, `force_cpu` and `hybrid` can also be passed to
-`factorize`, to change them for an existing solver. Everything else is fixed
-when the matrix is analyzed, and `factorize` ignores it, so one settings dict
-can go to both calls. An unknown keyword never stops a run: `analyze`,
-`factorize` and `Config.with_` ignore it with a `sparta.UnusedSettingWarning`.
+To change an existing solver, you can also pass the solve-behaviour settings,
+`force_cpu` and `hybrid` to `factorize`. All other settings are fixed at
+analysis, and `factorize` ignores them. So you can pass one settings dict to
+both calls.
+
+An unknown keyword never stops a run. `analyze`, `factorize` and
+`Config.with_` ignore it and issue a `sparta.UnusedSettingWarning`.
 
 **C:** fill a `sparta_config` with `sparta_config_default` or
 `sparta_config_preset`, change fields, and pass it to `sparta_analyze`.
@@ -730,55 +854,54 @@ double, and `enum` is one of the named choices.
 | Name | Type | Default | What it is for |
 |---|---|---|---|
 | **Solve behaviour** (Python only) | | | |
-| `refinement_steps` | int | `-1` | Maximum refinement corrections per right-hand side. |
-| `refinement_rtol` | float64 | `1e-6` | Residual at which refinement stops. |
-| `refinement_minimize` | bool | `True` | Scale each correction to shrink the residual most. |
-| `equilibrate` | bool | `False` | Balance row and column sizes before converting to single precision. |
-| `verbose` | bool | `False` | Print a short summary per solve. |
-| `safe_mode` | bool | `False` | Re-check every new matrix passed to `factorize`. |
-| `mtype` | enum | `AUTO` | What kind of matrix this is. |
-| `path` | enum | `AUTO` | Force LDLᵀ or LU. |
-| `triangle` | text | `"full"` | Whole matrix, or `"lower"` triangle only. |
+| `refinement_steps` | int | `-1` | Limits the refinement corrections per right-hand side. `-1` takes as many as needed. |
+| `refinement_rtol` | float64 | `1e-6` | Sets the relative residual at which refinement stops. |
+| `refinement_minimize` | bool | `True` | Makes each correction shrink the residual as much as possible, so fewer steps are needed. |
+| `equilibrate` | bool | `False` | Balances row and column sizes before the conversion to single precision. This can improve accuracy. |
+| `verbose` | bool | `False` | Prints a short summary after each solve. |
+| `safe_mode` | bool | `False` | Checks every new matrix passed to `factorize`. This is slower, but catches infinities and NaNs. |
+| `mtype` | enum | `AUTO` | Tells SPARTA what kind of matrix you pass. |
+| `path` | enum | `AUTO` | Forces LDLᵀ or LU. |
+| `triangle` | text | `"full"` | Tells SPARTA whether you pass the whole matrix or only the lower triangle. |
 | **Ordering** | | | |
-| `ordering` | enum | SCALPEL | Nested-dissection implementation. SCALPEL is the only one. |
-| `imbalance` | float64 | `0.8` | SCALPEL only. How unequal a split may be. |
-| `wide_cycles` | uint32 | `4` | SCALPEL only. Separator refinement cycles per split. |
-| `fm_passes` | uint32 | `4` | SCALPEL only. Refinement passes per separator. |
-| `separator_trials` | uint32 | `4` | SCALPEL only. Candidate separators tried per split. |
+| `ordering` | enum | SCALPEL | Selects the nested-dissection implementation. SCALPEL is the only one. |
+| `imbalance` | float64 | `0.8` | Only used by SCALPEL. Sets how unequal the two halves of a split may be. |
+| `wide_cycles` | uint32 | `4` | Only used by SCALPEL. More cycles give less fill, but the ordering takes longer. |
+| `fm_passes` | uint32 | `4` | Only used by SCALPEL. More passes give less fill, but the ordering takes longer. |
+| `separator_trials` | uint32 | `4` | Only used by SCALPEL. More trials can find a better split, but the ordering takes longer. |
 | **Supernodes and fronts** | | | |
-| `nemin` | uint64 | `16` | How eagerly groups of columns merge into wider blocks. |
-| `max_front` | uint64, optional | unlimited | Largest dense block allowed, in rows. |
+| `nemin` | uint64 | `16` | Controls how eagerly columns merge into wider blocks. Larger values suit the GPU, but store more fill. |
+| `max_front` | uint64, optional | unlimited | Makes the analysis fail when a dense block would have more rows than this. |
 | **Numerics** | | | |
-| `force_cpu` | bool | `False` | Double precision on the CPU instead of the GPU. Python and Rust only. |
-| `hybrid_cpu` | float64 | `0.0` | Share of the work the CPU does alongside the GPU; `hybrid=True` in Python. Metal only. |
-| `lu_diag_threshold` | float64 | `0.0` | LU only. How strongly to prefer the diagonal as pivot. |
-| `supernodal` | bool | `True` | LDLT only. Supernodal factorization: no frontal matrices on the CPU, half-size trailing blocks on the GPU. Faster and less memory; `False` is the multifrontal route. Ignored by LU and Vulkan. |
-| `real_split` | bool | `True` | Complex LDLT. Factors the parts of the matrix that have no imaginary entries in real arithmetic, which is faster. Same ordering and same answer. On the CPU it needs `supernodal` and also saves memory. On the GPU the solver times one factorization with it and one without and keeps the faster. |
-| `static_pivot` | float64 | `1e-12` | LDLT only. Pivots smaller than this, relative to the largest matrix entry, are raised to it. `0` replaces exact zeros only. Ignored by LU and Vulkan. |
+| `force_cpu` | bool | `False` | Factors and solves on the CPU in double precision instead of on the GPU. Only available in Python and Rust. |
+| `hybrid_cpu` | float64 | `0.0` | Lets the CPU do this share of the factorization while the GPU does the rest. Only used on Metal. In Python, `hybrid=True` turns it on. |
+| `lu_diag_threshold` | float64 | `0.0` | Only affects LU factorization. Above 0, SPARTA prefers the diagonal as pivot, which is faster but less stable. |
+| `supernodal` | bool | `True` | Speeds up LDLᵀ factorization and lowers its memory. Expected to be strictly better than the multifrontal factorization, which is used when it is turned off, with the same accuracy. Turn it off to check whether your matrix is an exception (see [Supernodes and fronts](#supernodes-and-fronts)). |
+| `real_split` | bool | `True` | Speeds up complex LDLᵀ factorization when parts of the matrix are real. Turn it off only if the GPU's first factorizations must all take the same time. |
+| `static_pivot` | float64 | `1e-12` | Only affects LDLᵀ factorization. Raises tiny pivots to this size, relative to the largest entry, so SPARTA never divides by a near-zero. `0` replaces exact zeros only. |
 | **CPU backend** (Python and Rust) | | | |
-| `cpu_panel` | uint64 | `32` | Pivots per panel before an update. |
-| `cpu_block_rows` | uint64 | `96` | Rows per block in the trailing update. |
-| `cpu_blas_min_rows` | uint64 | `64` | Smallest block handed to BLAS. |
+| `cpu_panel` | uint64 | `32` | Only used in CPU mode. Sets how many pivots are gathered before an update. |
+| `cpu_block_rows` | uint64 | `96` | Only used in CPU mode. Sets the rows per block of the trailing update. |
+| `cpu_blas_min_rows` | uint64 | `64` | Only used in CPU mode. Blocks smaller than this skip the dense kernels. |
 | **GPU scheduling** | | | |
-| `small_front_rows` | uint32 | `32` | Block height where the GPU leaves its serial kernel. |
-| `schur_batch` | uint32 | `0` | Panels completed between update drains. |
-| `panel_threads` | uint32 | `512` | Threads per threadgroup in the panel factorization. |
-| `solve_threads` | uint32 | `0` | Threads per block in the solves. |
+| `small_front_rows` | uint32 | `32` | Sets the block height where the GPU switches from its serial kernel to cooperative panels. |
+| `schur_batch` | uint32 | `0` | Sets how many panels the GPU completes between two update drains. |
+| `panel_threads` | uint32 | `512` | Sets the threads per threadgroup in the GPU panel factorization. |
+| `solve_threads` | uint32 | `0` | Sets the threads per block in the GPU solves. |
 | **GPU kernel geometry** | | | |
-| `panel` | uint32 | `16` | Pivots per panel. |
-| `schur_block` | uint32 | `4` | Register block in the Schur update. |
-| `strip_block` | uint32 | `4` | Register block in the strip update. |
-| `narrow_cols` | uint32 | `32` | Width where a front takes the wide kernels. |
-| `pivot_threads` | uint32 | `128` | Threads per pivot search. |
-| `schur_chunk` | uint32 | `16` | Panel columns staged per Schur pass. |
+| `panel` | uint32 | `16` | Sets the pivots per GPU panel. |
+| `schur_block` | uint32 | `4` | Sets the register block of the GPU Schur update. |
+| `strip_block` | uint32 | `4` | Sets the register block of the GPU strip update. |
+| `narrow_cols` | uint32 | `32` | Sets the width above which a block uses the GPU's wide kernels. |
+| `pivot_threads` | uint32 | `128` | Sets the GPU threads that search for one pivot together. |
+| `schur_chunk` | uint32 | `16` | Sets the panel columns staged per GPU Schur pass. |
 
 The tables further down give the allowed values and more detail for each group.
 
 ### Presets
 
-A preset is a named starting point for a kind of workload. It is not a
-guarantee: the best settings depend on your matrices, so measure before you
-keep a change.
+A preset is a named starting point for a kind of workload. The best settings
+still depend on your matrices, so measure before you keep a change.
 
 | Preset | Use it for | What it changes |
 |---|---|---|
@@ -798,75 +921,85 @@ result = sparta.optimize([A1, (A2, b2)], name="antenna")   # prints progress and
 solver = sparta.analyze(A, config="antenna")                # in any later session
 ```
 
-It tunes the GPU and CPU backends, keeps only changes that save more than 3%
-(`min_gain`), beat the timing noise and hold up on a recheck, and reports the
-gain over the defaults at the end. `iterations=3` repeats the search from the
-settings found, until a pass changes nothing.
-Without problems it tunes on two standard finite-element systems. Profiles
-are kept in `configs.json` in `~/Library/SPARTA` (macOS) or `~/.sparta`;
-`sparta.profiles()` lists them and `sparta.Config.delete(name)` removes one.
-In Rust, the same search is `sparta::optimize::optimize`, and
-`sparta::profiles` manages the same file. The user guide has the details.
+It tunes both the GPU and the CPU backend. It keeps a change only if the
+change saves more than 3% (`min_gain`), beats the timing noise and holds up on
+a recheck. At the end, it reports the gain over the defaults.
+
+- `iterations=3` repeats the search from the settings found, until a pass
+  changes nothing.
+- Without matrices, it tunes on two standard finite-element systems.
+- Profiles are kept in `configs.json`, in `~/Library/SPARTA` on macOS and in
+  `~/.sparta` elsewhere. `sparta.profiles()` lists them, and
+  `sparta.Config.delete(name)` removes one.
+- In Rust, the same search is `sparta::optimize::optimize`, and
+  `sparta::profiles` manages the same file.
+
+The user guide has the details.
 
 ### Solve behaviour (Python only)
 
-These control the Python layer around the solver. Rust and C have no
-equivalent yet.
+These settings control the Python layer around the solver. Rust and C do
+not have them yet.
 
 | Setting | Type | Values | What it does |
 |---|---|---|---|
-| `refinement_steps` | int | `-1`, `0`, or a positive integer | Maximum corrections per right-hand side. `-1` takes as many as `refinement_rtol` needs, `0` switches refinement off. |
-| `refinement_rtol` | float64 | between 0 and 1 | Relative residual at which refinement stops. |
-| `refinement_minimize` | bool | | Scales each correction to shrink the residual as much as possible. Costs one extra CPU matrix-vector product per step, and roughly halves the steps on badly conditioned matrices. |
-| `equilibrate` | bool | | Balances row and column sizes before the conversion to single precision. Can help accuracy, costs extra CPU work and memory, and does not always pay off. |
-| `verbose` | bool | | Prints a short summary per solve: method, ordering, fill, memory, timings, residuals. Adds the CPU work of measuring the residuals. |
-| `safe_mode` | bool | | Re-checks every new matrix passed to `factorize`. Off, a new matrix stored exactly like the analyzed one is read straight into the analyzed layout, which is much faster, and its values are not checked for infinities or NaNs. Either way a different pattern is detected and analyzed again. |
-| `mtype`, `path`, `triangle` | enum, enum, text | see [Describing your matrix](#describing-your-matrix) | How to read and factor the matrix. |
+| `refinement_steps` | int | `-1`, `0`, or a positive integer | Limits the corrections per right-hand side. `-1` takes as many as `refinement_rtol` needs. `0` turns refinement off. |
+| `refinement_rtol` | float64 | between 0 and 1 | Refinement stops when the relative residual falls below this value. |
+| `refinement_minimize` | bool | | Scales each correction to shrink the residual as much as possible. Costs one extra CPU matrix-vector product per step, and roughly halves the steps on badly conditioned matrices. | | Scales each correction to shrink the residual as much as possible. Each step costs one extra matrix-vector product on the CPU. On badly conditioned matrices, it roughly halves the number of steps. |
+| `equilibrate` | bool | | Balances row and column sizes before the conversion to single precision. Can help accuracy, costs extra CPU work and memory, and does not always pay off. | | Balances row and column sizes before the conversion to single precision. This can improve accuracy, but costs extra CPU time and memory, and does not always help. |
+| `verbose` | bool | | Prints a short summary per solve: method, ordering, fill, memory, timings, residuals. Adds the CPU work of measuring the residuals. | | Prints a short summary after each solve: method, ordering, fill, memory, timings and residuals. Measuring the residuals adds some CPU time. |
+| `safe_mode` | bool | | Re-checks every new matrix passed to `factorize`. Off, a new matrix stored exactly like the analyzed one is read straight into the analyzed layout, which is much faster, and its values are not checked for infinities or NaNs. Either way a different pattern is detected and analyzed again. | | Checks every new matrix passed to `factorize`. When it is off, a matrix stored exactly like the analyzed one is read straight into the analyzed layout. That is much faster, but its values are not checked for infinities or NaNs. In both cases, SPARTA detects a different pattern and analyzes it again. |
+| `mtype`, `path`, `triangle` | enum, enum, text | see [Describing your matrix](#describing-your-matrix) | These tell SPARTA how to read and factor the matrix. |
 
 ### SCALPEL settings
 
 | Setting | Type | Values | What it does |
 |---|---|---|---|
-| `imbalance` | float64 | 0.5 to 0.9 | Largest share of the matrix allowed in one half of a split. |
-| `wide_cycles` | uint32 | 0 or more | Separator refinement cycles per split. `0` orders faster and gives more fill. |
-| `fm_passes` | uint32 | 0 or more | Fiduccia–Mattheyses refinement passes. `0` is much faster and much worse. |
-| `separator_trials` | uint32 | 1 or more | Starting separators tried per split. The best one is kept. |
+| `imbalance` | float64 | 0.5 to 0.9 | Sets the largest share of the matrix allowed in one half of a split. |
+| `wide_cycles` | uint32 | 0 or more | Sets the separator refinement cycles per split. With `0`, the ordering is faster, but the factors get more fill. |
+| `fm_passes` | uint32 | 0 or more | Sets the Fiduccia–Mattheyses refinement passes. With `0`, the ordering is much faster, but the factors get much more fill. |
+| `separator_trials` | uint32 | 1 or more | Sets how many starting separators are tried per split. SPARTA keeps the best one. |
 
-SCALPEL runs in parallel, on the threads [`threads`](#cpu-threads) chooses. The ordering decides how much fill-in the factors carry, and so most of
-the cost, but a faster ordering does not always mean a faster factorization:
+SCALPEL runs in parallel, on the threads that [`threads`](#cpu-threads)
+sets. The ordering decides how much fill the factors get, and so most of the
+cost. A faster ordering does not always give a faster factorization, so
 measure both.
 
 ### Supernodes and fronts
 
 | Setting | Type | Values | What it does |
 |---|---|---|---|
-| `nemin` | uint64 | 1 or more | Fewest columns a group of columns (a supernode) must eliminate before it may merge with its neighbour. Larger values give fewer, wider blocks, which suits the GPU but stores more fill. |
-| `max_front` | uint64, optional | 1 or more, or unlimited | Largest dense block allowed, in rows. Analysis fails if a block would be bigger. It exists to fail early on a bad ordering. Unlimited is `None` in Python and Rust, `0` in C. |
+| `nemin` | uint64 | 1 or more | Sets how many columns a group of columns (a supernode) must eliminate before it may merge with its neighbour. Larger values give fewer, wider blocks. These suit the GPU, but store more fill. |
+| `max_front` | uint64, optional | 1 or more, or unlimited | Makes the analysis fail when a dense block would have more rows than this. Use it to catch a bad ordering early. In Python and Rust, `None` means unlimited. In C, `0` means unlimited. |
+| `supernodal` | bool | | Only affects LDLᵀ factorization. In CPU mode, it factors each block of columns in place instead of in a separate frontal matrix, which makes the factorization 25 to 43% faster and lowers peak memory. In GPU mode, it halves the work of setting up each front, which makes the factorization about 15% faster. It is expected to be strictly better than the multifrontal factorization, which is used when it is turned off: the pivots and the accuracy are the same, but the two can differ slightly in how they round. One exception is possible in CPU mode. Threads that update the same rows of the factor take turns, so on a matrix where many independent parts feed into the same rows, the threads can end up waiting on each other. None of our FEM test cases shows this. If the CPU factorization of your matrix is slower than expected, turn it off to check whether this is the cause. LU, the hybrid's CPU share and Vulkan ignore it. |
+| `real_split` | bool | | Only affects complex LDLᵀ factorization. It factors the parts of the matrix without imaginary entries in real arithmetic. In CPU mode, this makes the factorization 1.1 to 1.8 times faster and lowers peak memory by 12 to 28%, but only when `supernodal` is on. In GPU mode, the solver runs its second factorization without it and its third with it, then keeps whichever was faster, so the first three factorizations can differ in time. The results are equally accurate either way, so turn it off only if those first factorizations must all take the same time. |
 
 ### Numerics
 
 | Setting | Type | Values | What it does |
 |---|---|---|---|
-| `force_cpu` | bool | | Factor and solve on the CPU in double precision instead of on the GPU. Python and Rust only. See [Precision and accuracy](#precision-and-accuracy). |
-| `hybrid_cpu` | float64 | 0 to below 1 | Share of the factorization work the CPU does at the same time as the GPU does the rest. `0` is the GPU alone. It is a starting point: the share adapts after every factorization. Python also takes `hybrid=True` (30%). Ignored except on Metal. See [CPU and GPU together](#cpu-and-gpu-together-hybrid). |
-| `lu_diag_threshold` | float64 | 0 to 1 | LU only. `0` is strict partial pivoting. Above 0 the factorization accepts the diagonal entry as pivot if it is within this fraction of the column's best candidate. That is faster, but less stable, and **it changes results**, not just speed. |
-| `static_pivot` | float64 | 0 to below 1 | LDLT only. SPARTA pivots inside each front and never passes a column on to the parent front, so a pivot can turn out tiny without being zero. Typical causes are zero diagonal entries, as in saddle-point or constrained systems. Dividing by it as found can ruin the factorization. Any pivot smaller than `static_pivot` times the largest entry of the matrix is therefore raised to that size and counted in `perturbed_pivots`. On the CPU the raise is also capped at `static_pivot` times the largest entry below the pivot in its column, so a small pivot with nothing to amplify, as in a badly scaled diagonal, is left alone. The GPU, whose single precision cannot tell such a pivot from rounding noise, applies the threshold as is. The default, `1e-12`, sits far below the pivots of ordinary matrices. `0` replaces exact zeros only, the behaviour before 0.3.5. Ignored by LU and Vulkan. Python and Rust only: C, Julia and MATLAB use the default, which `SPARTA_STATIC_PIVOT` overrides. |
+| `force_cpu` | bool | | Factor and solve on the CPU in double precision instead of on the GPU. Python and Rust only. See [Precision and accuracy](#precision-and-accuracy). | | Factors and solves on the CPU in double precision instead of on the GPU. Only available in Python and Rust. See [Precision and accuracy](#precision-and-accuracy). |
+| `hybrid_cpu` | float64 | 0 to below 1 | Lets the CPU do this share of the factorization while the GPU does the rest. `0` uses the GPU alone. The value is only a starting point: SPARTA adapts the share after every factorization. In Python, `hybrid=True` sets 30%. Only used on Metal. See [CPU and GPU together](#cpu-and-gpu-together-hybrid). |
+| `lu_diag_threshold` | float64 | 0 to 1 | Only affects LU factorization. With `0`, SPARTA uses strict partial pivoting. Above 0, SPARTA takes the diagonal entry as pivot if it is within this fraction of the best candidate in its column. This is faster but less stable, and **it changes the results**, not just the speed. |
+| `static_pivot` | float64 | 0 to below 1 | Only affects LDLᵀ factorization. SPARTA keeps each pivot in its block, so a pivot can be tiny without being zero. This happens, for example, with zero diagonal entries in saddle-point or constrained systems. Dividing by such a pivot can ruin the factorization. SPARTA therefore raises any pivot smaller than `static_pivot` times the largest matrix entry to that size, and counts it in `perturbed_pivots`. In CPU mode, the raise is also capped at `static_pivot` times the largest entry below the pivot, so a small pivot on a badly scaled diagonal is left alone. In GPU mode, single precision cannot tell such a pivot from rounding noise, so the threshold applies as is. The default, `1e-12`, is far below the pivots of ordinary matrices. With `0`, SPARTA replaces exact zeros only, as before version 0.3.5. LU and Vulkan ignore it. Only available in Python and Rust. In C, Julia and MATLAB, `SPARTA_STATIC_PIVOT` overrides the default. |
 
 ### CPU threads
 
 | Setting | Type | Values | What it does |
 |---|---|---|---|
-| `threads` | uint64 (uint32 in C) | 0 to 4096 | CPU threads for SPARTA's own work: the analysis, the CPU factorization and solves, and the hybrid's CPU share. `0`, the default, uses the process-wide Rayon pool, which `RAYON_NUM_THREADS` sizes. A positive count gives each analysis and each solver a pool of its own. |
+| `threads` | uint64 (uint32 in C) | 0 to 4096 | Sets the CPU threads for SPARTA's own work: the analysis, the CPU factorization and solves, and the hybrid's CPU share. With `0`, the default, SPARTA uses the process-wide Rayon pool, which `RAYON_NUM_THREADS` sizes. With a positive count, each analysis and each solver gets a pool of its own. |
 
-A count is a hard bound: a solver with its own pool also keeps the dense
-library from threading past it (Accelerate and MKL are kept to the calling
-thread, OpenBLAS to the pool's size). Unlike `RAYON_NUM_THREADS`, which is read
-once when the process first uses Rayon, it can differ per solver and leaves
-anything else in the process that uses Rayon alone.
+A positive count is a hard limit. The dense kernels start no threads of
+their own and run on the same pool, so SPARTA never uses more threads than
+this.
 
-`SPARTA_NUM_THREADS`, when set to a positive count, overrides `threads` wherever
-it was given, in any language. It is meant for wrappers and job scripts that
-cannot reach the call site.
+`RAYON_NUM_THREADS` is read once, when the process first uses Rayon, and
+applies to everything in the process. `threads` can differ per solver and does
+not affect other code that uses Rayon.
+
+If `SPARTA_NUM_THREADS` is set to a positive count, it overrides `threads`
+everywhere, in every language. Use it in wrappers and job scripts that cannot
+change the call.
 
 ```python
 solver = sparta.analyze(A, force_cpu=True, threads=6)
@@ -874,53 +1007,58 @@ solver = sparta.analyze(A, force_cpu=True, threads=6)
 
 ### CPU backend tuning (Python and Rust)
 
-These only matter with `force_cpu`.
+These settings only apply in CPU mode (`force_cpu`).
 
 | Setting | Type | Values | What it does |
 |---|---|---|---|
-| `cpu_panel` | uint64 | 1 or more | Pivots gathered before a trailing update, on the LU path and on fronts LAPACK cannot factor. |
-| `cpu_block_rows` | uint64 | 1 or more | Rows per block in the trailing update, and the unit of work when one front is split across threads. |
-| `cpu_blas_min_rows` | uint64 | 1 or more | Smallest trailing block handed to BLAS. Raise it to avoid BLAS overhead on small blocks. |
+| `cpu_panel` | uint64 | 1 or more | Sets how many pivots are gathered before a trailing update. It applies to LU, and to the LDLᵀ blocks that the blocked route cannot take (an exactly zero or tiny pivot). |
+| `cpu_block_rows` | uint64 | 1 or more | Sets the rows per block of the trailing update. When one block is split across threads, this is also the unit of work. |
+| `cpu_blas_min_rows` | uint64 | 1 or more | Blocks with fewer trailing rows than this skip the dense kernels. Raise it to avoid the call overhead on small blocks. |
 
 ### GPU tuning (advanced)
 
-The defaults are measured on Apple Silicon. Leave these alone unless you are
-tuning for different hardware.
+The defaults are measured on Apple Silicon. Change these settings only when
+you tune for different hardware.
 
 | Setting | Type | Values | What it does |
 |---|---|---|---|
-| `small_front_rows` | uint32 | 1 or more | Block height at which the GPU switches from its serial kernel to cooperative panels. |
-| `schur_batch` | uint32 | 0 or more | Pivot panels completed between two update drains. `0` drains once per level of the tree. |
-| `panel_threads` | uint32 | 32 to 1024 | Threads per threadgroup in the panel factorization. |
-| `solve_threads` | uint32 | `0`, or 32 to 1024 | Threads per block in the solves. `0` picks per block width. |
-| `panel` | uint32 | 16 | Pivots per panel. Other widths need kernel changes. |
-| `schur_block` | uint32 | 1 to 8 | Per-thread register block in the Schur update. The tile is `16 × schur_block` square. |
-| `strip_block` | uint32 | 1 to 8 | Per-thread register block in the strip update. |
-| `narrow_cols` | uint32 | 1 or more | Width above which a front takes the wide-front kernels. |
-| `pivot_threads` | uint32 | a multiple of 32, up to 1024 | Threads cooperating on one pivot search. |
-| `schur_chunk` | uint32 | 1 or more | Panel columns staged per Schur pass. |
+| `small_front_rows` | uint32 | 1 or more | Sets the block height at which the GPU switches from its serial kernel to cooperative panels. |
+| `schur_batch` | uint32 | 0 or more | Sets how many pivot panels the GPU completes between two update drains. With `0`, it drains once per level of the tree. |
+| `panel_threads` | uint32 | 32 to 1024 | Sets the threads per threadgroup in the panel factorization. |
+| `solve_threads` | uint32 | `0`, or 32 to 1024 | Sets the threads per block in the solves. With `0`, SPARTA picks it per block width. |
+| `panel` | uint32 | 16 | Sets the pivots per panel. Other widths need kernel changes. |
+| `schur_block` | uint32 | 1 to 8 | Sets the per-thread register block in the Schur update. The tile is `16 × schur_block` square. |
+| `strip_block` | uint32 | 1 to 8 | Sets the per-thread register block in the strip update. |
+| `narrow_cols` | uint32 | 1 or more | Sets the width above which a block uses the wide-front kernels. |
+| `pivot_threads` | uint32 | a multiple of 32, up to 1024 | Sets the threads that search for one pivot together. |
+| `schur_chunk` | uint32 | 1 or more | Sets the panel columns staged per Schur pass. |
 
-The last six are compiled into the GPU kernels. A combination the process has
-not used before costs about 300 ms of shader compilation the first time.
-Settings that break a device limit, such as shared memory, are rejected with a
-message naming the setting. `SPARTA_SCHUR_BATCH`, `SPARTA_PANEL_THREADS`,
-`SPARTA_SOLVE_THREADS`, `SPARTA_LU_DIAG_THRESHOLD`, `SPARTA_STATIC_PIVOT` and `SPARTA_HYBRID_CPU` override their defaults
-from the environment, for quick experiments.
+The last six settings are compiled into the GPU kernels. The first time a
+process uses a new combination, shader compilation takes about 300 ms.
+
+If a setting breaks a device limit, such as shared memory, SPARTA rejects it
+with a message that names the setting.
+
+For quick experiments, these environment variables override their defaults:
+`SPARTA_SCHUR_BATCH`, `SPARTA_PANEL_THREADS`, `SPARTA_SOLVE_THREADS`,
+`SPARTA_LU_DIAG_THRESHOLD`, `SPARTA_STATIC_PIVOT` and `SPARTA_HYBRID_CPU`.
 
 ## Precision and accuracy
 
 ### Single versus double precision
 
-The GPU computes in **single precision** (float32 for a real matrix,
-complex64 for a complex one), which holds about seven significant digits. On
-the kinds of systems SPARTA targets, a bare GPU solve lands at a relative
-residual of about 1e-5. The **CPU backend** computes in **double precision**
-(float64 or complex128), about sixteen digits, and is much slower.
+The GPU computes in **single precision**: float32 for a real matrix,
+complex64 for a complex one. That holds about seven significant digits. On FEM
+systems, a GPU solve without refinement reaches a relative residual of about
+1e-5.
 
-Between the two sits **iterative refinement**. The CPU measures how far the GPU
-answer is off, in double precision, and asks the GPU for corrections. This
-gives double-precision accuracy at close to single-precision speed, and works
-on all but the most badly conditioned systems.
+The **CPU backend** computes in **double precision**: float64 or complex128,
+about sixteen digits. It is much slower.
+
+**Iterative refinement** sits between the two. The CPU measures the error of
+the GPU answer in double precision, and the GPU computes corrections. This
+gives double-precision accuracy at close to single-precision speed. It works on
+all but the most badly conditioned systems.
 
 | Approach | Accuracy | Speed | Available in |
 |---|---|---|---|
@@ -929,19 +1067,19 @@ on all but the most badly conditioned systems.
 | CPU backend | full double precision | much slower | Rust, Python |
 
 **The residual is not the error in x.** Refinement stops on the residual,
-`‖b − Ax‖ / ‖b‖`. The error in x is larger, by roughly 7× on a
-well-conditioned system and by several hundred times on a sensitive one. Ask
-for a tighter residual than the accuracy you need.
+`‖b − Ax‖ / ‖b‖`. The error in x is larger: about 7× on a well-conditioned
+system, and several hundred times on a sensitive one. So ask for a tighter
+residual than the accuracy you need.
 
 ### Getting more accuracy from the GPU
 
-**Rust and C.** Refinement is not built into these interfaces yet: a solve
-returns the bare single-precision answer. `examples/refine.rs` shows how to
-refine from Rust yourself.
+**Rust and C.** These interfaces have no built-in refinement yet. A solve
+returns the single-precision answer. `examples/refine.rs` shows how to refine
+from Rust yourself.
 
 **Python.** Refinement is on by default and stops at a relative residual of
-`1e-6`. Keep A and b in double precision, since that is what the residual
-is measured against: float64 for a real matrix, complex128 for a complex one.
+`1e-6`. Keep A and b in double precision (float64 or complex128), because the
+residual is measured against them.
 
 ```python
 F = sparta.analyze(A.astype(np.float64)).factorize()      # a real matrix
@@ -955,29 +1093,29 @@ sparta.analyze(A, refinement_steps=2)      # at most two corrections, whatever t
 sparta.analyze(A, refinement_steps=0)      # off: the bare single-precision solve
 ```
 
-The factors stay single precision. Only the residuals and the running answer
-are kept in double precision, so a refined solve returns double precision
-whatever precision you passed in: float64 when A and b are both real,
-complex128 otherwise. Refinement stops as soon as it reaches the target. If it stops
-improving first, it returns the best answer it found and says so in its report
-(see [Checking a solve](#checking-a-solve)). If refinement struggles, try
+The factors stay in single precision. Only the residuals and the answer are
+kept in double precision. So a refined solve always returns double precision:
+float64 when A and b are both real, complex128 otherwise.
+
+Refinement stops as soon as it reaches the target. If it stops improving
+first, it returns the best answer it found and says so in its report (see
+[Checking a solve](#checking-a-solve)). If refinement struggles, try
 `equilibrate=True`, the `careful` preset, or the CPU backend.
 
 ### Solving on the CPU in double precision
 
-`force_cpu` runs the factorization and the solves in double precision on the
-CPU. It uses the same analysis and the same kind of factorization as the GPU.
-The large dense updates go to Apple Accelerate on a Mac, or to a BLAS library
-loaded at run time elsewhere (see
-[CPU dense kernels](#cpu-dense-kernels-blas-and-lapack)).
+`force_cpu` runs the factorization and the solves on the CPU, in double
+precision. It uses the same analysis and the same kind of factorization as the
+GPU. The large dense updates run on SPARTA's own dense kernels (see
+[CPU dense kernels](#cpu-dense-kernels-spartablas)).
 
 SPARTA never switches to the CPU on its own. If the GPU fails, you get an
 error, not a slow answer.
 
-**Rust:** set `force_cpu: true` in the `Config`, and pass double-precision
-values to `factor_values` and `solve_values`: `f64` for a real matrix,
-`Complex64` for a complex one. The CPU computes in the type you pass, so `f32`
-and `Complex32` work too, in single precision.
+**Rust:** Set `force_cpu: true` in the `Config`. Pass double-precision values
+to `factor_values` and `solve_values`: `f64` for a real matrix, `Complex64` for
+a complex one. The CPU computes in the type you pass, so with `f32` or
+`Complex32` it computes in single precision.
 
 **Python:**
 
@@ -989,22 +1127,24 @@ F.compute_dtype     # float64 for a real A, complex128 for a complex one
 F.factorize(force_cpu=True)     # force_cpu=False switches back to the GPU
 ```
 
-Switching releases the old factors and builds new ones on the chosen backend.
-`F.factor_seconds` reports the CPU factorization time.
+When you switch, SPARTA releases the old factors and builds new ones on the
+chosen backend. `F.factor_seconds` reports the CPU factorization time.
 
-**C:** not available. The C library is GPU-only.
+**C:** Not available. The C library only uses the GPU.
 
-[CPU architecture and tuning](src/cpu/README.md) covers how the CPU backend
+[CPU architecture and tuning](https://github.com/FennisRobert/SPARTA/blob/main/src/cpu/README.md) covers how the CPU backend
 executes and what memory it uses.
 
 ### CPU and GPU together (hybrid)
 
-On a Mac the CPU and the GPU share one memory, so they can factor one matrix
-together. With `hybrid` on, the CPU takes whole branches of the elimination
-tree while the GPU factors the rest, and the GPU finishes from where the two
-meet. The CPU computes in the GPU's precision, so the answers match a GPU-only
-factorization to single-precision rounding. It works for LDLᵀ and LU, real and
-complex.
+On a Mac, the CPU and the GPU share one memory, so they can factor one matrix
+together. With `hybrid` on, the CPU factors whole branches of the elimination
+tree while the GPU factors the rest. The GPU then finishes from where the two
+meet.
+
+The CPU computes in the GPU's precision, so the answers match a GPU-only
+factorization up to single-precision rounding. It works for LDLᵀ and LU, real
+and complex.
 
 **Python:**
 
@@ -1019,12 +1159,13 @@ F.hybrid_timing                                  # how the last factorization sp
 `config.hybrid_cpu` before `sparta_analyze`. **Julia:** `Solver(A; hybrid = true)`.
 **MATLAB:** the `'hybrid_cpu'` setting.
 
-The first factorization already runs split. After that the split adapts to the
-measured speed of each device, so a sweep settles from the third
-factorization on. Changing `hybrid` in `factorize` rebuilds the GPU factors.
+The first factorization already runs split. After that, SPARTA adapts the
+split to the measured speed of each device. In a sweep, the split settles from
+the third factorization on. If you change `hybrid` in `factorize`, SPARTA
+rebuilds the GPU factors.
 
-Where it does not apply, it is ignored rather than refused: with `force_cpu`,
-on Vulkan, and without a GPU.
+With `force_cpu`, on Vulkan, or without a GPU, SPARTA ignores `hybrid` instead
+of refusing it.
 
 Measured on an Apple M4 Pro (10 performance cores, 20-core GPU), settled sweep
 steps, with `RAYON_NUM_THREADS=10` (the performance cores, which beat the
@@ -1038,8 +1179,8 @@ default of all cores):
 | 887k unknowns, LU | 2.07 s | 1.94 s | 1.07× |
 | 86k unknowns, LU | 329 ms | 309 ms | 1.06× |
 
-It pays most on large symmetric systems. The CPU half of LU is slower
-relative to the GPU, so LU gains less.
+It helps most on large symmetric systems. For LU, the CPU is slower relative
+to the GPU, so LU gains less.
 
 ### Checking a solve
 
@@ -1054,7 +1195,7 @@ Check the result before trusting it, especially on a new kind of matrix.
 - Compute `‖b − Ax‖ / ‖b‖` yourself, in double precision.
 
 **Python.** Right after `factorize()`, before any solve, `F.quality` says how
-far the factorization is from breaking down. Reading it costs no extra GPU
+close the factorization came to breaking down. Reading it costs no extra GPU
 work:
 
 ```python
@@ -1075,26 +1216,32 @@ for r in F.refinement_reports:
 ```
 
 `status` is `CONVERGED`, `STAGNATED`, `ITERATION_LIMIT` or `NONFINITE`.
-`estimated_relative_error` estimates the error in x itself, which is usually
-the number you actually care about.
+`estimated_relative_error` estimates the error in x itself. That is usually
+the number you care about.
 
-SPARTA is built for FEM systems such as curl-curl and Helmholtz problems,
-whose diagonal is nonzero. A matrix with zero diagonal entries (saddle-point,
-Lagrange-multiplier or mixed formulations) is not supported yet: `factorize()`
-issues a `sparta.UnsupportedMatrixWarning`, because such a matrix can come out
-inaccurate or fail even when well conditioned.
+**Zero diagonal entries.** SPARTA is built for FEM systems such as curl-curl
+and Helmholtz problems, whose diagonal is nonzero. Matrices with zero diagonal
+entries (saddle-point, Lagrange-multiplier or mixed formulations) are not
+supported yet. Such a matrix can come out inaccurate or fail, even when it is
+well conditioned. For such a matrix, `factorize()` issues a
+`sparta.UnsupportedMatrixWarning`.
 
-When refinement does not reach `refinement_rtol`, the solve also issues a
-`sparta.AccuracyWarning`. It says how far off the answer is and why that most
-likely happened: a singular or ill-conditioned matrix, or zero diagonal
-entries whose pivot partner sits in another front, which SPARTA cannot pivot
-across. Turn it into an error with
+**Refinement falls short.** When refinement does not reach `refinement_rtol`,
+the solve issues a `sparta.AccuracyWarning`. The warning says how far off the
+answer is and the most likely cause:
+
+- a singular or ill-conditioned matrix, or
+- zero diagonal entries whose pivot partner sits in another block, which
+  SPARTA cannot pivot across.
+
+To turn the warning into an error, use
 `warnings.simplefilter('error', sparta.AccuracyWarning)`.
 
-A singular matrix fails `factorize()` with an error that names the unknown, in
-your numbering, whose pivot broke down, for example `factorization failed at
-unknown 40 ...: zero column (rank deficient). The matrix is singular...`. The
-same text reaches Rust (`Error::Pivot`'s `unknown`), C and Julia.
+**Singular matrices.** For a singular matrix, `factorize()` fails with an
+error that names the unknown whose pivot broke down, in your numbering. For
+example: `factorization failed at unknown 40 ...: zero column (rank
+deficient). The matrix is singular...`. Rust (`Error::Pivot`'s `unknown`), C
+and Julia get the same text.
 
 To check an answer yourself, compute the residual in double precision:
 
@@ -1105,21 +1252,22 @@ residual = np.linalg.norm(b - A @ x) / np.linalg.norm(b)
 **C.** `sparta_perturbed_pivots` reports the same count as Rust. Compute the
 residual yourself.
 
-A small residual does not guarantee a small error in x for a very sensitive
-matrix. Zero perturbed pivots does not guarantee accuracy either.
+For a very sensitive matrix, a small residual does not guarantee a small
+error in x. Zero perturbed pivots does not guarantee accuracy either.
 
 ## Memory and diagnostics
 
 ### Freeing a solver
 
-A factorization can hold a lot of GPU memory, 1.4 GiB on the larger test
-system. It is released when the solver is. Free it explicitly when you are done:
+A factorization can hold a lot of GPU memory: 1.4 GiB on our larger test
+case. SPARTA releases it when the solver is released. Free it explicitly when
+you are done:
 
 - **Rust:** `solver.destroy()`, or let the solver go out of scope.
-- **Python:** `F.destroy()`. Otherwise the memory stays claimed for as long as
-  anything refers to the solver, and a list, a traceback or a notebook's output
-  history all count. `destroy()` is safe to call twice. A solver is also a
-  context manager, which frees it even if the block raises an error:
+- **Python:** `F.destroy()`. Without it, the memory stays claimed as long as
+  anything refers to the solver, including a list, a traceback or a
+  notebook's output history. `destroy()` is safe to call twice. A solver is
+  also a context manager, which frees it even if the block raises an error:
 
   ```python
   with sparta.analyze(A) as F:
@@ -1130,13 +1278,13 @@ system. It is released when the solver is. Free it explicitly when you are done:
 - **C:** `sparta_solver_free(solver)`, and `sparta_analysis_free` for an
   analysis that never became a solver.
 
-After `destroy()`, a Python solver still answers `F.n` and `F.path`. `factorize`,
-`solve` and `info` raise `ValueError`. Use a solver only on the thread that
-created it.
+After `destroy()`, a Python solver still answers `F.n` and `F.path`, but
+`factorize`, `solve` and `info` raise `ValueError`. Use a solver only on the
+thread that created it.
 
-When things go wrong: a bad matrix or a bad option leaves an existing
-factorization intact. A failure inside the factorization invalidates it, and
-solving raises an error until a later factorization succeeds.
+**When things go wrong.** A bad matrix or a bad option leaves an existing
+factorization intact. A failure inside the factorization invalidates it. Until
+a later factorization succeeds, solving raises an error.
 
 ### Looking inside
 
@@ -1151,7 +1299,7 @@ report the same things in code:
 | Property | Tells you |
 |---|---|
 | `sparta.gpu_available()` | Whether this build's GPU backend (Metal or Vulkan) can run in this process |
-| `sparta.blas_library()` | The CPU backend's BLAS library, or `"portable loops"` without one |
+| `sparta.blas_library()` | The CPU dense kernels in use, for example `"SpartaBLAS (sme512)"` |
 | `F.n`, `F.path` | Matrix size and the chosen method |
 | `F.info` | Pattern statistics and estimated memory |
 | `F.quality` | How trustworthy the factors are (see [Checking a solve](#checking-a-solve)) |
@@ -1161,7 +1309,7 @@ report the same things in code:
 | `F.diagnostics()` | All of the above, plus the current options, the backend and the refinement reports |
 
 The full argument-by-argument reference, including every error, is in
-[python/API.md](python/API.md).
+[python/API.md](https://github.com/FennisRobert/SPARTA/blob/main/python/API.md).
 
 **C.** `sparta_analysis_fill_ratio`, `sparta_analysis_factor_bytes`,
 `sparta_factor_seconds` and `sparta_perturbed_pivots`.
@@ -1174,8 +1322,7 @@ and factorization.
 
 ## Building from source
 
-This matters when you build on something other than an Apple Silicon Mac, or
-want the CPU backend to run fast off Apple.
+Read this when you build on something other than an Apple Silicon Mac.
 
 ### GPU backends
 
@@ -1195,15 +1342,19 @@ cargo build --release --features vulkan       # name one explicitly
 cargo build --release --no-default-features   # CPU backend only
 ```
 
-The target's choice comes from the default `gpu` feature. Turning default
-features off without naming a backend leaves out the GPU code, its kernels
-and the Metal framework links; a Rust crate that uses only the CPU path
-depends on `sparta-solver` with `default-features = false`. The Python
-extension and the C library pass the same switch on:
-`maturin build --release --manifest-path python/Cargo.toml --no-default-features`
-builds a CPU-only wheel. Such a build has no device, so every solver needs
-`force_cpu` (`Config::force_cpu` in Rust, `force_cpu=True` in Python,
-`config.force_cpu` in C).
+The default `gpu` feature lets the target choose. If you turn default
+features off without naming a backend, the build leaves out the GPU code, its
+kernels and the Metal framework links.
+
+- **Rust:** A crate that only uses the CPU path depends on `sparta-solver`
+  with `default-features = false`.
+- **Python and C:** The same switch works. For example,
+  `maturin build --release --manifest-path python/Cargo.toml --no-default-features`
+  builds a CPU-only wheel.
+
+A CPU-only build has no device, so every solver needs `force_cpu`
+(`Config::force_cpu` in Rust, `force_cpu=True` in Python, `config.force_cpu`
+in C).
 
 `F.diagnostics()["backend"]` in Python and `sparta_device()` in C report which
 backend a binary carries.
@@ -1214,19 +1365,21 @@ The Vulkan backend runs the same factorizations and solves as Metal, in
 float32 for real matrices and complex64 for complex ones, on AMD and NVIDIA
 GPUs under Windows and Linux.
 
-- **Building** needs nothing extra: a plain `pip install` or `cargo build` on
-  Windows or Linux includes it. The kernels ship compiled to SPIR-V in
-  `src/kernels/vulkan/spirv/`. Only after editing a `.comp` file do you need
-  `glslc` from the [Vulkan SDK](https://vulkan.lunarg.com/); `build.rs` finds
-  it through `GLSLC`, then `VULKAN_SDK`, then the path, and
-  `SPARTA_WRITE_SPIRV=1 cargo build --features vulkan` refreshes the shipped
-  copies. A build without `glslc` whose kernels no longer match the shipped
-  SPIR-V stops with an error rather than using stale kernels.
-- **Running** needs a driver with Vulkan 1.3. Nothing is linked at build time:
-  the Vulkan loader is opened when the first solver is created, and without
-  one `gpu_available()` is false.
-- **Choosing a device.** With several GPUs the first discrete one is used.
-  `SPARTA_VULKAN_DEVICE` picks another, by index or by part of its name:
+- **Building** needs nothing extra. On Windows or Linux, a plain
+  `pip install` or `cargo build` includes Vulkan. The kernels ship compiled to
+  SPIR-V in `src/kernels/vulkan/spirv/`.
+- **Editing kernels.** After you edit a `.comp` file, you need `glslc` from the
+  [Vulkan SDK](https://vulkan.lunarg.com/). `build.rs` looks for it in
+  `GLSLC`, then `VULKAN_SDK`, then the path. Run
+  `SPARTA_WRITE_SPIRV=1 cargo build --features vulkan` to refresh the shipped
+  copies. If `glslc` is missing and the kernels no longer match the shipped
+  SPIR-V, the build stops with an error instead of using stale kernels.
+- **Running** needs a driver with Vulkan 1.3. Nothing is linked at build time.
+  SPARTA opens the Vulkan loader when the first solver is created. Without a
+  loader, `gpu_available()` is false.
+- **Choosing a device.** With several GPUs, SPARTA uses the first discrete
+  one. To pick another, set `SPARTA_VULKAN_DEVICE` to its index or part of its
+  name:
 
 ```sh
 cargo build --release                     # Vulkan by default on Windows and Linux
@@ -1240,9 +1393,9 @@ maturin develop --release --manifest-path python/Cargo.toml --features vulkan
 Tested on an NVIDIA RTX 3080 and an AMD Radeon integrated GPU (Windows 11).
 
 **Testing the Vulkan path on a Mac.** MoltenVK translates Vulkan to Metal,
-so the Vulkan kernels can be checked on Apple Silicon. It is for testing, not
-for speed: on an M4 Pro it is 1.0 to 1.7 times slower than the Metal backend,
-with the same residuals.
+so you can check the Vulkan kernels on Apple Silicon. Use it for testing only:
+on an M4 Pro, it is 1.0 to 1.7 times slower than the Metal backend, with the
+same residuals.
 
 ```sh
 brew install molten-vk vulkan-loader
@@ -1251,55 +1404,47 @@ cargo test --release --no-default-features --features vulkan
 maturin develop --release --manifest-path python/Cargo.toml --features vulkan
 ```
 
-The variable is needed because macOS does not search `/opt/homebrew/lib` for
+You need the variable because macOS does not search `/opt/homebrew/lib` for
 libraries by default. The Metal-only hybrid tests skip themselves.
 
-### CPU dense kernels (BLAS and LAPACK)
+### CPU dense kernels (SpartaBLAS)
 
-The CPU backend (`force_cpu`) hands its large dense operations to a BLAS and
-LAPACK library. Without one it gives the same answers, several times more
-slowly, on plain Rust loops. The GPU path does not use BLAS.
+In CPU mode (`force_cpu`) and in the hybrid's CPU share, SPARTA runs its
+dense work on SpartaBLAS, its own kernels in `crates/sparta-blas`. The dense
+work is the matrix products, the triangular solves, and the LU and LDLᵀ
+factorization of each block's diagonal. You do not need to install or link
+anything, on any platform. GPU mode does not use these kernels.
 
-| Platform | What to do |
-|---|---|
-| macOS | Nothing. Every Mac build uses Apple's Accelerate. |
-| Python on Linux and Windows | Nothing. pip installs `scipy-openblas32` with SPARTA, and SPARTA loads it on import. |
-| Rust on Linux and Windows | Set `SPARTA_BLAS` to the library's path, or call `sparta::load_blas(path)` before the first CPU factorization. |
+SpartaBLAS has one kernel set per processor family. On first use, it picks
+the best set the processor supports:
+
+| Kernel set | Processors | Status |
+|---|---|---|
+| `sme512` | Arm SME2 matrix unit at a 512-bit vector length: Apple M4 and later | Hand-written; measured |
+| `neon` | Every 64-bit Arm processor | Measured on Apple M4 Pro |
+| `avx512` | x86-64 with AVX-512: Intel Xeon (Skylake-SP and later), AMD Zen 4 and later | Written; not yet run on x86 hardware |
+| `avx2` | x86-64 with AVX2 and FMA: Intel since 2013 (Haswell), AMD since Zen 1 | Written; not yet run on x86 hardware |
+| `scalar` | Anything else | Portable fallback |
 
 `sparta.blas_library()` (Python) and `sparta::blas_library()` (Rust) name the
-library in use, or return `"portable loops"`. If Python finds none, the import
-warns. It tries, in order: `SPARTA_BLAS`; the `scipy-openblas32` package; the
-OpenBLAS inside SciPy's install; a conda environment's OpenBLAS or MKL. The
-library is fixed for the process once the first CPU factorization runs.
+set in use, for example `"SpartaBLAS (sme512)"`. To force a set for testing,
+set `SPARTA_KERNEL` before the first CPU factorization:
 
 ```sh
-SPARTA_BLAS=/usr/lib/x86_64-linux-gnu/libopenblas.so.0 cargo run --release   # Rust
+SPARTA_KERNEL=neon python my_simulation.py     # sme512, avx512, avx2, neon or scalar
 ```
 
-On a Ryzen 5 3600XT (Windows), an 84k-unknown complex system factored in
-0.56 s with `scipy-openblas32`, 0.55 s with a linked OpenBLAS and 0.65 to
-0.76 s with MKL. Intel processors have not been measured.
+If the processor cannot run the forced set, SPARTA prints a message and uses
+the best available set instead.
 
-#### Linking a library at build time
+The kernels start no threads of their own. Large calls split across the same
+Rayon pool as the rest of SPARTA (see [CPU threads](#cpu-threads)), so the
+dense work never competes with the factorization for cores.
 
-Two build-time variables link a library into SPARTA instead. A linked library
-always wins over one loaded at run time, and a wrong name fails the build
-with a link error.
-
-| Variable | Meaning |
-|---|---|
-| `SPARTA_BLAS_LIB` | Library to link, without the `lib` prefix: `openblas`, or `mkl_rt` for Intel MKL. Several may be given, separated by commas. |
-| `SPARTA_BLAS_DIR` | Folder to look for it in, when it is not on the default search path. |
-
-```sh
-SPARTA_BLAS_LIB=openblas cargo build --release                         # Linux, after: apt install libopenblas-dev
-SPARTA_BLAS_DIR=$MKLROOT/lib SPARTA_BLAS_LIB=mkl_rt pip install .       # Linux, Intel oneAPI MKL
-SPARTA_BLAS_DIR='C:\venv\Library\lib' SPARTA_BLAS_LIB=mkl_rt cargo build --release   # Windows, pip mkl + mkl-devel
-```
-
-A linked MKL needs its library folder at run time too: `source
-/opt/intel/oneapi/setvars.sh` on Linux, `C:\venv\Library\bin` on `PATH` on
-Windows. On macOS the variables are ignored.
+The `sme512` kernels follow Arm's architecture, not one vendor's, but they need
+a 512-bit vector length. A processor with SME at another length uses `neon`
+until a kernel set for its length exists. On Linux and Windows, SPARTA does not
+detect the matrix unit yet, so those systems also use `neon`.
 
 ## Development
 
@@ -1312,16 +1457,16 @@ sh validate.sh                 # all of the above plus the Metal numerical suite
 ```
 
 `validate.sh` also builds the Python extension and runs the GPU tests against
-NumPy double-precision references. The first time, it creates a virtualenv
-under the ignored `.local/` folder.
+NumPy double-precision references. On its first run, it creates a virtualenv
+in the ignored `.local/` folder.
 
 ### Test matrices and benchmarks
 
-The benchmarks run on real systems exported from EMerge, kept in
-`test_matrices/`. They are too large for git and are not part of the
-repository; tests that need a matrix you don't have are skipped. To make your
-own test systems, `tools/sparta_io.py` reads and writes the `.sparta` format,
-and `tools/npz_to_sparta.py` converts SciPy `.npz` exports.
+The benchmarks run on real FEM systems in `test_matrices/`. These are too
+large for git and are not part of the repository. Tests that need a matrix you
+do not have are skipped. To make your own test systems, use
+`tools/sparta_io.py`, which reads and writes the `.sparta` format, and
+`tools/npz_to_sparta.py`, which converts SciPy `.npz` exports.
 
 ```sh
 cargo run --release --example bench -- --curl-curl 24                   # synthetic 24³ system
@@ -1342,8 +1487,8 @@ cargo run --release --example dispatch_audit -- test_matrices/em_m1_sym1.sparta
 | `tools/sparta_io.py` | Reads and writes `.sparta` files from Python. |
 
 The SCALPEL ordering is a standalone crate with its own options and
-measurements: see [crates/scalpel/README.md](crates/scalpel/README.md) and
-[documentation/SCALPEL.md](documentation/SCALPEL.md).
+measurements. See [crates/scalpel/README.md](https://github.com/FennisRobert/SPARTA/blob/main/crates/scalpel/README.md) and
+[documentation/SCALPEL.md](https://github.com/FennisRobert/SPARTA/blob/main/documentation/SCALPEL.md).
 
 ### Repository layout
 
@@ -1352,6 +1497,7 @@ src/                 the solver: analysis, GPU bridge, CPU backend
 src/kernels/         Metal kernels: assembly, pivoting, updates, solves
 src/symbolic/        ordering, elimination tree, column counts, supernodes
 crates/scalpel/      the SCALPEL nested-dissection ordering
+crates/sparta-blas/  SpartaBLAS: the CPU dense kernels, one set per processor family
 crates/sparta-capi/  the C and C++ interface
 python/              the sparta Python package and its Rust bindings
 examples/            benchmark and analysis programs

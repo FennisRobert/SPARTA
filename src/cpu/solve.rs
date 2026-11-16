@@ -60,7 +60,7 @@ const GEMM_MIN: usize = 4096;
 
 /// Whether a trailing product over `elements` factor values goes to GEMM.
 pub(super) fn gemm(r: usize, elements: usize) -> bool {
-    cfg!(any(sparta_accelerate, sparta_blas)) && r >= GEMM_RHS && elements >= GEMM_MIN
+    r >= GEMM_RHS && elements >= GEMM_MIN
 }
 
 /// `t[i] -= l[i] * y` for every row `i`, each row holding `y.len()` values.
@@ -201,12 +201,10 @@ impl Solver {
     /// factorization, so the GEMMs run one per task on the calling thread.
     pub(super) fn with_caller_blas<T>(&self, blas: bool, work: impl FnOnce() -> T) -> T {
         if blas {
-            dense::set_global_threading(Threading::Caller);
             rayon::broadcast(|_| dense::set_threading(Threading::Caller));
         }
         let out = work();
         if blas {
-            dense::set_global_threading(Threading::Machine);
             rayon::broadcast(|_| dense::set_threading(Threading::Machine));
         }
         out

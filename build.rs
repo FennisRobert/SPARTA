@@ -11,10 +11,9 @@
 //!   reads, and mirrored by `Device::COMPILED`. A build for a target that
 //!   supports nothing compiles the symbolic analysis and the CPU backend, and
 //!   reports no device.
-//! - **CPU BLAS and LAPACK.** `src/cpu/dense.rs` calls plain CBLAS and
-//!   f2c-style LAPACK, which Accelerate, OpenBLAS and MKL all export. A
-//!   linked provider is published as `cfg(sparta_accelerate)` /
-//!   `cfg(sparta_blas)`; without either, `src/blas.rs` loads one at run time.
+//!
+//! Nothing is linked for the CPU dense kernels: they are SPARTA's own
+//! (`crates/sparta-blas`), compiled into the library.
 
 use std::{env, fs, path::{Path, PathBuf}, process::Command};
 
@@ -120,42 +119,6 @@ fn backend(os: &str, arch: &str) -> Backend {
         (false, false) if os == "macos" && arch == "aarch64" => Backend::Metal,
         (false, false) if os == "windows" || os == "linux" => Backend::Vulkan,
         (false, false) => Backend::None,
-    }
-}
-
-/// Emits the link directives for the CPU dense kernels.
-///
-/// Accelerate is the obvious choice on Apple and needs no external package.
-/// Elsewhere nothing is linked by default: `src/blas.rs` loads a CBLAS and
-/// LAPACK at run time, which the Python package finds on its own (the
-/// `scipy-openblas32` wheel it depends on). A build can still link one, when
-/// `SPARTA_BLAS_LIB` names it (for example `openblas`, or `mkl_rt` for MKL);
-/// `SPARTA_BLAS_DIR` adds a search path for one that is not on the default
-/// one. A linked library is then the only one used.
-/// `SPARTA_DENSE_LIBRARY` carries a linked choice to `src/blas.rs` for reporting.
-fn dense_kernels(os: &str) {
-    println!("cargo:rerun-if-env-changed=SPARTA_BLAS_LIB");
-    println!("cargo:rerun-if-env-changed=SPARTA_BLAS_DIR");
-    if os == "macos" || os == "ios" {
-        println!("cargo:rustc-cfg=sparta_accelerate");
-        println!("cargo:rustc-env=SPARTA_DENSE_LIBRARY=Accelerate");
-        println!("cargo:rustc-link-lib=framework=Accelerate");
-        return;
-    }
-    // No system BLAS is guaranteed to exist off Apple, so a build that was not
-    // told which one to link loads one at run time instead (`src/blas.rs`),
-    // and keeps to the portable Rust loops when it finds none.
-    let Ok(lib) = env::var("SPARTA_BLAS_LIB") else {
-        println!("cargo:rustc-env=SPARTA_DENSE_LIBRARY=portable loops");
-        return;
-    };
-    println!("cargo:rustc-env=SPARTA_DENSE_LIBRARY={lib}");
-    if let Ok(dir) = env::var("SPARTA_BLAS_DIR") {
-        println!("cargo:rustc-link-search=native={dir}");
-    }
-    println!("cargo:rustc-cfg=sparta_blas");
-    for name in lib.split(',').filter(|n| !n.trim().is_empty()) {
-        println!("cargo:rustc-link-lib={}", name.trim());
     }
 }
 
@@ -387,8 +350,6 @@ fn main() {
     for flag in [
         "sparta_metal",
         "sparta_vulkan",
-        "sparta_accelerate",
-        "sparta_blas",
     ] {
         println!("cargo:rustc-check-cfg=cfg({flag})");
     }
@@ -402,7 +363,6 @@ fn main() {
     }
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    dense_kernels(&os);
 
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     match backend(&os, &arch) {

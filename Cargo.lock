@@ -182,8 +182,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sparta-blas"
+version = "0.1.0"
+dependencies = [
+ "num-complex",
+ "rayon",
+]
+
+[[package]]
 name = "sparta-capi"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "sparta-solver",
 ]
@@ -197,14 +205,14 @@ dependencies = [
 
 [[package]]
 name = "sparta-solver"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "ash",
- "libloading",
  "num-complex",
  "rayon",
  "scalpel",
  "serde_json",
+ "sparta-blas",
  "sparta-matgen",
 ]
 

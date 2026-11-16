@@ -75,7 +75,7 @@ mod sparse;
 pub mod symbolic;
 mod threads;
 pub use analysis::{Analysis, Kind};
-pub use blas::{describe as blas_library, load as load_blas};
+pub use blas::describe as blas_library;
 pub use config::Config;
 pub use device::Device;
 pub use gpu::gpu_available;

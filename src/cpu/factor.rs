@@ -41,8 +41,8 @@ pub(super) struct Front<'a> {
 impl Front<'_> {
     /// Eliminate fully summed columns, then finish the deferred Schur complement.
     ///
-    /// Wide fronts go to Accelerate through `blocked.rs` (LDL^T) or
-    /// `blocked_lu.rs` (LU), which hand them back untouched when LAPACK meets
+    /// Wide fronts go to the dense kernels through `blocked.rs` (LDL^T) or
+    /// `blocked_lu.rs` (LU), which hand them back untouched when `?sytrf` meets
     /// an exactly singular pivot block; `panel.rs`
     /// then factors them with its rescue floor. Narrow fronts stay on the
     /// serial kernel, whose complete pivot search matches Metal's short-front
@@ -55,7 +55,7 @@ impl Front<'_> {
         self.sub.fill(C::from_re(0.0));
         let small = self.m <= self.config.small_front_rows as usize;
         if !small {
-            if dense::available() {
+            if dense::available() && (self.kind != Kind::Ldlt || dense::has_sytrf()) {
                 let done = if self.kind == Kind::Ldlt {
                     self.factor_blocked(scratch, report)?
                 } else {

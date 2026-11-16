@@ -11,15 +11,29 @@ build-backend = "maturin"
 
 [project]
 name = "sparta-solver"
-version = "0.3.6"
+version = "0.3.7"
 requires-python = ">=3.9"
-dependencies = ["numpy>=1.21", "scipy>=1.7",
-                # The CPU solver's BLAS, loaded at import (sparta/_blas.py).
-                "scipy-openblas32; sys_platform != 'darwin'"]
-description = "Experimental Apple Silicon GPU-resident sparse complex-symmetric solver"
+dependencies = ["numpy>=1.21", "scipy>=1.7"]
+description = "Sparse direct solver for finite-element problems: optimal ordering, own dense kernels, GPU or CPU"
 license = { text = "AGPL-3.0-or-later" }
 authors = [{ name = "Robert Fennis" }, { name = "Milan Rother" }]
 readme = "README.md"
+keywords = ["sparse", "direct solver", "finite element", "FEM", "LDLT", "GPU", "Metal", "Vulkan"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+[project.urls]
+Repository = "https://github.com/FennisRobert/SPARTA"
+Issues = "https://github.com/FennisRobert/SPARTA/issues"
 
 [tool.maturin]
 manifest-path = "python/Cargo.toml"

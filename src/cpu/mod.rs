@@ -246,8 +246,9 @@ impl Solver {
         let machine = !pool.bounded();
         let shared = Shared::new(fronts, factors, upper, diagonal, subdiag, perms, two, *rowmajor, tiny);
         // Rayon owns the parallelism: fronts across threads in wide levels, and
-        // row blocks within one front in narrow ones. Accelerate threads only
-        // inside `zsytrf`, which sets and clears this itself. The setting is
+        // row blocks within one front in narrow ones. The dense kernels split
+        // over the pool only for a lone front, which sets and clears this
+        // itself. The setting is
         // thread-local, so it has to reach every worker, not just this one.
         dense::set_threading(Threading::Caller);
         rayon::broadcast(|_| {
@@ -313,9 +314,6 @@ impl Solver {
             })
         } else {
             schedule.iter().enumerate().try_for_each(|(depth, level)| {
-            // OpenBLAS's control is process-wide, so it is set here, where the
-            // previous level has joined and no thread is inside BLAS.
-            dense::set_global_threading(if level.spread { Threading::Caller } else { Threading::Machine });
             let t0 = Instant::now();
             let clock = Report::clock();
             if !level.spread {
@@ -383,8 +381,7 @@ impl Solver {
         })
         };
         // Leave the pool as it was found, for whatever else in the process
-        // calls Accelerate.
-        dense::set_global_threading(Threading::Machine);
+        // calls SpartaBLAS.
         dense::set_threading(Threading::Machine);
         rayon::broadcast(|_| {
             dense::set_threading(Threading::Machine);

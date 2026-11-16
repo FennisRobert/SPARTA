@@ -1,8 +1,8 @@
 //! One elimination level, assembled and factored across threads.
 //!
 //! Fronts in the same level are independent, so the level is the unit of
-//! parallelism. Accelerate still threads inside a single large product, and the
-//! two compose: the top levels are a handful of wide fronts whose own BLAS
+//! parallelism. The dense kernels still split a single large product over the
+//! pool, and the two compose: the top levels are a handful of wide fronts whose own BLAS
 //! calls fill the machine, and the bottom levels are thousands of narrow fronts
 //! that fill it here instead.
 use super::blocked::Scratch;
@@ -352,11 +352,9 @@ pub(super) struct Level {
 /// whole machine. Widest first, so Rayon's stealing does not end a level
 /// waiting on one late large front.
 ///
-/// OpenBLAS has only a process-wide control, which `Solver::factor_all` sets
-/// between levels: one thread for a spread level, the machine for a lone
-/// front. Without either control -- macOS 13 and 14 -- a spread level would
-/// have every front threading against every other, so only levels whose
-/// fronts are too narrow to reach Accelerate at all are spread there.
+/// The dense kernels have a per-thread control (`dense::controllable` is
+/// always true with SpartaBLAS), so every level of two or more fronts spreads.
+/// The narrow-front rule below only applies to a library without one.
 pub(super) fn schedule(plan: &Analysis) -> Vec<Level> {
     let controllable = dense::controllable();
     plan.levels

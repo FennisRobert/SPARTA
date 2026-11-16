@@ -1,6 +1,6 @@
-//! Partial LU of one front through Accelerate's blocked kernels.
+//! Partial LU of one front through the blocked dense kernels.
 //!
-//! The fully summed block goes to LAPACK's `?getrf`, and the rest is three
+//! The fully summed block goes to `?getrf` (SpartaBLAS's, in LAPACK's conventions), and the rest is three
 //! level-3 calls: `L11 U12 = A12` and `L21 U11 = A21` as triangular solves,
 //! then the whole rank-`nc` Schur complement `A22 -= L21 U12` as one product.
 //! This replaces `panel.rs`'s LU route, which pivots and solves for U12 one
@@ -81,16 +81,16 @@ impl Front<'_> {
         if tail > 0 {
             let clock = Report::clock();
             // U12: rows 0..n, columns n..m, against L11 at the origin; then
-            // L21: rows n..m, columns 0..n, against U11. Accelerate does not
-            // thread a triangular solve, so a front alone on the machine
-            // spreads its solves over the pool instead.
+            // L21: rows n..m, columns 0..n, against U11. A front alone on the
+            // machine spreads its solves over the pool as row blocks, which
+            // split better than one threaded solve (see `trsm_front_spread`).
             let solve = if self.parallel { dense::trsm_front_spread } else { dense::trsm_front };
             solve(Side::Left, Tri::UnitLower, n, tail, self.a, 0, n, m);
             solve(Side::Right, Tri::Upper, tail, n, self.a, 0, n * m, m);
             report.stop(Phase::Offdiag, clock);
             let clock = Report::clock();
-            // The product, unlike the solves, Accelerate threads well -- when
-            // the front has the machine to itself. One sharing its level with
+            // The product the library splits over the pool itself -- when the
+            // front has the machine to itself. One sharing its level with
             // others splits the product into row blocks for the pool instead.
             if self.alone {
                 dense::set_threading(Threading::Machine);

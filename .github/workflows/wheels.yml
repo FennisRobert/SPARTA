@@ -1,10 +1,17 @@
-# Builds the Python wheels and attaches them to a GitHub Release, so users can
-# install SPARTA without Rust or a C compiler. Nothing goes to PyPI.
+# Builds the Python wheels and the source distribution, tests each wheel, and
+# on a release publishes them to PyPI and attaches them to a GitHub Release.
+# Users then install SPARTA with `pip install sparta-solver`, without Rust or
+# a C compiler.
 #
-# Pushing a tag v* builds that tag and creates its release. Running the
-# workflow by hand ("Run workflow" on the Actions tab) builds without
-# releasing, or, given a tag, builds that tag and attaches the wheels to its
-# release, creating the release if needed.
+# Pushing a tag v* builds that tag, publishes it to PyPI and creates its
+# GitHub Release. The tag must match the version in pyproject.toml (v0.3.7 for
+# 0.3.7), or nothing is published. Running the workflow by hand ("Run
+# workflow" on the Actions tab) builds and tests without publishing, or, given
+# a tag, builds that tag and publishes it.
+#
+# PyPI accepts the upload through trusted publishing: the PyPI project
+# sparta-solver names this repository, this workflow file (wheels.yml) and the
+# environment "pypi" as its publisher. No API token is stored here.
 name: wheels
 
 on:
@@ -13,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build and release, e.g. v0.3.3. Empty: build only."
+        description: "Tag to build and publish, e.g. v0.3.7. Empty: build and test only."
         required: false
         default: ""
 
@@ -34,6 +41,10 @@ jobs:
           - { name: macos-arm64, os: macos-15, target: aarch64-apple-darwin, test: true }
           # Intel Macs: cross-compiled, CPU backend only, not run here.
           - { name: macos-x86_64, os: macos-15, target: x86_64-apple-darwin, test: false }
+          # Both slices in one file, for apps that bundle one wheel for every
+          # Mac. pip prefers the single-architecture wheels above, which are
+          # half the size. The test runs the arm64 slice.
+          - { name: macos-universal2, os: macos-15, target: universal2-apple-darwin, test: true }
           - { name: linux-x86_64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, test: true }
           - { name: linux-aarch64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, test: true }
           - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc, test: true }
@@ -50,8 +61,10 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist
           manylinux: auto
-      # A CPU solve on a 2D grid, wide enough to reach the BLAS path. The
-      # runners have no usable GPU.
+      # CPU solves on a 2D grid, large enough to reach the dense kernels: a
+      # complex symmetric LDLT and a real unsymmetric LU. The runners have no
+      # usable GPU. On x86 these are the only runs of the AVX2 and AVX-512
+      # kernel sets, so a wrong kernel stops the release here.
       - name: Test the wheel
         if: matrix.test
         shell: bash
@@ -59,22 +72,24 @@ jobs:
           python -m pip install dist/*.whl
           cd "$RUNNER_TEMP"
           python - <<'PY'
-          import sys
           import numpy as np
           from scipy import sparse
           import sparta
           print(sparta.__version__, sparta.blas_library(), sparta.gpu_available())
-          if sys.platform != "darwin":
-              assert sparta.blas_library() != "portable loops", "no BLAS found"
+          assert "scalar" not in sparta.blas_library(), "no vector kernel set was selected"
           m = 120
           t = sparse.diags([-1.0, 4.0, -1.0], [-1, 0, 1], shape=(m, m))
-          a = (sparse.kron(sparse.eye(m), t) + sparse.kron(sparse.diags([-1.0, -1.0], [-1, 1], shape=(m, m)), sparse.eye(m))).tocsc()
-          a = (a + 0.1j * sparse.eye(m * m)).tocsc()
-          b = np.ones(m * m, dtype=complex)
-          x = sparta.analyze(a, force_cpu=True).factorize().solve(b)
-          r = np.linalg.norm(a @ x - b) / np.linalg.norm(b)
-          print("relative residual", r)
-          assert r < 1e-10
+          lap = sparse.kron(sparse.eye(m), t) + sparse.kron(sparse.diags([-1.0, -1.0], [-1, 1], shape=(m, m)), sparse.eye(m))
+          cases = {
+              "complex LDLT": (lap + 0.1j * sparse.eye(m * m)).tocsc(),
+              "real LU": (lap + sparse.diags([0.3], [m], shape=(m * m, m * m))).tocsc(),
+          }
+          for name, a in cases.items():
+              b = np.ones(m * m, dtype=a.dtype)
+              x = sparta.analyze(a, force_cpu=True).factorize().solve(b)
+              r = np.linalg.norm(a @ x - b) / np.linalg.norm(b)
+              print(name, "relative residual", r)
+              assert r < 1e-10, name
           PY
       - uses: actions/upload-artifact@v4
         with:
@@ -87,6 +102,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.TAG || github.ref }}
+      - name: Check that the tag matches the package version
+        if: env.TAG != ''
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
+          echo "tag $TAG, pyproject.toml version $version"
+          test "$TAG" = "v$version"
       - uses: PyO3/maturin-action@v1
         with:
           command: sdist
@@ -96,9 +118,24 @@ jobs:
           name: sdist
           path: dist/*.tar.gz
 
-  release:
+  pypi:
     needs: [wheel, sdist]
     if: ${{ inputs.tag != '' || startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/sparta-solver/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  release:
+    needs: [pypi]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -116,5 +153,5 @@ jobs:
             Install without Rust or a compiler (macOS, Linux and Windows, Python 3.9 or later):
 
             ```
-            pip install sparta-solver --find-links https://github.com/${{ github.repository }}/releases/expanded_assets/${{ env.TAG }}
+            pip install sparta-solver
             ```

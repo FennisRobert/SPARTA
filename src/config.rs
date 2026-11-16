@@ -63,7 +63,7 @@ pub struct Config {
     /// waste less. Measured on an M4 Pro `curl_curl_30^3`, 96 rows: 64 and 128
     /// both cost about 5%, and 256 about 20%.
     pub cpu_block_rows: usize,
-    /// Minimum trailing rows before updates use Apple Accelerate. Raise to avoid BLAS overhead on small blocks.
+    /// Minimum trailing rows before updates use the dense kernels (SpartaBLAS). Raise to avoid their call overhead on small blocks.
     pub cpu_blas_min_rows: usize,
     /// Factor `LDL^T` supernodally, on by default. On the CPU each node's
     /// columns are assembled and factored in place in the factor store, and

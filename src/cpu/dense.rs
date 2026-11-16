@@ -1,15 +1,9 @@
 //! BLAS and LAPACK entry points for the dense frontal algebra.
 //!
-//! Nothing here is specific to one vendor. Fronts are row-major, so the BLAS
-//! wrappers pass `CblasRowMajor` and let CBLAS do the index arithmetic; LAPACK
-//! is column-major only, so [`sytrf`] takes an explicitly packed column-major
-//! block. Both interfaces are the standard ones that Accelerate, OpenBLAS and
-//! MKL all export, and `crate::blas` decides which library the calls go to:
-//! Accelerate on Apple, a library linked through `SPARTA_BLAS_LIB`, or one
-//! loaded at run time.
-//!
-//! With no library, [`available`] reports false and every caller keeps to the
-//! portable Rust loops in `panel.rs` and `update.rs`.
+//! Every call goes to SpartaBLAS, SPARTA's own kernels, through the table in
+//! `crate::blas`, in the CBLAS and LAPACK call shapes. Fronts are row-major,
+//! so the BLAS wrappers pass `CblasRowMajor`; LAPACK is column-major only,
+//! so [`getrf`] and [`sytrf`] take an explicitly packed column-major block.
 use super::C;
 use crate::blas::{self, Library, PerThread};
 use crate::scalar::{Scalar, ScalarKind};
@@ -39,81 +33,34 @@ pub(super) enum Threading {
     Caller,
 }
 
-/// Choose the BLAS threading model for this thread, reporting whether a
-/// per-thread control exists at all.
+/// Choose the threading of the dense calls this thread makes next,
+/// reporting whether the library has a per-thread control.
 ///
-/// SPARTA wants Rayon to own every level of parallelism, which needs a control
-/// that is *per thread*; a global one would have workers fighting over it.
-/// Two libraries offer one: Accelerate's `BLASSetThreading` (macOS 15) and
-/// MKL's `MKL_Set_Num_Threads_Local`.
-///
-/// OpenBLAS deliberately is not: `openblas_set_num_threads` is process-wide,
-/// so calling it from a Rayon worker would change the setting under every
-/// other worker. It is set between levels instead, by [`set_global_threading`].
-/// When neither control exists -- macOS 13 and 14, or a BLAS that is neither --
-/// `level::schedule` keeps wide fronts off the spread path, which costs
-/// parallelism but never correctness.
+/// SPARTA wants Rayon to own every level of parallelism. SpartaBLAS starts no
+/// threads of its own: with `Machine` a large call spreads over the Rayon pool
+/// it runs in, with `Caller` it stays on the calling thread, and the setting
+/// is per thread, so workers never fight over it.
 pub(super) fn set_threading(threading: Threading) -> bool {
     match blas::library().and_then(|library| library.per_thread) {
-        // SAFETY: each arm calls the symbol it resolved, with one of the two
-        // values that library documents.
-        Some(PerThread::Accelerate(set)) => unsafe {
+        Some(PerThread::Sparta(set)) => {
             set(match threading {
                 Threading::Machine => 0,
                 Threading::Caller => 1,
             }) == 0
-        },
-        // SAFETY: as above. MKL returns the previous count, not a status, so
-        // the call itself is the success.
-        Some(PerThread::Mkl(set)) => unsafe {
-            set(match threading {
-                Threading::Machine => 0,
-                Threading::Caller => 1,
-            });
-            true
-        },
+        }
         None => false,
     }
 }
 
-/// Whether the library has a thread control of either kind, the per-thread
-/// one or OpenBLAS's process-wide one. A query: unlike calling either setter,
-/// it changes no thread's setting.
+/// Whether the library has a per-thread control. A query: it changes no
+/// thread's setting.
 pub(super) fn controllable() -> bool {
-    blas::library().is_some_and(|library| library.per_thread.is_some() || library.global.is_some())
+    blas::library().is_some_and(|library| library.per_thread.is_some())
 }
 
-/// Choose the BLAS threading model for the whole process, for a library whose
-/// only control is global, reporting whether it has one.
-///
-/// This is OpenBLAS's `openblas_set_num_threads`. `Machine` is the size of the
-/// Rayon pool it is called on, so `RAYON_NUM_THREADS` or `Config::threads`
-/// bounds BLAS as well, and an
-/// `OPENBLAS_NUM_THREADS` set for some other library in the process (EMerge
-/// sets it to 1 for numpy) does not leave the root front on one thread;
-/// `Caller` is one thread. Because it changes the setting under every thread
-/// at once, it may only be called while no other thread is inside BLAS:
-/// `Solver::factor_all` calls it between levels, after
-/// the previous level has joined, and the solve calls it before and after its
-/// sweeps. A library that has a per-thread control ([`set_threading`]) is left
-/// alone, and this reports false for it.
-///
-/// - `threading`: `Machine` for one front that should own every core, `Caller`
-///   for a level of fronts that Rayon spreads across the cores itself.
-pub(super) fn set_global_threading(threading: Threading) -> bool {
-    match blas::library().and_then(|library| library.global) {
-        // SAFETY: the symbol resolved in `crate::blas`, called with a positive count.
-        Some(set) => unsafe {
-            set(match threading {
-                // The pool this runs on, read per call: a solver with its
-                // own pool (`Config::threads`) bounds BLAS to that pool.
-                Threading::Machine => rayon::current_num_threads().max(1) as i32,
-                Threading::Caller => 1,
-            });
-            true
-        },
-        None => false,
-    }
+/// Whether the library has a `?sytrf` for the blocked LDLᵀ route.
+pub(super) fn has_sytrf() -> bool {
+    blas::library().is_some_and(|library| library.sytrf(KIND).is_some())
 }
 
 /// CBLAS enumerators, which are ABI constants rather than a header import.
@@ -379,7 +326,7 @@ pub(super) fn gemm_nt_front(
     let base = front.as_mut_ptr();
     // SAFETY: both rectangles lie in `front`, asserted above, and are disjoint
     // because each row's left-operand columns end where the target's begin.
-    // Accelerate reads one and writes the other, and completes before it
+    // The kernel reads one and writes the other, and completes before it
     // returns, so the aliasing `&mut front` would imply never materialises.
     unsafe {
         gemm(ffi::TRANS, (m, n, k), minus, base.add(a_at), ld, b.as_ptr(), ldb, one, base.add(c_at), ld);
@@ -436,8 +383,8 @@ pub(super) fn trsm_front(side: Side, tri: Tri, m: usize, n: usize, front: &mut [
 /// of rows (right side) or columns (left side), which a triangular solve
 /// treats independently, and each block is one single-threaded solve.
 ///
-/// Accelerate's legacy `?trsm` does not thread at all, and its `$NEWLAPACK`
-/// one threads less well than this: on a 2680 by 996 complex64 unknown, the
+/// Measured before SpartaBLAS, with Accelerate: its legacy `?trsm` did not
+/// thread at all, and its `$NEWLAPACK` one threaded less well than this: on a 2680 by 996 complex64 unknown, the
 /// legacy `ctrsm` takes 59 ms threaded and 62 ms not, the new one 6.4 ms, and
 /// ten row blocks of the new one on ten threads 5.3 ms (M4 Pro). On the 86k
 /// EMerge system factored as LU, spreading takes the factorization from 1.47
@@ -578,7 +525,7 @@ pub(super) fn sytrf(n: usize, a: &mut [C], lda: usize, ipiv: &mut [i32], work: &
     // The legacy f2c entry point takes `uplo` as a pointer to one character;
     // it compares through `lsame_`, which never reads the hidden length.
     unsafe {
-        library().sytrf(KIND)(
+        library().sytrf(KIND).expect("callers check `has_sytrf` first")(
             b"L".as_ptr(),
             &order,
             a.as_mut_ptr().cast(),
@@ -599,7 +546,7 @@ pub(super) fn sytrf_workspace(n: usize) -> usize {
     // SAFETY: a workspace query touches neither `a` nor `ipiv`, which LAPACK
     // declares nullable, and writes one complex length into `best`.
     unsafe {
-        library().sytrf(KIND)(
+        library().sytrf(KIND).expect("callers check `has_sytrf` first")(
             b"L".as_ptr(),
             &order,
             std::ptr::null_mut(),

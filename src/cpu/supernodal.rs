@@ -223,7 +223,6 @@ pub(super) fn factor_all(
     let give = |worker: Worker| workers.lock().unwrap().push(worker);
     let bumped = AtomicU64::new(0);
     for level in schedule {
-        dense::set_global_threading(if level.spread { Threading::Caller } else { Threading::Machine });
         let clock = Report::clock();
         if !level.spread {
             let mut worker = take();
@@ -308,7 +307,7 @@ unsafe fn node(
         unknown: None,
     };
     let Worker { scratch, report, sn } = worker;
-    let small = m <= plan.config.small_front_rows as usize || !dense::available();
+    let small = m <= plan.config.small_front_rows as usize || !dense::available() || !dense::has_sytrf();
 
     // The blocked route: `?sytrf` on the fully summed block, then the
     // off-diagonal solve, all inside the node's own columns.
@@ -392,16 +391,19 @@ unsafe fn node(
             let (gemm, scatter) = (AtomicU64::new(0), AtomicU64::new(0));
             let run = |b: usize| {
                 let (i0, i1) = (b * rows, ((b + 1) * rows).min(tail));
-                BLOCK.with(|cell| {
-                    let mut w = cell.borrow_mut();
-                    grow(&mut w, (i1 - i0) * i1);
-                    let t0 = Instant::now();
-                    dense::gemm_nt_set(i1 - i0, i1, n, &l21[i0 * n..], n, packed, n, &mut w, i1);
-                    let t1 = Instant::now();
-                    scatter_rows(plan, layout, store, sn, i0, i1, &w, i1);
-                    gemm.fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
-                    scatter.fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                });
+                // Taken out of the cell for the duration, not borrowed: the
+                // GEMM may spread over the pool, and while it waits Rayon can
+                // run another block on this thread, which then finds the cell
+                // empty and allocates its own.
+                let mut w = BLOCK.with(|cell| cell.take());
+                grow(&mut w, (i1 - i0) * i1);
+                let t0 = Instant::now();
+                dense::gemm_nt_set(i1 - i0, i1, n, &l21[i0 * n..], n, packed, n, &mut w, i1);
+                let t1 = Instant::now();
+                scatter_rows(plan, layout, store, sn, i0, i1, &w, i1);
+                gemm.fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
+                scatter.fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                BLOCK.with(|cell| cell.replace(w));
             };
             let blocks = tail.div_ceil(rows);
             if parallel {

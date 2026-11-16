@@ -120,7 +120,7 @@ front. `Config::static_pivot` (default `1e-12`, τ) raises a nonzero LDLᵀ pivo
 τ·min(max|A|, colmax) to that size, keeping its phase, where colmax is the
 largest entry below it in its column. The column is scanned only for a pivot
 already below τ·max|A|, so healthy fronts pay nothing, and a small pivot with
-nothing below it (a badly scaled diagonal) is kept. LAPACK's
+nothing below it (a badly scaled diagonal) is kept. The blocked
 `?sytrf` cannot, so a front where it took such a pivot is refactored by the
 panel kernel. Exact zeros keep their front-relative `sqrt(eps)` rescue. Completed L columns and LU U12 are copied
 into permanent storage before a later level can reuse the frontal workspace.
@@ -129,14 +129,15 @@ Small fronts follow Metal's serial complete diagonal/off-diagonal search for
 LDLᵀ and restricted partial row pivoting for LU. A 2×2 LDLᵀ pivot can cross a
 panel boundary and is always consumed whole.
 
-Larger LDLᵀ fronts eliminate their whole fully summed block through LAPACK's
-Bunch–Kaufman `zsytrf` and then subtract the entire Schur complement as one
-rank-`nc` product (`blocked.rs`). This is the same pivot test the cooperative
-Metal kernels apply, over the same rows: the search was already confined to the
-fully summed block, which is exactly the block LAPACK sees. `zsytrf` interleaves
-its interchanges with its elimination steps, so `Front::adopt` replays them onto
-the columns already written to recover the single-permutation form the solve and
-the child scatter maps assume. A front LAPACK reports as exactly singular is
+Larger LDLᵀ fronts eliminate their whole fully summed block through the
+Bunch–Kaufman `?sytrf` (SpartaBLAS's, in LAPACK's conventions) and then
+subtract the entire Schur complement as one rank-`nc` product (`blocked.rs`).
+This is the same pivot test the cooperative Metal kernels apply, over the same
+rows: the search was already confined to the fully summed block, which is
+exactly the block `?sytrf` sees. It interleaves its interchanges with its
+elimination steps, so `Front::adopt` replays them onto the columns already
+written to recover the single-permutation form the solve and the child scatter
+maps assume. A front `?sytrf` reports as exactly singular is
 handed back untouched and factored by `panel.rs` with its rescue floor, so
 perturbation counting is unchanged.
 
@@ -145,11 +146,9 @@ and the LDLᵀ fallback. It does not split fully summed rows and trailing rows
 into separate GPU dispatches. `update.rs` packs L and D*Lᵀ (or U), then updates
 the whole remaining front once per panel. Metal's strip/Schur dispatch
 separation and multi-panel Schur deferral are not needed here. Large
-updates go to whichever BLAS `build.rs` linked -- Accelerate on Apple, or the
-library `SPARTA_BLAS_LIB` names -- always with an ordinary transpose, never a
-conjugate transpose. Smaller updates, and builds with no BLAS at all, use Rust
-loops. `SPARTA_BLAS_LIB` takes a comma-separated list, so reference netlib
-links as `SPARTA_BLAS_LIB=blas,lapack`.
+updates go to SpartaBLAS (`crates/sparta-blas`, through `dense.rs`), always
+with an ordinary transpose, never a conjugate transpose. Updates below
+`cpu_blas_min_rows` use Rust loops.
 
 Only the lower triangle of an LDLᵀ front is assembled and only the lower
 triangle of its Schur complement is formed. Child maps ascend, so a child's
@@ -162,36 +161,21 @@ Fronts in one level are independent and their workspace slots are disjoint, so
 `level.rs` runs every level of two or more fronts across a Rayon pool. A front
 holding more than a thread's share of its level's work also splits its own rows
 and row blocks into tasks, which threads done with the smaller fronts steal; a
-level of one front, the root's, runs that front alone. Rayon owns the parallelism and Accelerate is set
-single-threaded per worker, except inside `zsytrf`, whose serial diagonal chain
-it splits better from the inside. That needs a per-thread BLAS thread count,
-which Accelerate (`BLASSetThreading`) and MKL (`MKL_Set_Num_Threads_Local`)
-have and OpenBLAS does not. OpenBLAS's `openblas_set_num_threads` is
-process-wide, so `dense::set_global_threading` sets it between levels instead,
-when no thread is inside BLAS: one thread for a spread level, the size of the
-Rayon pool it runs on for a lone front, so `RAYON_NUM_THREADS` or `threads`
-bounds OpenBLAS too and an
-`OPENBLAS_NUM_THREADS` meant for another library in the process is overridden.
-Its `?sytrf` therefore runs on one thread inside a spread level. The per-thread
-controls are only taken from the vendor `SPARTA_BLAS_LIB` names, so an MKL
-loaded by something else in the process (PARDISO, say) is not mistaken for the
-library SPARTA calls.
+level of one front, the root's, runs that front alone. Rayon owns all the
+parallelism. SpartaBLAS starts no threads of its own and has a per-thread
+setting (`dense::set_threading`): every worker of a spread level sets
+`Caller`, so its products stay on that thread, and a lone front sets
+`Machine`, so its products split over the Rayon pool it runs on. Because the
+split uses that pool, `RAYON_NUM_THREADS`, `Config::threads` and
+`SPARTA_NUM_THREADS` bound the dense work as well.
 
-`Config::threads` (`src/threads.rs`) gives a solver a Rayon pool of its own;
-`SPARTA_NUM_THREADS` overrides it. A solver on its own pool never hands a
-product to the library to thread, since Accelerate's and MKL's own threads
-would not respect the pool's size: a lone front splits its work over the pool
-like a front in a spread level. The controls are resolved by a query that sets
-nothing (`dense::controllable`): a lookup that probed by setting the calling
-thread to `Machine` would leave that thread threading its BLAS calls inside the
-spread levels of the process's first factorization.
-
-On a Ryzen 5 3600XT (Zen 2, 6 cores, Windows) with an 84k complex-symmetric
-EMerge patch antenna system, complex128 LDLᵀ took 1.52 s with every level run
-one front at a time, 0.55 s with levels spread under OpenBLAS (conda), and
-0.65–0.76 s against MKL (conda `mkl_rt`). Compiling for `x86-64-v3` (AVX2,
-FMA) and using 6 rather than 12 Rayon threads each made no measurable
-difference.
+Letting the products of a spread level's fronts split as well (nested Rayon
+parallelism) was measured and is not used: on em_m4 (M4 Pro, complex128) it
+factored in 2.6-3.1 s against 2.1-2.6 s. So was reserving the SME matrix units
+for a few threads and running the rest on NEON: 2.2-3.1 s against 2.08-2.13 s
+for SME everywhere. Scratch buffers that live in thread-locals are taken out
+for a call and put back after, never borrowed across a dense call, because
+Rayon may run another task on the same thread while a split product waits.
 
 Factor columns are stored row-major per node (`nr` rows of `nc` values), the
 layout a front's rows copy into without a transpose; wide LDLᵀ fronts write
@@ -248,7 +232,7 @@ The independent CPU settings are available in Rust `Config` and in Python
 | `force_cpu` | false | Explicitly select the CPU backend |
 | `cpu_panel` | 32 | Pivots before a trailing update, panel path only |
 | `cpu_block_rows` | 96 | Rows per block of the trailing update, and the unit of work when one front is split across threads |
-| `cpu_blas_min_rows` | 64 | Minimum trailing rows before the panel path calls BLAS |
+| `cpu_blas_min_rows` | 64 | Minimum trailing rows before the panel path calls the dense kernels |
 
 `cpu_block_rows` was measured on an M4 Pro `curl_curl_30^3`: 64 and 128 each
 cost about 5% against 96, and 256 about 20%. The others are conservative

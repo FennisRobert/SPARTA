@@ -9,7 +9,6 @@ from scipy import sparse
 EPS: float = 1e-10
 
 from ._sparta import gpu_available, blas_library, __version__
-from . import _blas  # loads the CPU solver's BLAS; see _blas.py
 from ._types import Ordering, MatrixType, Path, Backend
 from ._options import _Options, _hybrid_share, _warn_unused, UnusedSettingWarning
 from ._config import Config, presets, profiles
@@ -54,8 +53,8 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
     Parameters
     ----------
     force_cpu : bool or None, default None
-        True uses Rust complex128 factorization and solves on CPU, with Apple
-        Accelerate for large updates. False uses Metal complex64. None uses the
+        True uses Rust complex128 factorization and solves on CPU, with SPARTA's
+        own dense kernels (SpartaBLAS) for large updates. False uses Metal complex64. None uses the
         config setting, or False without a config. factorize(force_cpu=...) can
         override this later without repeating symbolic analysis.
     hybrid : bool, float or None, default None
@@ -71,9 +70,9 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
     cpu_panel : int or None, default None
         CPU panel width in pivots; 2x2 pivots may extend it by one column.
     cpu_block_rows : int or None, default None
-        Rows per tile for small CPU updates below the Accelerate threshold.
+        Rows per tile for small CPU updates below the dense-kernel threshold.
     cpu_blas_min_rows : int or None, default None
-        Minimum trailing rows before CPU updates use Apple Accelerate.
+        Minimum trailing rows before CPU updates use the dense kernels.
     supernodal : bool or None, default None
         Factor LDLT supernodally, which is faster and uses less memory. On the
         CPU no frontal matrix is ever built: each node's columns are factored
@@ -103,7 +102,7 @@ def analyze(matrix: sparse.spmatrix, *, config: Config | str | None = None,
         CPU threads for SPARTA's own work: the analysis, CPU factorization and
         solves, and the hybrid's CPU share. 0 uses the process-wide pool, which
         RAYON_NUM_THREADS sizes; a positive count, up to 4096, gives the solver
-        a pool of its own and keeps Accelerate from threading past it. The
+        a pool of its own, which the dense kernels run on as well. The
         SPARTA_NUM_THREADS environment variable, when set to a positive count,
         overrides this. None uses the config's threads, or 0 without a config.
     **unused

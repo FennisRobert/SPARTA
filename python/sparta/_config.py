@@ -43,7 +43,7 @@ class Config:
         Rows per block in the CPU trailing update, and the unit of work when a
         single front is spread across threads.
     cpu_blas_min_rows : int
-        Minimum trailing rows before CPU updates use Accelerate.
+        Minimum trailing rows before CPU updates use the dense kernels.
     supernodal : bool
         Factor LDLT supernodally (default True). On the CPU each node's columns
         are factored in place and its update goes straight into its ancestors'
@@ -71,7 +71,7 @@ class Config:
         CPU threads for SPARTA's own work: the analysis, CPU factorization and
         solves, and the hybrid's CPU share. 0 uses the process-wide pool, which
         RAYON_NUM_THREADS sizes; a positive count, up to 4096, gives the solver
-        a pool of its own and keeps Accelerate from threading past it. The
+        a pool of its own, which the dense kernels run on as well. The
         SPARTA_NUM_THREADS environment variable, when set to a positive count,
         overrides this.
     ordering : str

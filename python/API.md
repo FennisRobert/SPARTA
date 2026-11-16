@@ -241,8 +241,9 @@ idempotent and leave `Drop` with nothing to do.
 ## Inspection and availability
 
 - `sparta.gpu_available()` reports whether Metal is visible to the process.
-- `sparta.blas_library()` names the CPU backend's BLAS library, or returns
-  `"portable loops"` when none was found.
+- `sparta.blas_library()` names the CPU dense kernels in use, for example
+  `"SpartaBLAS (sme512)"`. `SPARTA_KERNEL` (`sme512`, `avx512`, `avx2`, `neon`
+  or `scalar`) forces a kernel set when set before the first CPU factorization.
 - `F.path` is the selected Path enum; `F.n` is the matrix dimension.
 - `F.info` reports symbolic counts and byte estimates.
 - `F.factor_device_seconds` is GPU factor time, excluding CPU analysis/preparation.
@@ -408,7 +409,8 @@ extra CPU matvecs. Logging costs are excluded from the printed solve time.
 ## CPU complex128
 
 Select `force_cpu=True` in Python to keep factorization and solves in double
-precision on the CPU. Large dense updates use Apple Accelerate on Apple Silicon.
+precision on the CPU. Large dense updates use SPARTA's own dense kernels
+(SpartaBLAS), on every platform.
 Both LDLT and LU use the same symbolic analysis and multifrontal architecture as
 Metal. This is explicit selection; GPU failures never trigger an automatic fallback.
 

@@ -1,6 +1,7 @@
-//! Partial `LDL^T` of one front through Accelerate's blocked kernels.
+//! Partial `LDL^T` of one front through the blocked dense kernels.
 //!
-//! The fully summed block goes to LAPACK's Bunch-Kaufman `zsytrf`, and the
+//! The fully summed block goes to the Bunch-Kaufman `?sytrf` (SpartaBLAS's, in
+//! LAPACK's conventions), and the
 //! whole Schur complement is then one rank-`nc` product. Rank is what decides
 //! the speed of the update: measured on an M4 Pro, `zgemm` runs at 170 GFLOP/s
 //! at rank 32 and 740 GFLOP/s at rank 800, so deferring the update until the
@@ -119,9 +120,7 @@ impl Front<'_> {
         let ipiv = &mut s.ipiv[..n];
         // A panelled factorization has a serial chain down the diagonal that
         // row blocks cannot split from the outside, so this is left to the
-        // library. Accelerate (macOS 26) runs `?sytrf` and `?getrf` on one
-        // thread either way, legacy and `$NEWLAPACK` alike; the setting is
-        // for libraries that do thread them.
+        // library, which splits the panel's trailing GEMMs over the pool.
         // Only a front alone on an unbounded solver: one sharing its level would
         // have the library thread against the other fronts' workers.
         if self.alone {

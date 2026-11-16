@@ -32,11 +32,12 @@ and visit <http://localhost:8000>.
   licence for closed-source software; inquiries go to
   robertfennis@emerge-numerics.com. Keep the page in step with `LICENSE` and the
   main README.
-- **The performance numbers** were measured with `tools/website_bench.py` on
-  13 October 2026: Apple M4 Pro (14-core CPU, 20-core GPU, 24 GB), macOS 26.6.2,
-  the four `test_matrices/*1.sparta` systems, medians of three runs, with
-  `RAYON_NUM_THREADS=8 VECLIB_MAXIMUM_THREADS=8`, without iterative refinement. Problem #1
-  is `em_m1`, #2 `em_m2`, #3 `em_m3_asym`, #4 `em_bandcond`. Re-run it before
+- **The performance numbers** come from three EMerge models in the
+  `sparta_compare` folder next to this repository, measured on 16 November
+  2026 with EMerge 3.0.7 on an Apple M4 Pro (14-core CPU, 20-core GPU, 24 GB),
+  default settings: `python run_bench.py 3 > results3.jsonl`, then
+  `python to_website.py results3.jsonl <this folder>/index.html`, which
+  rewrites only the part between the `EMERGE-BENCH` markers. Re-run it before
   quoting new numbers.
 
 ## Hosting

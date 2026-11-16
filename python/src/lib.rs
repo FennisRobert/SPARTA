@@ -269,14 +269,8 @@ fn device() -> &'static str {
         sparta::Device::Vulkan => "vulkan",
     }
 }
-/// Loads the BLAS and LAPACK at `path` for the CPU solver and returns how
-/// `blas_library()` names it. Raises when the library lacks a routine, or
-/// once a library is already chosen.
-#[pyfunction]
-fn _load_blas(path: &str) -> PyResult<String> {
-    sparta::load_blas(path).map_err(PyRuntimeError::new_err)
-}
-/// Names the CPU solver's BLAS and LAPACK, or "portable loops" without one.
+/// Names the CPU solver's dense kernels: SpartaBLAS and the instruction set
+/// it runs on, for example "SpartaBLAS (sme)".
 #[pyfunction]
 fn blas_library() -> String {
     sparta::blas_library()
@@ -313,7 +307,6 @@ fn _sparta(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCpuFactor>()?;
     m.add_function(wrap_pyfunction!(gpu_available, m)?)?;
     m.add_function(wrap_pyfunction!(device, m)?)?;
-    m.add_function(wrap_pyfunction!(_load_blas, m)?)?;
     m.add_function(wrap_pyfunction!(blas_library, m)?)?;
     m.add_function(wrap_pyfunction!(_settings, m)?)?;
     m.add_function(wrap_pyfunction!(_presets, m)?)?;

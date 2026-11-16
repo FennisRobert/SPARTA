@@ -1,0 +1,12 @@
+[package]
+name = "sparta-blas"
+version = "0.1.0"
+edition = "2021"
+description = "SPARTA's own dense kernels: GEMM, TRSM and LU for the four BLAS types"
+authors = ["Robert Fennis", "Milan Rother"]
+license = "AGPL-3.0-or-later"
+publish = false
+
+[dependencies]
+rayon = "1.12"
+num-complex = "0.4"

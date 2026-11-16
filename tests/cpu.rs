@@ -59,7 +59,7 @@ fn matrix(n: usize, kind: Kind) -> Vec<C> {
 }
 
 #[test]
-/// Exercise serial, one-column and blocked panels, including Accelerate and Rust updates.
+/// Exercise serial, one-column and blocked panels, including dense-kernel and Rust updates.
 fn dense_pivoting_and_multiple_rhs() {
     for kind in [Kind::Ldlt, Kind::Lu] {
         for n in [2, 9, 35, 67] {

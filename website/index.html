@@ -170,10 +170,6 @@ td.num { font-family: "Roboto Mono", monospace; font-size: 14px; }
           font: 500 12.5px/1 "Roboto Mono", monospace; color: var(--text); }
 .acc { font-size: 13.5px; color: var(--muted); border-top: 1px solid var(--line); padding-top: 10px; margin: 6px 0 0; }
 .acc.ill { border-top: 0; padding-top: 4px; }
-.alltimes { margin-top: 30px; }
-.alltimes summary { cursor: pointer; font-weight: 500; font-size: 15px; }
-.alltimes table { margin-top: 14px; font-size: 14px; }
-.alltimes th, .alltimes td { padding: 9px 10px; }
 
 /* Platforms */
 .platform { background: #fff; border-top: 3px solid var(--black); padding: 26px 26px 22px; }
@@ -247,10 +243,11 @@ footer .bottom { border-top: 1px solid #2c2729; padding: 16px 0 22px; display: f
   <div class="solve" aria-hidden="true"><pre id="solve"></pre></div>
   <div class="wrap">
     <div>
-      <h1>Sparse direct factorization on the GPU</h1>
+      <h1>The sparse direct solver for finite-element problems</h1>
       <p class="acronym">SPARSE ACCELERATED RAPID TRIANGULAR ANALYSER</p>
-      <p class="lead">Supernodal multifrontal LDLᵀ and LU for large sparse real and complex systems, with every
-        numeric kernel on the GPU. A device-independent Rust core with Python, C/C++, MATLAB and Julia interfaces.</p>
+      <p class="lead">Specialised for the systems finite-element simulations produce, and tuned in many small,
+        measured ways to keep every core busy, so the factorization runs close to the machine's limits on memory
+        bandwidth and arithmetic, on the GPU or CPU. Self-contained, with no external maths libraries, and callable from Python, C/C++, Rust, MATLAB and Julia.</p>
       <div class="buttons">
         <a class="btn white" href="#get">Get SPARTA <span class="chev">›</span></a>
         <a class="btn outline" href="#example">Example integration</a>
@@ -261,8 +258,8 @@ footer .bottom { border-top: 1px solid #2c2729; padding: 16px 0 22px; display: f
     <div class="wrap">
       <div><b>LDLᵀ and LU</b>supernodal multifrontal, GPU-resident</div>
       <div><b>complex64 + complex128</b>mixed-precision refinement</div>
-      <div><b>Nested dissection</b>custom ordering algorithm</div>
-      <div><b>Rust, Python, C/C++</b>plus MATLAB and Julia</div>
+      <div><b>Built for FEM</b>planned once, every core kept busy</div>
+      <div><b>90% of peak</b>own dense kernels, per processor</div>
     </div>
   </div>
 </header>
@@ -271,7 +268,8 @@ footer .bottom { border-top: 1px solid #2c2729; padding: 16px 0 22px; display: f
   <div class="wrap">
     <div class="title">
       <h2>Direct solver capabilities</h2>
-      <p>Symbolic analysis runs on the CPU; every numeric kernel, including the triangular solves, runs on the GPU.</p>
+      <p>Every part of the solve is designed and measured for mesh problems: the analysis plans the whole
+        factorization once, and the schedule keeps every core doing useful arithmetic, on the GPU or on the CPU.</p>
     </div>
     <div class="cols">
       <div class="feature">
@@ -287,10 +285,23 @@ footer .bottom { border-top: 1px solid #2c2729; padding: 16px 0 22px; display: f
       <div class="feature">
         <h3>Ordering and analysis</h3>
         <ul>
-          <li>Custom nested-dissection ordering, deterministic and parallel</li>
-          <li>Supernode amalgamation and elimination-tree postordering</li>
+          <li>Nested-dissection ordering: the fewest operations a mesh allows (n<sup>1.5</sup> in 2D,
+            n<sup>2</sup> in 3D)</li>
+          <li>Own parallel, deterministic implementation</li>
+          <li>Wide supernodes, so the work runs as large dense products</li>
           <li>Pattern reuse: refactor new values on the same analysis and GPU memory, for frequency sweeps and
             time stepping</li>
+        </ul>
+      </div>
+      <div class="feature">
+        <h3>CPU factorization</h3>
+        <ul>
+          <li>Same analysis and factorization as the GPU, in double precision</li>
+          <li>SpartaBLAS: SPARTA's own dense kernels, one set per processor family</li>
+          <li>Hand-written kernels for the Arm SME2 matrix unit (Apple M4 and later): 82–91% of peak on one core</li>
+          <li>NEON, AVX2 and AVX-512 kernel sets; no BLAS or LAPACK to install</li>
+          <li>Small fronts one per core, large fronts across all cores, from one thread pool that never oversubscribes</li>
+          <li>Real arithmetic for the real parts of complex FEM systems</li>
         </ul>
       </div>
       <div class="feature">
@@ -331,8 +342,8 @@ footer .bottom { border-top: 1px solid #2c2729; padding: 16px 0 22px; display: f
           file. Not yet tested in MATLAB.</li>
         <li><b>Julia</b> — a <code>Solver</code> type with <code>\</code> and <code>factorize!</code>, calling the
           library directly.</li>
-        <li><b>Installation</b> — <code>pip install</code> from the GitHub repository builds and installs the Python
-          package.</li>
+        <li><b>Installation</b> — <code>pip install sparta-solver</code> installs a prebuilt wheel on macOS, Linux
+          and Windows, with no compiler needed.</li>
       </ul>
     </div>
     <div>
@@ -401,67 +412,50 @@ close(F)                <span class="c"># 4. free the GPU memory</span></pre></d
   <div class="wrap">
     <div class="title">
       <h2>Performance</h2>
-      <p>Four full-wave electromagnetic finite-element problems, each solved by SPARTA's GPU solver and by its CPU
-        solver on the same machine, without iterative refinement. Wall time through the Python API, median of three runs.</p>
+      <p>Three EMerge models, each swept over frequency with SPARTA as the solver, once on its GPU path and once on its
+        CPU path on the same machine. Times are the solve times EMerge itself reports, summed over the sweep: per
+        frequency, the solver call that factors the system and solves it for every port or excitation. Meshing and
+        assembly are not included.</p>
     </div>
     <p class="rig">Apple M4 Pro · 14-core CPU (10 performance + 4 efficiency) · 20-core GPU · 24 GB unified memory ·
       macOS 26.6.2</p>
     <div class="legend">
       <span><i class="gpu"></i><span class="t"><b>SPARTA GPU solver</b>: Metal on 20 GPU cores, complex64, no refinement</span></span>
-      <span><i class="cpu"></i><span class="t"><b>SPARTA CPU solver</b>: complex128 on 8 threads, Accelerate</span></span>
+      <span><i class="cpu"></i><span class="t"><b>SPARTA CPU solver</b>: complex128 on all 14 cores, SpartaBLAS</span></span>
     </div>
+    <!-- EMERGE-BENCH START -->
     <div class="perfgrid">
       <figure class="perf">
-        <figcaption><h3>Full-wave EM FEM problem #1</h3>
-          <p class="meta">109,370 unknowns · 4.08 M nonzeros · complex symmetric, LDLᵀ</p></figcaption>
-        <div class="metric"><div class="mlabel"><span>Factorization</span><span class="sp">2.3× faster on GPU</span></div><div class="bar gpu" style="--w:42.0%" title="Full-wave EM FEM problem #1 · Factorization · GPU: 120 ms" tabindex="0"><span class="v">120 ms</span></div><div class="bar cpu" style="--w:98.0%" title="Full-wave EM FEM problem #1 · Factorization · CPU: 279 ms" tabindex="0"><span class="v">279 ms</span></div></div><div class="metric"><div class="mlabel"><span>Refactorization</span><span class="sp">2.6× faster on GPU</span></div><div class="bar gpu" style="--w:37.9%" title="Full-wave EM FEM problem #1 · Refactorization · GPU: 108 ms" tabindex="0"><span class="v">108 ms</span></div><div class="bar cpu" style="--w:100.0%" title="Full-wave EM FEM problem #1 · Refactorization · CPU: 285 ms" tabindex="0"><span class="v">285 ms</span></div></div><div class="metric"><div class="mlabel"><span>Solve</span><span class="sp">4.2× faster on GPU</span></div><div class="bar gpu" style="--w:4.7%" title="Full-wave EM FEM problem #1 · Solve · GPU: 13 ms" tabindex="0"><span class="v">13 ms</span></div><div class="bar cpu" style="--w:19.6%" title="Full-wave EM FEM problem #1 · Solve · CPU: 56 ms" tabindex="0"><span class="v">56 ms</span></div></div>
-        <p class="acc">Relative residual, no refinement: GPU 6·10<sup>-5</sup> · CPU 2·10<sup>-13</sup></p>
+        <figcaption><h3>Patch antenna</h3>
+          <p class="meta">Inset-fed microstrip patch on a 1.524 mm substrate inside an air sphere with an absorbing boundary, lumped-port feed · 423,436 unknowns · 18.4 M nonzeros · 7 frequencies</p></figcaption>
+        <div class="metric"><div class="mlabel"><span>All 7 frequencies</span><span class="sp">1.6× faster on GPU</span></div><div class="bar gpu" style="--w:62.8%" title="Patch antenna · All 7 frequencies · GPU: 5.45 s" tabindex="0"><span class="v">5.45 s</span></div><div class="bar cpu" style="--w:100.0%" title="Patch antenna · All 7 frequencies · CPU: 8.68 s" tabindex="0"><span class="v">8.68 s</span></div></div>
+        <div class="metric"><div class="mlabel"><span>First frequency, with analysis</span><span class="sp">1.3× faster on GPU</span></div><div class="bar gpu" style="--w:21.8%" title="Patch antenna · First frequency, with analysis · GPU: 1.90 s" tabindex="0"><span class="v">1.90 s</span></div><div class="bar cpu" style="--w:28.3%" title="Patch antenna · First frequency, with analysis · CPU: 2.45 s" tabindex="0"><span class="v">2.45 s</span></div></div>
+        <div class="metric"><div class="mlabel"><span>Each further frequency (median)</span><span class="sp">1.8× faster on GPU</span></div><div class="bar gpu" style="--w:6.7%" title="Patch antenna · Each further frequency (median) · GPU: 581 ms" tabindex="0"><span class="v">581 ms</span></div><div class="bar cpu" style="--w:12.0%" title="Patch antenna · Each further frequency (median) · CPU: 1.04 s" tabindex="0"><span class="v">1.04 s</span></div></div>
+        <p class="acc">Peak memory of the whole EMerge process: GPU 9.2 GB · CPU 12.1 GB</p>
       </figure>
       <figure class="perf">
-        <figcaption><h3>Full-wave EM FEM problem #2</h3>
-          <p class="meta">68,690 unknowns · 2.29 M nonzeros · complex symmetric, LDLᵀ</p></figcaption>
-        <div class="metric"><div class="mlabel"><span>Factorization</span><span class="sp">1.8× faster on GPU</span></div><div class="bar gpu" style="--w:56.9%" title="Full-wave EM FEM problem #2 · Factorization · GPU: 41 ms" tabindex="0"><span class="v">41 ms</span></div><div class="bar cpu" style="--w:100.0%" title="Full-wave EM FEM problem #2 · Factorization · CPU: 73 ms" tabindex="0"><span class="v">73 ms</span></div></div><div class="metric"><div class="mlabel"><span>Refactorization</span><span class="sp">1.9× faster on GPU</span></div><div class="bar gpu" style="--w:50.9%" title="Full-wave EM FEM problem #2 · Refactorization · GPU: 37 ms" tabindex="0"><span class="v">37 ms</span></div><div class="bar cpu" style="--w:95.7%" title="Full-wave EM FEM problem #2 · Refactorization · CPU: 70 ms" tabindex="0"><span class="v">70 ms</span></div></div><div class="metric"><div class="mlabel"><span>Solve</span><span class="sp">4.7× faster on GPU</span></div><div class="bar gpu" style="--w:6.6%" title="Full-wave EM FEM problem #2 · Solve · GPU: 5 ms" tabindex="0"><span class="v">5 ms</span></div><div class="bar cpu" style="--w:31.3%" title="Full-wave EM FEM problem #2 · Solve · CPU: 23 ms" tabindex="0"><span class="v">23 ms</span></div></div>
-        <p class="acc">Relative residual, no refinement: GPU 2·10<sup>-3</sup> · CPU 5·10<sup>-12</sup></p>
+        <figcaption><h3>Radar cross-section</h3>
+          <p class="meta">PEC sphere of 0.5 m radius in a scattered-field formulation, absorbing outer boundary · 317,866 unknowns · 12.8 M nonzeros · 8 frequencies</p></figcaption>
+        <div class="metric"><div class="mlabel"><span>All 8 frequencies</span><span class="sp">2.3× faster on GPU</span></div><div class="bar gpu" style="--w:43.4%" title="Radar cross-section · All 8 frequencies · GPU: 14.1 s" tabindex="0"><span class="v">14.1 s</span></div><div class="bar cpu" style="--w:100.0%" title="Radar cross-section · All 8 frequencies · CPU: 32.5 s" tabindex="0"><span class="v">32.5 s</span></div></div>
+        <div class="metric"><div class="mlabel"><span>First frequency, with analysis</span><span class="sp">1.9× faster on GPU</span></div><div class="bar gpu" style="--w:8.4%" title="Radar cross-section · First frequency, with analysis · GPU: 2.73 s" tabindex="0"><span class="v">2.73 s</span></div><div class="bar cpu" style="--w:15.9%" title="Radar cross-section · First frequency, with analysis · CPU: 5.16 s" tabindex="0"><span class="v">5.16 s</span></div></div>
+        <div class="metric"><div class="mlabel"><span>Each further frequency (median)</span><span class="sp">2.4× faster on GPU</span></div><div class="bar gpu" style="--w:5.0%" title="Radar cross-section · Each further frequency (median) · GPU: 1.63 s" tabindex="0"><span class="v">1.63 s</span></div><div class="bar cpu" style="--w:12.0%" title="Radar cross-section · Each further frequency (median) · CPU: 3.91 s" tabindex="0"><span class="v">3.91 s</span></div></div>
+        <p class="acc">Peak memory of the whole EMerge process: GPU 7.1 GB · CPU 11.7 GB</p>
       </figure>
       <figure class="perf">
-        <figcaption><h3>Full-wave EM FEM problem #3</h3>
-          <p class="meta">86,006 unknowns · 3.62 M nonzeros · unsymmetric, LU</p></figcaption>
-        <div class="metric"><div class="mlabel"><span>Factorization</span><span class="sp">12.2× faster on GPU</span></div><div class="bar gpu" style="--w:8.2%" title="Full-wave EM FEM problem #3 · Factorization · GPU: 366 ms" tabindex="0"><span class="v">366 ms</span></div><div class="bar cpu" style="--w:100.0%" title="Full-wave EM FEM problem #3 · Factorization · CPU: 4.47 s" tabindex="0"><span class="v">4.47 s</span></div></div><div class="metric"><div class="mlabel"><span>Refactorization</span><span class="sp">13.2× faster on GPU</span></div><div class="bar gpu" style="--w:7.6%" title="Full-wave EM FEM problem #3 · Refactorization · GPU: 338 ms" tabindex="0"><span class="v">338 ms</span></div><div class="bar cpu" style="--w:100.0%" title="Full-wave EM FEM problem #3 · Refactorization · CPU: 4.47 s" tabindex="0"><span class="v">4.47 s</span></div></div><div class="metric"><div class="mlabel"><span>Solve</span><span class="sp">3.4× faster on GPU</span></div><div class="bar gpu" style="--w:0.6%" title="Full-wave EM FEM problem #3 · Solve · GPU: 27 ms" tabindex="0"><span class="v">27 ms</span></div><div class="bar cpu" style="--w:2.0%" title="Full-wave EM FEM problem #3 · Solve · CPU: 91 ms" tabindex="0"><span class="v">91 ms</span></div></div>
-        <p class="acc">Relative residual, no refinement: GPU 3·10<sup>-5</sup> · CPU 2·10<sup>-13</sup></p>
-      </figure>
-      <figure class="perf">
-        <figcaption><h3>Full-wave EM FEM problem #4</h3>
-          <p class="meta">457,054 unknowns · 17.63 M nonzeros · complex symmetric, LDLᵀ</p></figcaption>
-        <div class="metric"><div class="mlabel"><span>Factorization</span><span class="sp">2.7× faster on GPU</span></div><div class="bar gpu" style="--w:37.6%" title="Full-wave EM FEM problem #4 · Factorization · GPU: 358 ms" tabindex="0"><span class="v">358 ms</span></div><div class="bar cpu" style="--w:100.0%" title="Full-wave EM FEM problem #4 · Factorization · CPU: 953 ms" tabindex="0"><span class="v">953 ms</span></div></div><div class="metric"><div class="mlabel"><span>Refactorization</span><span class="sp">2.5× faster on GPU</span></div><div class="bar gpu" style="--w:32.5%" title="Full-wave EM FEM problem #4 · Refactorization · GPU: 310 ms" tabindex="0"><span class="v">310 ms</span></div><div class="bar cpu" style="--w:80.0%" title="Full-wave EM FEM problem #4 · Refactorization · CPU: 762 ms" tabindex="0"><span class="v">762 ms</span></div></div><div class="metric"><div class="mlabel"><span>Solve</span><span class="sp">9.6× faster on GPU</span></div><div class="bar gpu" style="--w:2.5%" title="Full-wave EM FEM problem #4 · Solve · GPU: 23 ms" tabindex="0"><span class="v">23 ms</span></div><div class="bar cpu" style="--w:23.6%" title="Full-wave EM FEM problem #4 · Solve · CPU: 225 ms" tabindex="0"><span class="v">225 ms</span></div></div>
-        <p class="acc">Relative residual, no refinement: GPU 1·10<sup>-1</sup> · CPU 2·10<sup>-11</sup></p><p class="acc ill"><em>This test system is ill-conditioned, so single precision alone is far from accurate on it; it is shown for speed.</em></p>
+        <figcaption><h3>Coupled-line filter</h3>
+          <p class="meta">Six-section coupled-line bandpass filter on a 20 mil substrate in a closed air box, two modal ports · 1,245,102 unknowns · 44.0 M nonzeros · 30 frequencies</p></figcaption>
+        <div class="metric"><div class="mlabel"><span>All 30 frequencies</span><span class="sp">1.1× faster on GPU</span></div><div class="bar gpu" style="--w:92.5%" title="Coupled-line filter · All 30 frequencies · GPU: 42.8 s" tabindex="0"><span class="v">42.8 s</span></div><div class="bar cpu" style="--w:100.0%" title="Coupled-line filter · All 30 frequencies · CPU: 46.3 s" tabindex="0"><span class="v">46.3 s</span></div></div>
+        <div class="metric"><div class="mlabel"><span>First frequency, with analysis</span><span class="sp">about equal</span></div><div class="bar gpu" style="--w:11.3%" title="Coupled-line filter · First frequency, with analysis · GPU: 5.22 s" tabindex="0"><span class="v">5.22 s</span></div><div class="bar cpu" style="--w:11.8%" title="Coupled-line filter · First frequency, with analysis · CPU: 5.47 s" tabindex="0"><span class="v">5.47 s</span></div></div>
+        <div class="metric"><div class="mlabel"><span>Each further frequency (median)</span><span class="sp">1.1× faster on GPU</span></div><div class="bar gpu" style="--w:2.7%" title="Coupled-line filter · Each further frequency (median) · GPU: 1.24 s" tabindex="0"><span class="v">1.24 s</span></div><div class="bar cpu" style="--w:2.9%" title="Coupled-line filter · Each further frequency (median) · CPU: 1.34 s" tabindex="0"><span class="v">1.34 s</span></div></div>
+        <p class="acc">Peak memory of the whole EMerge process: GPU 13.2 GB · CPU 10.8 GB</p>
       </figure>
     </div>
-    <details class="alltimes">
-      <summary>All measurements</summary>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Problem</th><th class="num">Unknowns</th><th>Method</th>
-            <th class="num">Analysis GPU</th><th class="num">Analysis CPU</th>
-            <th class="num">Factor GPU</th><th class="num">Factor CPU</th>
-            <th class="num">Refactor GPU</th><th class="num">Refactor CPU</th>
-            <th class="num">Solve GPU</th><th class="num">Solve CPU</th>
-            <th class="num">Residual GPU</th><th class="num">Residual CPU</th></tr></thead>
-          <tbody>
-            <tr><td>#1</td><td class="num">109,370</td><td>LDLT</td><td class="num">246 ms</td><td class="num">237 ms</td><td class="num">120 ms</td><td class="num">279 ms</td><td class="num">108 ms</td><td class="num">285 ms</td><td class="num">13 ms</td><td class="num">56 ms</td><td class="num">6·10<sup>-5</sup></td><td class="num">2·10<sup>-13</sup></td></tr>
-<tr><td>#2</td><td class="num">68,690</td><td>LDLT</td><td class="num">141 ms</td><td class="num">132 ms</td><td class="num">41 ms</td><td class="num">73 ms</td><td class="num">37 ms</td><td class="num">70 ms</td><td class="num">5 ms</td><td class="num">23 ms</td><td class="num">2·10<sup>-3</sup></td><td class="num">5·10<sup>-12</sup></td></tr>
-<tr><td>#3</td><td class="num">86,006</td><td>LU</td><td class="num">171 ms</td><td class="num">175 ms</td><td class="num">366 ms</td><td class="num">4.47 s</td><td class="num">338 ms</td><td class="num">4.47 s</td><td class="num">27 ms</td><td class="num">91 ms</td><td class="num">3·10<sup>-5</sup></td><td class="num">2·10<sup>-13</sup></td></tr>
-<tr><td>#4</td><td class="num">457,054</td><td>LDLT</td><td class="num">1.04 s</td><td class="num">1.07 s</td><td class="num">358 ms</td><td class="num">953 ms</td><td class="num">310 ms</td><td class="num">762 ms</td><td class="num">23 ms</td><td class="num">225 ms</td><td class="num">1·10<sup>-1</sup></td><td class="num">2·10<sup>-11</sup></td></tr>
-          </tbody>
-        </table>
-      </div>
-    </details>
-    <p class="fine">Refactorization reuses the analysis with new values on the same pattern, as in a frequency sweep;
-      problem #4 refactors with its own values scaled. The CPU backend is limited to 8 threads
-      (<code>RAYON_NUM_THREADS=8</code>, <code>VECLIB_MAXIMUM_THREADS=8</code>), fewer than the 10 performance cores,
-      so background processes and the slower efficiency cores do not distort its times. Iterative refinement is off throughout, so these are the raw
-      single-precision GPU and double-precision CPU times. In normal use SPARTA refines the GPU solution to
-      double-precision accuracy, which adds a few solves per right-hand side. The analysis runs on the CPU for both.
-      Results for NVIDIA and AMD GPUs follow once the Vulkan backend is tuned.</p>
+    <p class="fine">Median of three runs, each a fresh process, on the machine above. EMerge solves one frequency at a
+      time and analyzes the sparsity pattern once, at the first frequency; every later frequency only refactors.
+      The GPU factors in single precision (complex64), the CPU in double precision (complex128). On the coupled-line filter
+      the two are within about 10%, most likely because in a closed box most of its matrix is real, which the CPU factors in
+      cheaper real arithmetic, and because its thin planar geometry gives many small fronts.</p>
+    <!-- EMERGE-BENCH END -->
   </div>
 </section>
 
@@ -522,10 +516,10 @@ close(F)                <span class="c"># 4. free the GPU memory</span></pre></d
         <div class="tag">Free, on GitHub</div>
         <p>The source code, the Python package, the C/C++, MATLAB and Julia bindings and the user guide are all in the
           repository.</p>
-        <div class="cmd"><code>pip install "git+https://github.com/FennisRobert/SPARTA.git"</code></div>
+        <div class="cmd"><code>pip install sparta-solver</code></div>
         <ul>
           <li>For open-source software under the AGPL</li>
-          <li>Build from source for Metal or Vulkan</li>
+          <li>Prebuilt for Metal and Vulkan, or build from source</li>
           <li>Issues and contributions through GitHub</li>
         </ul>
         <a class="more" href="https://github.com/FennisRobert/SPARTA">Go to the repository ›</a>
@@ -578,7 +572,7 @@ close(F)                <span class="c"># 4. free the GPU memory</span></pre></d
     <div class="top">
       <div>
         <a class="brand" href="#top">SPARTA</a>
-        <p style="margin-top:12px">SParse Accelerated Rapid Triangular Analyser.<br>A GPU sparse direct solver.</p>
+        <p style="margin-top:12px">SParse Accelerated Rapid Triangular Analyser.<br>The sparse direct solver for finite-element problems.</p>
       </div>
       <div><h4>Product</h4><ul>
         <li><a href="#capabilities">Capabilities</a></li><li><a href="#example">Integration</a></li>
